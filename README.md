@@ -95,6 +95,21 @@ sparse keypoint visible-view support: yes
 direct depth/range selection: no
 ```
 
+## ORA3D / pseudo disparity 관련 판단
+
+Raw fisheye image에서 ORA3D식 dense pseudo disparity를 그대로 만드는 것은 메인 방향으로 두지 않는다. ORA3D의 핵심은 overlap region feature에 depth-aware auxiliary supervision을 주는 철학이지, pseudo disparity를 완전한 GT로 믿는 것이 아니다.
+
+Fisheye에서는 pinhole/rectified stereo와 달리 대응점이 직선 scanline이 아니라 curved epipolar path를 따라 움직인다. 따라서 raw fisheye overlap 전체에 traditional stereo를 바로 적용해 dense pseudo depth를 만들면 주변부 왜곡, occlusion, scale 변화, view 간 appearance 차이 때문에 noise가 커질 수 있다.
+
+```text
+raw fisheye dense pseudo disparity as GT: no
+confidence-filtered weak auxiliary: optional
+object/query-level range auxiliary: safer
+ray / spherical / camera geometry PE: yes
+```
+
+우리 데이터에는 3D box GT가 있으므로 dense pixel pseudo depth를 억지로 만들기보다 object/query 단위의 sparse keypoint projection quality와 visible view support를 우선 사용한다. Pseudo disparity를 쓰더라도 confidence가 높은 영역만 보조 신호로 제한하고, 주변부/occlusion/boundary/robot-body region은 mask out해야 한다.
+
 남은 검증:
 
 1. `kb_lens_fov_deg=360`처럼 너무 느슨한 FOV mask를 실제 렌즈 FOV 근처로 제한한다.
