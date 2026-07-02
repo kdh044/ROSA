@@ -29,10 +29,26 @@ center one-point와 sparse keypoint 모두 direct depth/range refinement
 
 ```text
 direct depth/range selection: no
+range aux only as novelty: no
+fisheye ray geometry PE: yes
+object-level overlap range auxiliary: yes
+projection-quality weighted supervision: yes
 visible view/keypoint support weighting: yes
 projection-quality reliability: yes
 temporal query update weighting: yes
 ```
+
+메인 ablation은 다음 순서로 둔다.
+
+```text
+1. baseline Sparse4D
+2. + query-level range aux only
+3. + fisheye ray PE
+4. + object-level overlap mask
+5. + projection-quality loss/view weighting
+```
+
+2번만 좋아지면 novelty가 약하다. 3~5번이 같이 좋아져야 4-fisheye overlap을 안전하게 auxiliary supervision으로 바꿨다는 주장을 할 수 있다.
 
 ## 모델 코드 위치
 
@@ -54,6 +70,8 @@ projection 결과          = (B, N_cam, N_obj, N_key, 2)
 sampled feature          = (B, N_cam, N_obj, N_key, C_l)
 view_support             = (B, N_cam, N_obj)
 query_support            = (B, N_obj)
+range_logits             = (B, N_obj, N_bins)
+range_aux_weight         = (B, N_obj)
 ```
 
 Range-search ablation에서는 후보 축 `K`가 추가된다.
