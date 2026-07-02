@@ -9,110 +9,121 @@ Upstream 참고:
 
 ## 최종 연구 정의
 
-> 4-fisheye 환경에서 object query 중심 ray-depth 후보를 visible overlap view들에 재투영하고, feature 일치도와 어안 투영 품질로 각 후보의 지지도를 계산해 temporal query의 3D 위치를 보정하는 연구.
+> 4-fisheye temporal 3D detection에서 object query가 여러 fisheye view에 투영될 때, 각 visible view/keypoint 관측의 geometric quality와 feature support를 계산해 query update에 더 믿을 관측을 강하게 반영하는 연구.
 
-핵심 문제의식은 fisheye query가 단순히 "3D query가 이미지 어디에 투영되는가"만 보는 것이 아니라, "visible overlap view들 중 어떤 관측이 이 query의 3D 위치를 가장 잘 지지하는가"를 함께 판단해야 한다는 점이다.
+핵심 문제의식은 fisheye query가 단순히 "3D query가 이미지 어디에 투영되는가"만 보는 것이 아니라, "visible overlap view들 중 어떤 관측이 이 query를 가장 안정적으로 지지하는가"를 함께 판단해야 한다는 점이다.
 
-현재 방향은 object 전체를 촘촘한 graph node로 투영하는 방식이 아니다. 먼저 object center 한 점을 기준으로 reference camera ray를 만들고, 그 ray 방향의 거리/range 후보를 visible fisheye view들에 재투영한다. 각 후보가 여러 view에서 얼마나 일관되게 지지되는지를 feature 일치도와 어안 투영 품질로 계산해 query의 거리/range와 temporal update 신뢰도를 안정화한다.
+현재까지의 GT 기준 range 후보 검증에서는 feature matching score가 정답 range를 충분히 안정적으로 고르지 못했다. 따라서 "sparse ray matching으로 depth/range를 직접 찾거나 보정한다"는 강한 주장은 메인 claim으로 두지 않는다. Range 후보 실험은 보조 ablation으로 남기고, 주된 방향은 fisheye visible view support weighting이다.
+
+우리가 쓰는 신호는 dense depth map이 아니다. `MultiScaleDepthMapGenerator`처럼 LiDAR surface point를 이미지 전체에 투영해 픽셀별 depth map을 만드는 방식과 구분한다. 본 연구에서의 target은 object query / sparse keypoint가 각 fisheye view에서 얼마나 유효하고 안정적인 관측을 갖는지 평가하는 view support signal이다.
+
+```text
+dense pixel depth map target: no  # 이미지 전체 픽셀 깊이 지도 아님
+2D bbox center target: no         # 2D 박스 중심 아님
+direct depth/range selection claim: no
+query/keypoint visible-view support: yes
+projection-quality reliability signal: yes
+temporal query update weighting: yes
+```
+
+현재 방향은 object 전체를 dense하게 matching하거나 graph node를 촘촘히 뿌리는 방식이 아니다. Sparse4D가 이미 사용하는 sparse box keypoint를 4개 fisheye view에 투영하고, 각 view/keypoint가 image bound, fisheye FOV, 중심부 거리, projected footprint, truncation, feature support 측면에서 얼마나 믿을 만한지 계산한다. 이 support로 feature aggregation과 temporal query update를 안정화한다.
 
 ## 제안 모듈
 
 | 모듈 | 목적 | 본 연구의 차이 |
 | --- | --- | --- |
-| Object-Center Fisheye Ray Candidate Sampling | object query의 중심점 하나를 기준으로 reference camera ray를 만들고, 그 ray 위에 sparse range 후보를 생성한다. | dense overlap disparity나 box 전체 graph sampling이 아니라 object center query의 ray 방향 거리 후보만 sparse하게 검증한다. |
-| Visible-View Ray Matching Support Scoring | 각 range 후보가 visible fisheye view들에서 얼마나 잘 지지되는지 계산한다. | 모든 view를 동일하게 평균내지 않고, query의 3D 위치를 가장 잘 지지하는 visible 관측을 더 강하게 반영한다. |
-| Reliability-Guided Temporal Query Refinement | matching 기반 지지도를 이용해 매 시점 3D 위치/range update를 안정화한다. | 별도 tracking association이 아니라 temporal query의 3D 위치 추정 안정성에 집중한다. |
+| Fisheye Projection Quality Estimation | object query의 sparse keypoint를 4개 fisheye camera에 투영하고 view/keypoint별 geometric quality를 계산한다. | dense overlap disparity가 아니라 query-visible view 단위의 품질을 본다. |
+| Visible-View Support Scoring | 각 visible view가 현재 query를 얼마나 안정적으로 지지하는지 계산한다. | 모든 view를 동일하게 평균내지 않고, query/keypoint 관측을 잘 지지하는 view를 더 강하게 반영한다. |
+| Reliability-Guided Temporal Query Update | support가 높은 view feature를 더 강하게 쓰고, support가 낮은 query는 temporal prior를 더 보존한다. | depth를 직접 찾는 것이 아니라 temporal query update의 신뢰도를 조절한다. |
 
 신뢰도 결합은 다음 형태를 기본으로 둔다.
 
 ```text
-reliability(r_k) = matching_confidence(r_k) * projection_quality(r_k)
+support_c = feature_support_c * projection_quality_c
+query_feature = sum_c support_c * view_feature_c
 ```
 
-- `matching_confidence(r_k)`: visible view들에서 샘플링한 feature consistency.
-- `projection_quality(r_k)`: image bound, fisheye FOV, projected footprint, image-center distance, truncation, invalid region 여부.
+- `feature_support_c`: view c에서 query/keypoint feature가 얼마나 안정적으로 관측되는지.
+- `projection_quality_c`: image bound, fisheye FOV, projected footprint, image-center distance, truncation, invalid region 여부.
 - 유효한 visible view가 두 개 미만이면 multi-view matching 대상에서 제외한다.
 
-Reference view feature는 range 후보마다 바뀌지 않는다. Reference camera에서 query center pixel을 잡고 inverse projection해서 ray를 만들면, 그 ray 위의 모든 후보점은 reference camera에 다시 투영될 때 같은 pixel로 돌아온다.
+Projection quality는 GT 기준 실험과 실제 inference에서 사용하는 box가 다르다.
 
 ```text
-f_ref = reference camera의 query center feature
-f_c(r_k) = range 후보 r_k를 camera c에 재투영한 위치의 feature
-matching_confidence(r_k) = mean_c cosine(f_ref, f_c(r_k))
-```
-
-이후 variant에서는 visible view all-pair similarity도 비교한다.
-
-```text
-matching_confidence(r_k) = mean_{i,j} cosine(f_i(r_k), f_j(r_k))
-```
-
-Projection quality는 oracle 실험과 실제 inference에서 사용하는 box가 다르다.
-
-```text
-oracle 실험: GT box를 이용해 projected area / truncation / visibility 계산
+GT 기준 실험: GT box를 이용해 projected area / truncation / visibility 계산
 실제 적용: predicted query box 또는 anchor box를 이용해 projection quality 계산
 ```
 
-Temporal range 시작값은 object 상태에 따라 구분한다.
+Range 후보 실험은 보조 ablation으로만 유지한다.
 
 ```text
-기존 object query: 이전 frame의 range / temporal prior 주변에서 후보 생성
-신규 object query: detector baseline range 주변에서 후보 생성
-oracle 기초 검증: GT range 주변에서 후보 생성
+main: 현재 query 위치의 visible view/keypoint support 계산
+ablation: GT range 주변 sparse keypoint range search
+hold: feature score로 direct depth/range 선택
 ```
 
 ## 현재 실험
 
-오늘은 학습하지 않고 oracle 기반 기초 검증만 수행한다.
+현재까지 수행한 것은 학습이 아니라 GT 기준 기초 검증이다.
 
-> GT object center 주변의 range 후보를 visible fisheye view들에 재투영했을 때, multi-view feature consistency와 projection quality를 곱한 reliability curve가 실제 range 근처에서 peak를 만드는가?
+> GT object 주변 range 후보를 visible fisheye view들에 재투영했을 때, feature score가 실제 range 근처에서 충분히 강한 peak를 만드는가?
+
+결과는 direct depth/range refinement claim을 지지하기에 부족하다.
+
+```text
+center one-point level0:
+정답 +/-0.4m 근처 최고점: 13.1%
+경계 후보 최고점: 59.0%
+
+sparse keypoint level0:
+정답 +/-0.4m 근처 최고점: 28.7%
+경계 후보 최고점: 23.0%
+
+sparse keypoint level0 + z_center 수정:
+정답 +/-0.4m 근처 최고점: 35.2%
+경계 후보 최고점: 18.0%
+```
+
+따라서 `sparse keypoint`는 center 한 점보다 낫지만, "정답 range를 직접 고른다"는 메인 주장으로는 약하다. 이후 실험은 range search를 보조 ablation으로 두고, visible view support weighting을 주 방향으로 둔다.
 
 ORA3D와의 차이:
 
 ```text
 dense full-image overlap matching: no
 object-query visible fisheye views: yes
-object center ray only: yes
-multi-node box graph: no
+sparse keypoint visible-view support: yes
+direct depth/range selection: no
 ```
 
-초기 절차:
+남은 검증:
 
-1. 두 개 이상 camera에 보이는 GT object를 고른다.
-2. projected area, image-center distance, truncation, projection validity를 기준으로 object를 가장 잘 보는 oracle reference camera를 선택한다.
-3. GT object center를 reference camera에 projection하고, 해당 fisheye pixel을 inverse projection해서 3D ray를 만든다.
-4. GT range 주변 후보를 만든다. 예: `r_gt +/- 2m`, `K=21`.
-5. 각 후보 3D point를 네 개 fisheye camera에 모두 재투영한다.
-6. image bound, fisheye FOV, projection-quality filter를 통과한 visible view만 남긴다.
-7. valid view에서 feature를 sampling한다.
-8. reference feature `f_ref`는 고정하고, 각 range 후보의 non-reference visible view feature `f_c(r_k)`와 cosine similarity를 계산한다.
-9. projection quality와 matching confidence를 곱해 최종 reliability curve를 만든다.
+1. `kb_lens_fov_deg=360`처럼 너무 느슨한 FOV mask를 실제 렌즈 FOV 근처로 제한한다.
+2. GT bbox의 `z_bottom`을 geometric center로 변환한 기준을 유지한다.
+3. GT box/keypoint overlay로 projection/extrinsic이 실제 이미지에 맞는지 계속 확인한다.
+4. Range search가 충분히 좋아지지 않으면 direct depth refinement는 폐기하고 view support weighting만 유지한다.
+
+
+## Feature 샘플링 shape
+
+View support / range-search ablation에서 맞춰야 할 tensor shape는 다음과 같이 둔다.
 
 ```text
-matching_confidence(r_k) = mean_c cosine(f_ref, f_c(r_k))
-reliability(r_k) = matching_confidence(r_k) * projection_quality(r_k)
+feature_maps[l]           = (B, N_cam, C_l, H_l, W_l)
+query/keypoint 3D points  = (B, N_obj, N_key, 3)
+projection 결과           = (B, N_cam, N_obj, N_key, 2)
+valid view/keypoint mask  = (B, N_cam, N_obj, N_key)
+sampled feature           = (B, N_cam, N_obj, N_key, C_l)
+projection_quality        = (B, N_cam, N_obj, N_key)
+view_support              = (B, N_cam, N_obj)
+query_support             = (B, N_obj)
 ```
 
-성공 기준은 `r_gt` 근처에서 reliability curve가 뚜렷한 local peak를 보이는 것이다.
-
-결과가 좋으면 다음 순서로 확장한다.
+Range-search ablation에서는 여기에 후보 축 `K`가 추가된다.
 
 ```text
-1. GT range 주변 oracle check
-2. baseline predicted range 주변 check
-3. temporal prior range 주변 check
-4. reliability를 query update에 연결
-5. auxiliary loss로 학습
-```
-
-Feature는 다음 우선순위로 비교한다.
-
-```text
-1. neck/FPN feature
-2. object-region pooled feature
-3. 2D aux feature
-4. raw backbone feature
+candidate keypoints       = (B, N_obj, K, N_key, 3)
+candidate projection      = (B, N_cam, N_obj, K, N_key, 2)
+candidate reliability     = (B, N_obj, K)
 ```
 
 ## 코드 배치
@@ -120,10 +131,10 @@ Feature는 다음 우선순위로 비교한다.
 실제 모델 로직은 `projects/mmdet3d_plugin/` 안에 넣고, 그 모델을 실행하거나 중간 결과를 뽑는 바깥 실험 스크립트만 `tools/research/`에 모은다.
 
 ```text
-projects/mmdet3d_plugin/models/projection.py        # fisheye projection / inverse ray / projection validity
-projects/mmdet3d_plugin/models/ray_matching.py      # range 후보, visible-view matching, reliability 계산
+projects/mmdet3d_plugin/models/projection.py        # fisheye projection / projection validity
+projects/mmdet3d_plugin/models/ray_matching.py      # range-search ablation / visible-view support helper
 projects/mmdet3d_plugin/models/blocks.py            # 기존 feature sampling/fusion에 reliability weight 연결
-projects/mmdet3d_plugin/models/sparse4d_head.py     # query range/update에 reliability 반영
+projects/mmdet3d_plugin/models/sparse4d_head.py     # temporal query update에 reliability 반영
 projects/mmdet3d_plugin/datasets/transforms/        # camera/GT/meta packing 보강
 configs/                                            # ablation별 설정
 tools/research/                                    # 위 모델을 호출하는 실험 실행 스크립트
@@ -134,13 +145,13 @@ tools/research/                                    # 위 모델을 호출하는 
 현재 예정 실행 스크립트:
 
 ```text
-tools/research/ray_matching_oracle_check.py
+tools/research/ray_range_gt_check.py
 ```
 
 결과 저장 위치:
 
 ```text
-work_dirs/_ray_matching_oracle_check/
+work_dirs/_ray_range_gt_check/
 ```
 
 ## 지금 볼 코드
@@ -149,8 +160,8 @@ work_dirs/_ray_matching_oracle_check/
 
 | 우선순위 | 파일 | 볼 내용 |
 | ---: | --- | --- |
-| 1 | `projects/mmdet3d_plugin/models/projection.py` | KB fisheye projection, 앞으로 추가할 inverse ray / projection quality |
-| 2 | `projects/mmdet3d_plugin/models/ray_matching.py` | 다음에 만들 ray 후보, support scoring, reliability 계산 모듈 |
+| 1 | `projects/mmdet3d_plugin/models/projection.py` | KB fisheye projection, FOV/image-bound validity, projection quality |
+| 2 | `projects/mmdet3d_plugin/models/ray_matching.py` | range-search ablation, sparse keypoint support scoring helper |
 | 3 | `projects/mmdet3d_plugin/models/blocks.py` | feature sampling/fusion에 reliability weight를 연결할 지점 |
 | 4 | `projects/mmdet3d_plugin/models/sparse4d_head.py` | temporal query update에 reliability를 반영할 지점 |
 | 5 | `projects/mmdet3d_plugin/datasets/transforms/pack_sparse4d.py` | camera matrix, fisheye params, GT/meta가 모델로 들어오는 흐름 |
@@ -172,7 +183,7 @@ work_dirs/_ray_matching_oracle_check/
 
 | 우선순위 | 논문 | 필요한 이유 |
 | ---: | --- | --- |
-| 1 | ORA3D | dense overlap disparity/depth supervision과 본 연구의 object-query sparse ray matching 차이를 대비한다. |
+| 1 | ORA3D | dense overlap disparity/depth supervision과 본 연구의 query-level visible-view support 차이를 대비한다. |
 | 2 | Sparse4D v3 | object query, temporal instance bank, query update 흐름의 직접적인 기반이다. |
 | 3 | MIC-BEV | 여러 camera/view 관측을 동일하게 보지 않고 중요도를 다르게 두는 논리를 방어한다. |
 | 4 | FishBEV / Fisheye3DOD / DaF-BEVSeg | fisheye projection, view 품질, 주변부 왜곡 문제를 설명하는 배경으로 사용한다. |

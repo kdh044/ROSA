@@ -5,6 +5,8 @@
 #
 # Projects LiDAR points to each camera's image plane via `lidar2img` and
 # emits a list of multi-scale sparse depth maps (one per FPN level).
+# This is for dense depth-branch supervision only. It is not the
+# object-query center ray/range target used by the current research.
 # ------------------------------------------------------------------------
 from typing import List
 

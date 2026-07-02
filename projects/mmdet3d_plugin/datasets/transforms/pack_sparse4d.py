@@ -150,7 +150,8 @@ class PackSparse4DInputs(BaseTransform):
         inputs["ocam_lens_fov_deg"] = float(self.ocam_lens_fov_deg)
         inputs["kb_lens_fov_deg"] = float(self.kb_lens_fov_deg)
 
-        # ---- depth GT (already prepared by MultiScaleDepthMapGenerator) ----
+        # ---- dense depth-map GT only, not the query-center ray/range target ----
+        # Prepared by MultiScaleDepthMapGenerator when the dense depth branch is used.
         if "gt_depth" in results:
             inputs["gt_depth"] = [
                 _to_tensor(d).float() for d in results["gt_depth"]
