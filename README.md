@@ -174,10 +174,11 @@ candidate reliability     = (B, N_obj, K)
 projects/mmdet3d_plugin/models/projection.py        # fisheye projection / projection validity
 projects/mmdet3d_plugin/models/ray_matching.py      # range-search ablation / visible-view support helper
 projects/mmdet3d_plugin/models/positional_encoding.py # ray PE / camera geometry encoding 후보
-projects/mmdet3d_plugin/models/blocks.py            # 기존 feature sampling/fusion에 reliability weight 연결
+projects/mmdet3d_plugin/models/blocks.py            # geometry-biased view/keypoint attention
 projects/mmdet3d_plugin/models/sparse4d_head.py     # temporal query update에 reliability 반영
 projects/mmdet3d_plugin/datasets/transforms/        # camera/GT/meta packing 보강
-configs/                                            # ablation별 설정
+configs/sparse4d_kb20_car_ped_viewconf.py           # fisheye geometry attention ablation
+configs/                                            # 기타 ablation별 설정
 tools/research/                                    # 위 모델을 호출하는 실험 실행 스크립트
 ```
 
@@ -203,7 +204,7 @@ work_dirs/_ray_range_gt_check/
 | ---: | --- | --- |
 | 1 | `projects/mmdet3d_plugin/models/projection.py` | KB fisheye projection, FOV/image-bound validity, projection quality |
 | 2 | `projects/mmdet3d_plugin/models/ray_matching.py` | range-search ablation, sparse keypoint support scoring helper |
-| 3 | `projects/mmdet3d_plugin/models/blocks.py` | feature sampling/fusion에 projection-quality weight를 연결할 지점 |
+| 3 | `projects/mmdet3d_plugin/models/blocks.py` | DeformableFeatureAggregation attention에 fisheye geometry bias를 넣은 지점 |
 | 4 | `projects/mmdet3d_plugin/models/sparse4d_head.py` | range auxiliary head와 temporal query update reliability를 반영할 지점 |
 | 5 | `projects/mmdet3d_plugin/datasets/transforms/pack_sparse4d.py` | camera matrix, fisheye params, GT/meta가 모델로 들어오는 흐름 |
 | 6 | `configs/` | `range aux only`, `ray PE`, `overlap mask`, `quality weighting` ablation 설정 |

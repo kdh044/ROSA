@@ -63,6 +63,8 @@ class DeformableFeatureAggregation(BaseModule):
         use_camera_embed=False,
         residual_mode="add",
         projection_type="pinhole",
+        use_fisheye_geometry_attention=False,
+        geometry_attention_cfg=None,
     ):
         super(DeformableFeatureAggregation, self).__init__()
         if embed_dims % num_groups != 0:
@@ -81,6 +83,20 @@ class DeformableFeatureAggregation(BaseModule):
         self.use_deformable_func = use_deformable_func
         self.attn_drop = attn_drop
         self.residual_mode = residual_mode
+        self.use_fisheye_geometry_attention = bool(use_fisheye_geometry_attention)
+        default_geometry_cfg = dict(
+            boundary_margin=0.08,
+            boundary_weight=1.0,
+            center_weight=0.5,
+            angle_weight=1.0,
+            bias_scale=1.0,
+            min_confidence=1e-4,
+            max_incidence_deg=None,
+        )
+        if geometry_attention_cfg is not None:
+            default_geometry_cfg.update(geometry_attention_cfg)
+        self.geometry_attention_cfg = default_geometry_cfg
+        self._last_geometry_confidence = None
         self.proj_drop = nn.Dropout(proj_drop)
         kps_generator["embed_dims"] = embed_dims
         self.kps_generator = MODELS.build(kps_generator)
@@ -126,16 +142,36 @@ class DeformableFeatureAggregation(BaseModule):
     ):
         bs, num_anchor = instance_feature.shape[:2]
         key_points = self.kps_generator(anchor, instance_feature)
-        weights = self._get_weights(instance_feature, anchor_embed, metas)
+        points_2d = None
+        geometry_confidence = None
+        if self.use_fisheye_geometry_attention:
+            points_2d = self.project_points(
+                key_points,
+                metas["projection_mat"],
+                metas.get("image_wh"),
+                metas=metas,
+            )
+            geometry_confidence = self._get_geometry_confidence(
+                key_points, points_2d, metas
+            )
+            self._last_geometry_confidence = geometry_confidence.detach()
+        else:
+            self._last_geometry_confidence = None
+
+        weights = self._get_weights(
+            instance_feature, anchor_embed, metas, geometry_confidence
+        )
 
         if self.use_deformable_func:
-            points_2d = (
-                self.project_points(
+            if points_2d is None:
+                points_2d = self.project_points(
                     key_points,
                     metas["projection_mat"],
                     metas.get("image_wh"),
                     metas=metas,
                 )
+            points_2d = (
+                points_2d
                 .permute(0, 2, 3, 1, 4)
                 .reshape(bs, num_anchor, self.num_pts, self.num_cams, 2)
             )
@@ -172,7 +208,9 @@ class DeformableFeatureAggregation(BaseModule):
             output = torch.cat([output, instance_feature], dim=-1)
         return output
 
-    def _get_weights(self, instance_feature, anchor_embed, metas=None):
+    def _get_weights(
+        self, instance_feature, anchor_embed, metas=None, geometry_confidence=None
+    ):
         bs, num_anchor = instance_feature.shape[:2]
         feature = instance_feature + anchor_embed
         if self.camera_encoder is not None:
@@ -183,9 +221,25 @@ class DeformableFeatureAggregation(BaseModule):
             )
             feature = feature[:, :, None] + camera_embed[:, None]
 
+        logits = self.weights_fc(feature).reshape(
+            bs,
+            num_anchor,
+            self.num_cams,
+            self.num_levels,
+            self.num_pts,
+            self.num_groups,
+        )
+        if geometry_confidence is not None:
+            cfg = self.geometry_attention_cfg
+            min_conf = float(cfg["min_confidence"])
+            bias_scale = float(cfg["bias_scale"])
+            geo_bias = torch.log(
+                geometry_confidence.clamp(min=min_conf)
+            ) * bias_scale
+            logits = logits + geo_bias[:, :, :, None, :, None]
+
         weights = (
-            self.weights_fc(feature)
-            .reshape(bs, num_anchor, -1, self.num_groups)
+            logits.reshape(bs, num_anchor, -1, self.num_groups)
             .softmax(dim=-2)
             .reshape(
                 bs,
@@ -205,6 +259,69 @@ class DeformableFeatureAggregation(BaseModule):
                 1 - self.attn_drop
             )
         return weights
+
+    def _get_geometry_confidence(self, key_points, points_2d, metas):
+        """Build a geometry-derived attention prior for each view/keypoint.
+
+        Returns:
+            confidence: (B, N_anchor, N_cam, N_pts), in [0, 1].
+        """
+        cfg = self.geometry_attention_cfg
+        valid = (points_2d[..., 0] >= 0.0) & (points_2d[..., 0] <= 1.0)
+        valid = valid & (points_2d[..., 1] >= 0.0) & (points_2d[..., 1] <= 1.0)
+
+        boundary = torch.minimum(
+            torch.minimum(points_2d[..., 0], 1.0 - points_2d[..., 0]),
+            torch.minimum(points_2d[..., 1], 1.0 - points_2d[..., 1]),
+        )
+        boundary_margin = float(cfg["boundary_margin"])
+        boundary_conf = (boundary / max(boundary_margin, 1e-6)).clamp(0.0, 1.0)
+
+        center_dist = torch.linalg.norm(points_2d - 0.5, dim=-1) / (0.5 ** 0.5)
+        center_conf = (1.0 - center_dist).clamp(0.0, 1.0)
+
+        angle_conf = self._get_incidence_confidence(key_points, metas)
+
+        confidence = valid.to(dtype=points_2d.dtype)
+        confidence = confidence * boundary_conf.pow(float(cfg["boundary_weight"]))
+        confidence = confidence * center_conf.pow(float(cfg["center_weight"]))
+        confidence = confidence * angle_conf.pow(float(cfg["angle_weight"]))
+        return confidence.permute(0, 2, 1, 3).contiguous()
+
+    def _get_incidence_confidence(self, key_points, metas):
+        lidar2cam = metas.get("lidar2cam")
+        if lidar2cam is None:
+            return key_points.new_ones(
+                key_points.shape[0],
+                self.num_cams,
+                key_points.shape[1],
+                key_points.shape[2],
+            )
+        bs, num_anchor, num_pts = key_points.shape[:3]
+        ones = key_points.new_ones(bs, num_anchor, num_pts, 1)
+        pts_h = torch.cat([key_points, ones], dim=-1)[:, None, ..., None]
+        pts_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
+        x = pts_cam[..., 0]
+        y = pts_cam[..., 1]
+        z = pts_cam[..., 2]
+        radial = torch.sqrt(x * x + y * y + 1e-12)
+
+        if self.projection_type == "ocam_fisheye":
+            incidence = torch.atan2(radial, -z)
+            lens_key = "ocam_lens_fov_deg"
+        else:
+            incidence = torch.atan2(radial, z)
+            lens_key = "kb_lens_fov_deg"
+
+        max_incidence_deg = self.geometry_attention_cfg.get("max_incidence_deg")
+        if max_incidence_deg is None:
+            lens_fov = metas.get(lens_key, metas.get("ocam_lens_fov_deg", 360.0))
+            if isinstance(lens_fov, torch.Tensor):
+                max_incidence_deg = float(lens_fov.flatten()[0].item()) / 2.0
+            else:
+                max_incidence_deg = float(lens_fov) / 2.0
+        max_incidence = np.deg2rad(float(max_incidence_deg))
+        return (1.0 - incidence / max(max_incidence, 1e-6)).clamp(0.0, 1.0)
 
     def project_points(
         self, key_points, projection_mat, image_wh=None, metas=None
