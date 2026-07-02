@@ -1,14 +1,17 @@
-# Copyright (c) Horizon Robotics. All rights reserved.
+# ------------------------------------------------------------------------
+# Ported from Sparse4D (HorizonRobotics) to mmcv 2.x / mmdet3d 1.4
+# Changes: BBOX_CODERS → mmdet3d TASK_UTILS
+# ------------------------------------------------------------------------
 from typing import Optional
 
 import torch
 
-from mmdet.core.bbox.builder import BBOX_CODERS
+from mmdet3d.registry import TASK_UTILS
 
 from projects.mmdet3d_plugin.core.box3d import *
 
 
-@BBOX_CODERS.register_module()
+@TASK_UTILS.register_module()
 class SparseBox3DDecoder(object):
     def __init__(
         self,

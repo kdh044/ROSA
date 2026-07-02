@@ -1,13 +1,16 @@
+# ------------------------------------------------------------------------
+# Ported from Sparse4D (HorizonRobotics) to mmcv 2.x / mmdet3d 1.4
+# Changes: LOSSES → mmdet3d MODELS
+# ------------------------------------------------------------------------
 import torch
 import torch.nn as nn
 
-from mmcv.utils import build_from_cfg
-from mmdet.models.builder import LOSSES
+from mmdet3d.registry import MODELS
 
 from projects.mmdet3d_plugin.core.box3d import *
 
 
-@LOSSES.register_module()
+@MODELS.register_module()
 class SparseBox3DLoss(nn.Module):
     def __init__(
         self,
@@ -18,14 +21,14 @@ class SparseBox3DLoss(nn.Module):
     ):
         super().__init__()
 
-        def build(cfg, registry):
+        def build(cfg):
             if cfg is None:
                 return None
-            return build_from_cfg(cfg, registry)
+            return MODELS.build(cfg)
 
-        self.loss_box = build(loss_box, LOSSES)
-        self.loss_cns = build(loss_centerness, LOSSES)
-        self.loss_yns = build(loss_yawness, LOSSES)
+        self.loss_box = build(loss_box)
+        self.loss_cns = build(loss_centerness)
+        self.loss_yns = build(loss_yawness)
         self.cls_allow_reverse = cls_allow_reverse
 
     def forward(
@@ -39,8 +42,6 @@ class SparseBox3DLoss(nn.Module):
         cls_target=None,
         **kwargs,
     ):
-        # Some categories do not distinguish between positive and negative
-        # directions. For example, barrier in nuScenes dataset.
         if self.cls_allow_reverse is not None and cls_target is not None:
             if_reverse = (
                 torch.nn.functional.cosine_similarity(

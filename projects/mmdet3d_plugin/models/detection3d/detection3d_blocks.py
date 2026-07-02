@@ -1,14 +1,16 @@
+# ------------------------------------------------------------------------
+# Ported from Sparse4D (HorizonRobotics) to mmcv 2.x / mmdet3d 1.4
+# Changes: PLUGIN_LAYERS / POSITIONAL_ENCODING → mmdet3d MODELS
+# ------------------------------------------------------------------------
 import torch
 import torch.nn as nn
 import numpy as np
 
-from mmcv.cnn import Linear, Scale, bias_init_with_prob
-from mmcv.runner.base_module import Sequential, BaseModule
-from mmcv.cnn import xavier_init
-from mmcv.cnn.bricks.registry import (
-    PLUGIN_LAYERS,
-    POSITIONAL_ENCODING,
-)
+from mmcv.cnn import Linear, Scale
+from mmengine.model import BaseModule, Sequential
+from mmengine.model import xavier_init, bias_init_with_prob
+
+from mmdet3d.registry import MODELS
 
 from projects.mmdet3d_plugin.core.box3d import *
 from ..blocks import linear_relu_ln
@@ -20,7 +22,7 @@ __all__ = [
 ]
 
 
-@POSITIONAL_ENCODING.register_module()
+@MODELS.register_module()
 class SparseBox3DEncoder(BaseModule):
     def __init__(
         self,
@@ -74,7 +76,7 @@ class SparseBox3DEncoder(BaseModule):
         return output
 
 
-@PLUGIN_LAYERS.register_module()
+@MODELS.register_module()
 class SparseBox3DRefinementModule(BaseModule):
     def __init__(
         self,
@@ -156,7 +158,7 @@ class SparseBox3DRefinementModule(BaseModule):
         return output, cls, quality
 
 
-@PLUGIN_LAYERS.register_module()
+@MODELS.register_module()
 class SparseBox3DKeyPointsGenerator(BaseModule):
     def __init__(
         self,
@@ -291,11 +293,6 @@ class SparseBox3DKeyPointsGenerator(BaseModule):
                 T_src2dst[..., :vel_dim, :vel_dim], vel[..., None]
             ).squeeze(-1)
             dst_anchor = torch.cat([center, size, yaw, vel], dim=-1)
-            # TODO: Fix bug
-            # index = [X, Y, Z, W, L, H, COS_YAW, SIN_YAW] + [VX, VY, VZ][:vel_dim]
-            # index = torch.tensor(index, device=dst_anchor.device)
-            # index = torch.argsort(index)
-            # dst_anchor = dst_anchor.index_select(dim=-1, index=index)
             dst_anchors.append(dst_anchor)
         return dst_anchors
 

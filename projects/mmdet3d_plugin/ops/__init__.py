@@ -1,6 +1,11 @@
-import torch
+try:
+    from .deformable_aggregation import DeformableAggregationFunction
+    from . import deformable_aggregation_ext  # noqa: F401
 
-from .deformable_aggregation import DeformableAggregationFunction
+    _DAF_BUILT = True
+except Exception:
+    DeformableAggregationFunction = None
+    _DAF_BUILT = False
 
 
 def deformable_aggregation_function(
@@ -10,6 +15,11 @@ def deformable_aggregation_function(
     sampling_location,
     weights,
 ):
+    if not _DAF_BUILT:
+        raise RuntimeError(
+            "deformable_aggregation_ext is not built. Run "
+            "`python projects/mmdet3d_plugin/ops/setup.py develop` in this package."
+        )
     return DeformableAggregationFunction.apply(
         feature_maps,
         spatial_shape,
@@ -20,6 +30,8 @@ def deformable_aggregation_function(
 
 
 def feature_maps_format(feature_maps, inverse=False):
+    import torch
+
     if inverse:
         col_feats, spatial_shape, scale_start_index = feature_maps
         num_cams, num_levels = spatial_shape.shape[:2]

@@ -1,3 +1,14 @@
 *.pyc
 *.npy
 *.pth
+
+# Local artifacts and generated files
+*.pyo
+__pycache__/
+*.so
+*.o
+build/
+*.egg-info/
+.ninja_deps
+.ninja_log
+work_dirs/

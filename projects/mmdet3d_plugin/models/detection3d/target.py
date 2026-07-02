@@ -1,9 +1,13 @@
+# ------------------------------------------------------------------------
+# Ported from Sparse4D (HorizonRobotics) to mmcv 2.x / mmdet3d 1.4
+# Changes: BBOX_SAMPLERS → mmdet3d TASK_UTILS
+# ------------------------------------------------------------------------
 import torch
 import numpy as np
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from mmdet.core.bbox.builder import BBOX_SAMPLERS
+from mmdet3d.registry import TASK_UTILS
 
 from projects.mmdet3d_plugin.core.box3d import *
 from ..base_target import BaseTargetWithDenoising
@@ -12,7 +16,7 @@ from ..base_target import BaseTargetWithDenoising
 __all__ = ["SparseBox3DTarget"]
 
 
-@BBOX_SAMPLERS.register_module()
+@TASK_UTILS.register_module()
 class SparseBox3DTarget(BaseTargetWithDenoising):
     def __init__(
         self,
@@ -272,7 +276,7 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
             )
             valid_mask = torch.logical_or(
                 valid_mask, ((cls_target >= 0) & (dn_cls_target == -3))
-            )  # valid denotes the items is not from pad.
+            )
         attn_mask = dn_box_target.new_ones(
             num_gt * self.num_dn_groups, num_gt * self.num_dn_groups
         )
@@ -315,15 +319,12 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
                 dn_id_target,
             )
 
-        # split instance_feature and anchor into non-dn and dn
         num_dn = num_anchor - num_noraml_anchor
         dn_instance_feature = instance_feature[:, -num_dn:]
         dn_anchor = anchor[:, -num_dn:]
         instance_feature = instance_feature[:, :num_noraml_anchor]
         anchor = anchor[:, :num_noraml_anchor]
 
-        # reshape all dn metas from (bs,num_all_dn,xxx)
-        # to (bs, dn_group, num_dn_per_group, xxx)
         num_dn_groups = self.num_dn_groups
         num_dn = num_dn // num_dn_groups
         dn_feat = dn_instance_feature.reshape(bs, num_dn_groups, num_dn, -1)
@@ -334,12 +335,10 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
         if dn_id_target is not None:
             dn_id = dn_id_target.reshape(bs, num_dn_groups, num_dn)
 
-        # update temp_dn_metas by instance_id
         temp_dn_feat = self.dn_metas["dn_instance_feature"]
         _, num_temp_dn_groups, num_temp_dn = temp_dn_feat.shape[:3]
         temp_dn_id = self.dn_metas["dn_id_target"]
 
-        # bs, num_temp_dn_groups, num_temp_dn, num_dn
         match = temp_dn_id[..., None] == dn_id[:, :num_temp_dn_groups, None]
         temp_reg_target = (
             match[..., None] * dn_reg_target[:, :num_temp_dn_groups, None]
@@ -352,8 +351,6 @@ class SparseBox3DTarget(BaseTargetWithDenoising):
         temp_valid_mask = self.dn_metas["valid_mask"]
         temp_dn_anchor = self.dn_metas["dn_anchor"]
 
-        # handle the misalignment the length of temp_dn to dn caused by the
-        # change of num_gt, then concat the temp_dn and dn
         temp_dn_metas = [
             temp_dn_feat,
             temp_dn_anchor,

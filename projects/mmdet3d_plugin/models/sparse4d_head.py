@@ -1,31 +1,82 @@
-# Copyright (c) Horizon Robotics. All rights reserved.
-from typing import List, Optional, Tuple, Union
-import warnings
+# ------------------------------------------------------------------------
+# Ported from Sparse4D (HorizonRobotics) to mmcv 2.x / mmdet3d 1.4
+# Changes:
+#   HEADS / LOSSES → mmdet3d MODELS
+#   BBOX_SAMPLERS / BBOX_CODERS → mmdet3d TASK_UTILS
+#   ATTENTION / PLUGIN_LAYERS / POSITIONAL_ENCODING / FEEDFORWARD_NETWORK /
+#       NORM_LAYERS → mmdet3d MODELS (all unified)
+#   BaseModule from mmengine.model
+#   reduce_mean from mmengine.dist.utils
+#   force_fp32 dropped
+# ------------------------------------------------------------------------
+from typing import List, Optional, Union
 
-import numpy as np
 import torch
 import torch.nn as nn
 
-from mmcv.cnn.bricks.registry import (
-    ATTENTION,
-    PLUGIN_LAYERS,
-    POSITIONAL_ENCODING,
-    FEEDFORWARD_NETWORK,
-    NORM_LAYERS,
-)
-from mmcv.runner import BaseModule, force_fp32
-from mmcv.utils import build_from_cfg
-from mmdet.core.bbox.builder import BBOX_SAMPLERS
-from mmdet.core.bbox.builder import BBOX_CODERS
-from mmdet.models import HEADS, LOSSES
-from mmdet.core import reduce_mean
+from mmengine.model import BaseModule
+from mmengine.dist import all_reduce
+import torch.distributed as dist
 
-from .blocks import DeformableFeatureAggregation as DFG
+from mmdet3d.registry import MODELS, TASK_UTILS
+
+from .blocks import DeformableFeatureAggregation as DFG  # noqa: F401
 
 __all__ = ["Sparse4DHead"]
 
 
-@HEADS.register_module()
+def reduce_mean(tensor):
+    """All-reduce mean of a tensor across DDP workers (no-op when single GPU)."""
+    if not (dist.is_available() and dist.is_initialized()):
+        return tensor
+    tensor = tensor.clone()
+    all_reduce(tensor, op="mean")
+    return tensor
+
+
+def _build_norm(cfg):
+    """Resolve mmcv-1 style norm configs (LN / BN / GN) to torch modules."""
+    if cfg is None:
+        return None
+    cfg = cfg.copy()
+    norm_type = cfg.pop("type")
+    if norm_type in ("LN", "LayerNorm"):
+        normalized_shape = cfg.pop("normalized_shape")
+        return nn.LayerNorm(normalized_shape, **cfg)
+    if norm_type in ("BN", "BN2d", "BatchNorm2d"):
+        return nn.BatchNorm2d(**cfg)
+    if norm_type in ("BN1d", "BatchNorm1d"):
+        return nn.BatchNorm1d(**cfg)
+    if norm_type in ("GN", "GroupNorm"):
+        return nn.GroupNorm(**cfg)
+    return MODELS.build(dict(type=norm_type, **cfg))
+
+
+def _build_attention(cfg):
+    """MultiheadAttention from mmcv-1 ATTENTION → torch.nn.MultiheadAttention.
+
+    Falls back to MODELS registry otherwise.
+    """
+    if cfg is None:
+        return None
+    cfg = cfg.copy()
+    if cfg.get("type") == "MultiheadAttention":
+        cfg.pop("type")
+        embed_dims = cfg.pop("embed_dims")
+        num_heads = cfg.pop("num_heads")
+        dropout = cfg.pop("dropout", 0.0)
+        batch_first = cfg.pop("batch_first", True)
+        return nn.MultiheadAttention(
+            embed_dim=embed_dims,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=batch_first,
+            **cfg,
+        )
+    return MODELS.build(cfg)
+
+
+@MODELS.register_module()
 class Sparse4DHead(BaseModule):
     def __init__(
         self,
@@ -50,6 +101,7 @@ class Sparse4DHead(BaseModule):
         cls_threshold_to_reg: float = -1,
         dn_loss_weight: float = 5.0,
         decouple_attn: bool = True,
+        gate_invalid_temp_gnn: bool = False,
         init_cfg: dict = None,
         **kwargs,
     ):
@@ -61,6 +113,7 @@ class Sparse4DHead(BaseModule):
         self.cls_threshold_to_reg = cls_threshold_to_reg
         self.dn_loss_weight = dn_loss_weight
         self.decouple_attn = decouple_attn
+        self.gate_invalid_temp_gnn = gate_invalid_temp_gnn
 
         if reg_weights is None:
             self.reg_weights = [1.0] * 10
@@ -78,36 +131,33 @@ class Sparse4DHead(BaseModule):
                 "norm",
                 "refine",
             ] * num_decoder
-            # delete the 'gnn' and 'norm' layers in the first transformer blocks
             operation_order = operation_order[3:]
         self.operation_order = operation_order
 
-        # =========== build modules ===========
-        def build(cfg, registry):
-            if cfg is None:
-                return None
-            return build_from_cfg(cfg, registry)
+        self.instance_bank = MODELS.build(instance_bank)
+        self.anchor_encoder = MODELS.build(anchor_encoder)
+        self.sampler = TASK_UTILS.build(sampler) if sampler is not None else None
+        self.decoder = TASK_UTILS.build(decoder) if decoder is not None else None
+        self.loss_cls = MODELS.build(loss_cls) if loss_cls is not None else None
+        self.loss_reg = MODELS.build(loss_reg) if loss_reg is not None else None
 
-        self.instance_bank = build(instance_bank, PLUGIN_LAYERS)
-        self.anchor_encoder = build(anchor_encoder, POSITIONAL_ENCODING)
-        self.sampler = build(sampler, BBOX_SAMPLERS)
-        self.decoder = build(decoder, BBOX_CODERS)
-        self.loss_cls = build(loss_cls, LOSSES)
-        self.loss_reg = build(loss_reg, LOSSES)
-        self.op_config_map = {
-            "temp_gnn": [temp_graph_model, ATTENTION],
-            "gnn": [graph_model, ATTENTION],
-            "norm": [norm_layer, NORM_LAYERS],
-            "ffn": [ffn, FEEDFORWARD_NETWORK],
-            "deformable": [deformable_model, ATTENTION],
-            "refine": [refine_layer, PLUGIN_LAYERS],
-        }
-        self.layers = nn.ModuleList(
-            [
-                build(*self.op_config_map.get(op, [None, None]))
-                for op in self.operation_order
-            ]
-        )
+        self.layers = nn.ModuleList()
+        for op in self.operation_order:
+            if op == "temp_gnn":
+                self.layers.append(_build_attention(temp_graph_model))
+            elif op == "gnn":
+                self.layers.append(_build_attention(graph_model))
+            elif op == "norm":
+                self.layers.append(_build_norm(norm_layer))
+            elif op == "ffn":
+                self.layers.append(MODELS.build(ffn))
+            elif op == "deformable":
+                self.layers.append(MODELS.build(deformable_model))
+            elif op == "refine":
+                self.layers.append(MODELS.build(refine_layer))
+            else:
+                raise NotImplementedError(f"unknown operation '{op}'")
+
         self.embed_dims = self.instance_bank.embed_dims
         if self.decouple_attn:
             self.fc_before = nn.Linear(
@@ -149,8 +199,17 @@ class Sparse4DHead(BaseModule):
             query_pos, key_pos = None, None
         if value is not None:
             value = self.fc_before(value)
-        return self.fc_after(
-            self.layers[index](
+        # torch MultiheadAttention returns (out, attn_weights)
+        layer = self.layers[index]
+        if isinstance(layer, nn.MultiheadAttention):
+            if key is None:
+                key = query
+            if value is None:
+                value = query
+            attn_mask = kwargs.get("attn_mask")
+            out, _ = layer(query, key, value, attn_mask=attn_mask)
+        else:
+            out = layer(
                 query,
                 key,
                 value,
@@ -158,7 +217,7 @@ class Sparse4DHead(BaseModule):
                 key_pos=key_pos,
                 **kwargs,
             )
-        )
+        return self.fc_after(out)
 
     def forward(
         self,
@@ -169,9 +228,9 @@ class Sparse4DHead(BaseModule):
             feature_maps = [feature_maps]
         batch_size = feature_maps[0].shape[0]
 
-        # ========= get instance info ============
         if (
-            self.sampler.dn_metas is not None
+            self.sampler is not None
+            and self.sampler.dn_metas is not None
             and self.sampler.dn_metas["dn_anchor"].shape[0] != batch_size
         ):
             self.sampler.dn_metas = None
@@ -182,17 +241,19 @@ class Sparse4DHead(BaseModule):
             temp_anchor,
             time_interval,
         ) = self.instance_bank.get(
-            batch_size, metas, dn_metas=self.sampler.dn_metas
+            batch_size,
+            metas,
+            dn_metas=self.sampler.dn_metas if self.sampler is not None else None,
         )
 
-        # ========= prepare for denosing training ============
-        # 1. get dn metas: noisy-anchors and corresponding GT
-        # 2. concat learnable instances and noisy instances
-        # 3. get attention mask
         attn_mask = None
         dn_metas = None
         temp_dn_reg_target = None
-        if self.training and hasattr(self.sampler, "get_dn_anchors"):
+        if (
+            self.training
+            and self.sampler is not None
+            and hasattr(self.sampler, "get_dn_anchors")
+        ):
             if "instance_id" in metas["img_metas"][0]:
                 gt_instance_id = [
                     torch.from_numpy(x["instance_id"]).cuda()
@@ -250,7 +311,6 @@ class Sparse4DHead(BaseModule):
         else:
             temp_anchor_embed = None
 
-        # =================== forward the layers ====================
         prediction = []
         classification = []
         quality = []
@@ -258,6 +318,7 @@ class Sparse4DHead(BaseModule):
             if self.layers[i] is None:
                 continue
             elif op == "temp_gnn":
+                current_instance_feature = instance_feature
                 instance_feature = self.graph_model(
                     i,
                     instance_feature,
@@ -269,6 +330,17 @@ class Sparse4DHead(BaseModule):
                     if temp_instance_feature is None
                     else None,
                 )
+                temp_mask = getattr(self.instance_bank, "mask", None)
+                if (
+                    self.gate_invalid_temp_gnn
+                    and temp_instance_feature is not None
+                    and temp_mask is not None
+                ):
+                    instance_feature = torch.where(
+                        temp_mask[:, None, None],
+                        instance_feature,
+                        current_instance_feature,
+                    )
             elif op == "gnn":
                 instance_feature = self.graph_model(
                     i,
@@ -342,7 +414,6 @@ class Sparse4DHead(BaseModule):
 
         output = {}
 
-        # split predictions of learnable instances and noisy instances
         if dn_metas is not None:
             dn_classification = [
                 x[:, num_free_instance:] for x in classification
@@ -380,7 +451,6 @@ class Sparse4DHead(BaseModule):
             anchor = anchor[:, :num_free_instance]
             cls = cls[:, :num_free_instance]
 
-            # cache dn_metas for temporal denoising
             self.sampler.cache_dn(
                 dn_instance_feature,
                 dn_anchor,
@@ -396,7 +466,6 @@ class Sparse4DHead(BaseModule):
             }
         )
 
-        # cache current instances for temporal modeling
         self.instance_bank.cache(
             instance_feature, anchor, cls, metas, feature_maps
         )
@@ -407,9 +476,7 @@ class Sparse4DHead(BaseModule):
             output["instance_id"] = instance_id
         return output
 
-    @force_fp32(apply_to=("model_outs"))
     def loss(self, model_outs, data, feature_maps=None):
-        # ===================== prediction losses ======================
         cls_scores = model_outs["classification"]
         reg_preds = model_outs["prediction"]
         quality = model_outs["quality"]
@@ -469,7 +536,6 @@ class Sparse4DHead(BaseModule):
         if "dn_prediction" not in model_outs:
             return output
 
-        # ===================== denoising losses ======================
         dn_cls_scores = model_outs["dn_classification"]
         dn_reg_preds = model_outs["dn_prediction"]
 
@@ -541,7 +607,6 @@ class Sparse4DHead(BaseModule):
             num_dn_pos,
         )
 
-    @force_fp32(apply_to=("model_outs"))
     def post_process(self, model_outs, output_idx=-1):
         return self.decoder.decode(
             model_outs["classification"],
