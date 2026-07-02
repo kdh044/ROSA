@@ -12,31 +12,52 @@
 
 **【2024/06】Our follow-up project, SparseDrive (an end-to-end planning model based on the sparse framework), has been released!!! [arxiv](https://arxiv.org/abs/2405.19620) & [github](https://github.com/swc-17/SparseDrive).**
 
-## 로컬 연구 메모: Fisheye-Aware Graph Query Aggregation
+## 로컬 연구 메모: Object-Query 중심 Sparse Multi-view Ray Matching
 
-이 fork는 KB20/SphereStream 계열 4-fisheye 3D MOT 실험을 위한 작업 공간이다. 현재 연구 방향은 다음과 같이 둔다.
+이 fork는 KB20/SphereStream 계열 4-fisheye 3D detection 실험을 위한 작업 공간이다. 현재 연구 방향은 다음과 같이 둔다.
 
-> Fisheye-Aware Graph Query Aggregation for 4-Fisheye 3D MOT
+> Object-Query 중심 Sparse Multi-view Ray Matching for 4-Fisheye Temporal 3D Detection
 
-핵심 문제의식은 fisheye query가 단순히 "3D query가 이미지 어디에 투영되는가"만 보는 것이 아니라, "어떤 view/node 관측이 이 query의 3D 위치를 가장 잘 지지하는가"를 함께 판단해야 한다는 점이다. 따라서 방법은 단순한 geometry MLP 추가가 아니라, object query 중심의 visible multi-view 관측을 신뢰도에 따라 다르게 반영하는 구조로 정리한다.
+핵심 문제의식은 fisheye query가 단순히 "3D query가 이미지 어디에 투영되는가"만 보는 것이 아니라, "visible overlap view들 중 어떤 관측이 이 query의 3D 위치를 가장 잘 지지하는가"를 함께 판단해야 한다는 점이다. 현재 방향은 object 전체를 촘촘한 graph node로 투영하는 방식이 아니다. 먼저 object center 한 점을 기준으로 sparse ray-depth 후보를 만들고, visible fisheye view들의 feature 일치도와 투영 품질을 이용해 query의 depth와 update 신뢰도를 안정화한다.
 
 ### 제안 모듈
 
 | 모듈 | 목적 | 참고 문헌 | 본 연구의 차이 |
 | --- | --- | --- | --- |
-| Fisheye Graph Node Sampling | object query/box 주변에 고정된 3D graph node를 만든다. center만 쓰지 않고 front/back, left/right, top/bottom, box edge sample 등을 후보로 둔다. | Graph-DETR3D, Sparse4D, Graph-DETR4D 확인 필요 | 짧은 주기 구현에서는 고정 object/box node를 먼저 쓰고, fisheye projection 품질을 평가한다. |
-| Node-View Reliability Estimator | 각 object query x graph node x camera view별 신뢰도를 추정한다. 입력 후보는 projection validity, projected footprint, radial distance, truncation ratio, visible view 수, best-view 대비 area ratio 등이다. | Fisheye3DOD, FishBEV, DaF-BEVSeg/FisheyeBEVSeg, MIC-BEV | camera-level 또는 BEV-cell-level importance가 아니라 object graph node-view reliability로 옮긴다. |
-| Reliability-Guided Temporal Query Update | view/node 신뢰도를 이용해 graph aggregation과 temporal query update를 조절한다. 좋지 않은 fisheye 관측이 temporal query persistence와 tracking을 흔들지 않게 하는 것이 목적이다. | Sparse4D v3, StreamPETR, UA-Track, Graph-DETR4D 확인 필요 | post-hoc tracking association cost가 아니라 temporal query update 자체에 집중한다. |
+| Object-Center Ray Candidate Sampling | object query의 중심점 하나를 기준으로 reference ray를 만들고, 그 ray 위에 sparse depth 후보를 생성한다. front/back, left/right, box edge 등 여러 graph node는 첫 단계에서 쓰지 않는다. | Sparse4D, ORA3D | dense overlap disparity나 box 전체 graph sampling이 아니라 object center query의 depth 후보만 sparse하게 검증한다. |
+| Visible-View Support Scoring | 각 depth 후보가 visible fisheye view들에서 얼마나 잘 지지되는지 계산한다. 신뢰도는 feature matching 신뢰도와 투영 품질 신뢰도를 곱해서 만든다. | ORA3D, MIC-BEV, FishBEV, Fisheye3DOD | 모든 view를 동일하게 평균내지 않고, query의 3D 위치를 가장 잘 지지하는 visible 관측을 더 강하게 반영한다. |
+| Reliability-Guided Temporal 3D Position Update | matching 기반 신뢰도를 이용해 매 시점 3D 위치/depth update를 안정화한다. 별도의 tracking 장치를 새로 만드는 것이 아니라 temporal 3D 위치 추정 안정성에 집중한다. | Sparse4D v3, StreamPETR, UA-Track | 추적 성능은 부가 결과로 볼 수 있지만, 주된 목표는 post-hoc association이 아니라 query의 시간적 3D 위치 추정 안정화다. |
+
+신뢰도 결합은 다음 형태를 기본으로 둔다.
+
+```text
+reliability(d_k) = matching_confidence(d_k) * projection_quality(d_k)
+```
+
+- `matching_confidence(d_k)`: visible view들에서 샘플링한 feature consistency. 첫 버전은 reference-to-visible cosine similarity 평균으로 계산한다.
+- `projection_quality(d_k)`: image bound, fisheye FOV, projected footprint, image-center distance, truncation, invalid region 여부로 계산한다.
+- 유효한 visible view가 두 개 미만이면 multi-view matching 대상에서 제외한다.
+
+Temporal depth 시작값은 object 상태에 따라 구분한다.
+
+```text
+기존 object query: 이전 frame의 depth / temporal prior 주변에서 후보 생성
+신규 object query: detector baseline depth 주변에서 후보 생성
+oracle 기초 검증: GT depth 주변에서 후보 생성
+```
+
+첫 실험은 oracle 기초 검증이므로 GT depth 주변 후보를 사용한다. 이 단계가 통과되면 실제 적용 단계에서 baseline predicted depth 또는 temporal-prior depth 주변 후보로 바꾼다.
 
 ### 읽을 논문 우선순위
 
 | 우선순위 | 논문 | 필요한 이유 |
 | ---: | --- | --- |
-| 1 | Graph-DETR3D | DETR3D-style query 주변 graph node feature aggregation의 직접적인 기반이다. 특히 border/overlap 영역 논리에 필요하다. |
-| 2 | Graph-DETR4D | temporal graph extension을 방어할 때 유용할 수 있다. 실제 인용 가능한 source 확인 필요. |
-| 3 | MIC-BEV | camera/view importance 관련 방어 논문이다. infrastructure camera의 BEV-cell importance와 대비할 수 있다. |
-| 4 | UA-Track | uncertainty-aware 3D MOT 방어 논문이다. object-state uncertainty/query denoising과 대비한다. |
-| 5 | ORA3D | overlap-region/depth-prior 처리 관련 방어 논문이다. 본 연구는 dense overlap disparity가 아니라 fisheye object-query sparse matching이라는 점을 대비한다. |
+| 1 | ORA3D | dense overlap disparity/depth supervision과 본 연구의 object-query sparse ray matching 차이를 명확히 대비하기 위해 필요하다. |
+| 2 | Sparse4D v3 | object query, temporal instance bank, query update 흐름의 직접적인 기반이다. |
+| 3 | MIC-BEV | 여러 camera/view 관측을 동일하게 보지 않고 중요도를 다르게 두는 논리를 방어하는 데 필요하다. |
+| 4 | FishBEV / Fisheye3DOD / DaF-BEVSeg | fisheye projection, view 품질, 주변부 왜곡 문제를 설명하는 배경으로 사용한다. |
+| 5 | UA-Track | uncertainty-aware temporal 3D 추정과 대비한다. 단, 본 연구는 별도 tracking association보다 query depth/update reliability에 집중한다. |
+| 6 | Graph-DETR3D | graph node aggregation은 이번 1차 방법의 핵심이 아니므로 참고 수준으로 둔다. 여러 node 확장은 후속 ablation 후보로만 남긴다. |
 
 ### 현재 ablation 메모
 
@@ -48,21 +69,23 @@
 | `sparse4d_kb20_car_ped_cyc_100e_github_r50_b8` | Car, Pedestrian, Cyclist | real | 0.2807 @ epoch 25 | 0.2253 | 0.2216 | 0.9601 | real velocity가 NDS/mAVE를 크게 악화한다. Cyclist도 약하다. |
 | `sparse4d_kb20_car_ped_cyc_zerovel_30e_github_r50_b8` | Car, Pedestrian, Cyclist | zero-valued | 0.2719 @ epoch 20 | 0.2447 | 0.3446 | 0.0033 | zero velocity로 mAVE/NDS는 회복되지만 2-class mAP까지는 회복되지 않는다. |
 
-해석: real velocity는 NDS/mAVE에 큰 영향을 주는 label/metric 이슈다. 하지만 3-class zero-velocity run도 2-class baseline보다 낮으므로 Cyclist 난이도, data balance, fisheye view-quality 문제가 여전히 남아 있다. node-view reliability 계열 모듈은 velocity ablation과 독립적인 축이며, label/class confounder를 통제한 뒤 평가하는 것이 맞다.
+해석: real velocity는 NDS/mAVE에 큰 영향을 주는 label/metric 이슈다. 하지만 3-class zero-velocity run도 2-class baseline보다 낮으므로 Cyclist 난이도, data balance, fisheye view-quality 문제가 여전히 남아 있다. sparse multi-view ray matching 계열 실험은 velocity ablation과 독립적인 축이며, label/class confounder를 통제한 뒤 평가하는 것이 맞다.
 
-### 현재 실험: Sparse Multi-view Ray Matching
+### 현재 실험: Sparse Multi-view Ray Matching 기초 검증
 
-다음 실험은 4-fisheye 환경에서 object-query-level sparse multi-view ray matching이 성립하는지 보는 oracle sanity check다. 핵심 질문은 다음이다.
+다음 실험은 4-fisheye 환경에서 object-query-level sparse multi-view ray matching이 성립하는지 보는 oracle 기반 기초 검증 실험이다. 핵심 질문은 다음이다.
 
 > GT object center 주변의 depth 후보를 visible fisheye view들에 재투영했을 때, multi-view feature consistency score가 실제 depth 근처에서 peak를 만드는가?
 
-핵심 가설은 4-fisheye overlap이 단순 중복 관측이 아니라는 점이다. 각 object query에 대해 여러 겹침 fisheye view가 서로 다른 후보 3D 위치를 서로 다른 신뢰도로 지지할 수 있다. 따라서 모든 view를 동일하게 평균내지 않고, projection quality, footprint, truncation, feature consistency를 이용해 query의 3D 위치를 가장 잘 지지하는 visible 관측을 더 강하게 반영해야 한다.
+핵심 가설은 4-fisheye overlap이 단순 중복 관측이 아니라는 점이다. 각 object query에 대해 여러 겹침 fisheye view가 서로 다른 후보 3D 위치를 서로 다른 신뢰도로 지지할 수 있다. 따라서 모든 view를 동일하게 평균내지 않고, projection quality와 feature consistency를 이용해 query의 3D 위치를 가장 잘 지지하는 visible 관측을 더 강하게 반영해야 한다.
 
-이 실험은 ORA3D식 dense overlap supervision과 다르다. ORA3D는 pinhole overlap 영역 전체에서 dense pixel-level disparity/depth cue를 사용한다. 우리는 먼저 4-fisheye 환경에서 object-query-level sparse ray matching만 검증한다.
+이 실험은 ORA3D식 dense overlap supervision과 다르다. ORA3D는 pinhole overlap 영역 전체에서 dense pixel-level disparity/depth cue를 사용한다. 우리는 먼저 4-fisheye 환경에서 object-query center 기반 sparse ray matching만 검증한다.
 
 ```text
 dense full-image overlap matching: no
 object-query visible fisheye views: yes
+object center ray only: yes
+multi-node box graph: no
 ```
 
 초기 절차:
@@ -74,33 +97,49 @@ object-query visible fisheye views: yes
 5. 각 후보 3D point를 네 개 fisheye camera에 모두 재투영한다.
 6. image bound, fisheye FOV, projection-quality filter를 통과한 visible view만 남긴다. image 밖, lens cone 밖, 심한 truncation, invalid region의 view는 matching score에 넣지 않는다.
 7. valid view에서 backbone/neck/object-region feature를 sampling한다.
-8. 먼저 reference-to-visible cosine similarity로 후보 depth score를 계산한다.
+8. 먼저 reference-to-visible cosine similarity로 후보 depth의 matching confidence를 계산한다.
+9. projection quality와 matching confidence를 곱해 최종 reliability curve를 만든다.
 
 ```text
-score(d_k) = mean_c cosine(f_ref(d_k), f_c(d_k))
+matching_confidence(d_k) = mean_c cosine(f_ref(d_k), f_c(d_k))
+reliability(d_k) = matching_confidence(d_k) * projection_quality(d_k)
 ```
 
 이후 variant에서는 visible view all-pair similarity도 비교한다.
 
 ```text
-score(d_k) = mean_{i,j} cosine(f_i(d_k), f_j(d_k))
+matching_confidence(d_k) = mean_{i,j} cosine(f_i(d_k), f_j(d_k))
 ```
 
-성공 기준은 `d_gt` 근처에서 score curve가 뚜렷한 local peak를 보이는 것이다. 모든 depth 후보의 score가 비슷하면 feature 해상도가 낮거나, object가 너무 작거나, view 간 appearance 차이가 크거나, reference view 선택이 나쁘거나, sampling point가 object가 아니라 background를 찍는 문제가 있을 수 있다.
+성공 기준은 `d_gt` 근처에서 reliability curve가 뚜렷한 local peak를 보이는 것이다. 모든 depth 후보의 score가 비슷하면 feature 해상도가 낮거나, object가 너무 작거나, view 간 appearance 차이가 크거나, reference view 선택이 나쁘거나, sampling point가 object가 아니라 background를 찍는 문제가 있을 수 있다.
 
-구현은 training loop 안에 바로 넣지 않고, `tools/` 아래 독립 진단 스크립트로 시작한다.
+구현은 두 층으로 나눈다. 실제 모델 로직은 `projects/mmdet3d_plugin/` 안에 넣고, 그 모델을 실행하거나 중간 결과를 뽑는 바깥 실험 스크립트만 `tools/research/`에 모은다. 즉 `tools/research/`는 method를 구현하는 위치가 아니라, 실험 실행/검증 entrypoint를 한곳에 모아두는 위치다.
 
 ```text
-tools/ray_matching_sanity_check.py
+tools/research/ray_matching_oracle_check.py
 ```
 
-이 스크립트는 `projects/mmdet3d_plugin`의 기존 config/model/dataloader 경로를 재사용하고, 학습된 checkpoint에서 feature를 추출해 object별 cost curve를 dump한다. 결과는 아래에 저장한다.
+이 스크립트는 `projects/mmdet3d_plugin`의 config/model/dataloader를 호출해 object별 depth 후보 curve를 dump한다. 초기 oracle 검증은 외부 스크립트에서 시작할 수 있지만, 실제 방법 구현 단계에서는 ray 후보 생성, visible-view scoring, reliability-guided update 로직을 `projects/mmdet3d_plugin` 안의 모델 코드로 옮긴다. 결과는 아래에 저장한다.
 
 ```text
-work_dirs/_ray_matching_sanity/
+work_dirs/_ray_matching_oracle_check/
 ```
 
-첫 버전에서는 새 학습을 하지 않는다. 목표는 GT-centered sparse multi-view ray matching이 의미 있는 cost curve를 만드는지 확인하는 것이다. 이 sanity check가 통과되면 다음 단계에서 oracle GT depth 후보를 baseline predicted depth 또는 temporal-prior depth 후보로 바꾸고, matching score를 query depth/update reliability에 연결한다.
+첫 버전에서는 새 학습을 하지 않는다. 목표는 GT-centered sparse multi-view ray matching이 의미 있는 reliability curve를 만드는지 확인하는 것이다. 이 기초 검증이 통과되면 다음 단계에서 oracle GT depth 후보를 baseline predicted depth 또는 temporal-prior depth 후보로 바꾸고, matching score를 query depth/update reliability에 연결한다.
+
+코드 배치 원칙은 다음과 같다.
+
+```text
+projects/mmdet3d_plugin/models/projection.py        # fisheye projection / inverse ray / projection validity
+projects/mmdet3d_plugin/models/ray_matching.py      # depth 후보, visible-view matching, reliability 계산
+projects/mmdet3d_plugin/models/blocks.py            # 기존 feature sampling/fusion에 reliability weight 연결
+projects/mmdet3d_plugin/models/sparse4d_head.py     # query depth/update에 reliability 반영
+projects/mmdet3d_plugin/datasets/transforms/        # camera/GT/meta packing 보강
+configs/                                            # ablation별 설정
+tools/research/                                    # 위 모델을 호출하는 실험 실행 스크립트
+```
+
+따라서 앞으로 모델을 많이 수정해야 하는 것은 맞다. 다만 그 코드는 `tools/research/`에 넣지 않고, `projects/mmdet3d_plugin/`에 실제 모듈로 넣는다. `tools/research/`는 실행 스크립트가 흩어지지 않게 모으는 역할만 한다.
 
 ## Overall Architecture
 <center>
