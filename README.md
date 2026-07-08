@@ -48,16 +48,40 @@ temporal query update weighting: yes
 
 ## 핵심 contribution
 
-최종 contribution은 다음 축으로 둔다.
+현재 구현된 contribution과 다음 단계 contribution을 분리한다.
+
+현재 구현되어 결과가 나온 축은 다음이다.
 
 ```text
 1. fisheye geometry relation encoding
 2. query/keypoint-level visible view confidence
 3. learnable geometry bias gate for Sparse4D attention
 4. learned geometry-relation view confidence
-5. object-level ray-range auxiliary as weak supervision
-6. visible view support를 temporal query update에 반영
 ```
+
+다음 단계에서 논문 main claim으로 올릴 후보는 다음이다.
+
+```text
+5. yaw-specific fisheye observation attention
+6. object-level ray-range auxiliary as weak supervision  # 보조/ablation
+7. local tangent patch sampling                         # 보조/ablation
+```
+
+중요한 표현상 주의점:
+
+```text
+나쁜 표현:
+  We add another attention module.
+
+좋은 표현:
+  We decouple orientation evidence aggregation from generic instance feature
+  aggregation by learning fisheye-geometry-conditioned yaw reliability for
+  each camera-keypoint observation.
+```
+
+즉 novelty는 "attention을 하나 더 붙였다"가 아니라, **어안에서 yaw를 설명하는
+관측과 class/center를 설명하는 관측이 다르므로, yaw feature aggregation을
+공통 instance aggregation에서 분리한다**는 점에 둔다.
 
 현재 attention bias는 다음 형태를 기본으로 둔다. 어안 주변부에서는 객체가
 단순히 작아지는 것이 아니라 한 축은 늘어나고 다른 축은 눌리는 비등방성
@@ -184,37 +208,175 @@ hold: feature score로 direct depth/range 선택
 
 ## 현재 실험
 
-현재 30epoch ablation queue는 다음 순서로 돈다.
+2026-07-08 기준 최신 상태.
+
+### 완료된 구현
 
 ```text
-1. baseline
-2. range aux only
-3. fusion support only
-4. fusion support + separated range aux
+1. KB fisheye projection 기반 Sparse4D 3-class baseline
+2. fisheye geometry confidence 계산
+   - valid
+   - boundary
+   - relative_area
+   - short_axis
+   - KB anisotropy
+3. geometry confidence를 Sparse4D aggregation attention logit에 주입
+4. geometry bias scale / quality exponent / view confidence MLP 학습
+5. late-epoch NaN 방지를 위한 stable schedule
+   - bias_scale=0.5
+   - max_learnable_quality_weight=0.5
+   - learned_confidence ramp: start 1000 iter, 3000 iter
+   - geometry 관련 lr_mult=0.25
+6. local tangent patch sampling 구현
+   - 현재 main claim이 아니라 ablation / 보조 모듈
+7. view feature confidence / view relation attention scaffold 구현
+   - `*_stable_viewfeat.py`
+   - `*_stable_relattn.py`
+8. hospital entrance sequence를 train split에 추가한 config 작성
+   - val은 기존 KB val 유지
 ```
 
-2026-07-02 현재 queue 상태:
+### 현재까지의 핵심 결과
+
+기존 KB val 기준 비교:
 
 ```text
-baseline: finished
-  final epoch 30: mAP 0.2345, NDS 0.2414
-  best mAP epoch 10: mAP 0.2921, NDS 0.2477
-  best NDS epoch 15: mAP 0.2611, NDS 0.2746
+Sparse4D baseline best:
+  epoch 10
+  mAP 0.2921 / NDS 0.2477 / mAOE 0.9843
+  Car 0.4465 / Ped 0.2873 / Cyclist 0.1425
 
-range aux only: running
-  latest checked epoch 5: mAP 0.2134, NDS 0.2370
+cleanrel_stable best:
+  epoch 15
+  mAP 0.3055 / NDS 0.2810 / mAOE 0.8246
+  Car 0.4597 / Ped 0.2961 / Cyclist 0.1607
 
-support only: pending
-support + separated range aux: pending
+delta:
+  mAP  +0.0134
+  NDS  +0.0333
+  mAOE -0.1597 rad
+  Cyclist AP +0.0182
 ```
 
-주의: 최초 support 실험에서는 `detach_geometry=True`가 support output까지
-detach해 deterministic quality exponent(`boundary/angle/short_axis/anisotropy`
-weight)의 gradient를 막고 있었다. 이 경우 learnable bias scale과 learned view
-confidence MLP는 학습되지만, quality exponent 자체는 초기값에 묶인다. 이후 코드는
-geometry 입력만 detach하고 support output은 detach하지 않도록 수정했다. 따라서
-`support only`와 `support + separated range aux`는 `*_learnwfix` workdir에서 다시
-확인한다.
+해석:
+
+```text
+cleanrel_stable은 단일 best checkpoint 기준 baseline보다 낫다.
+특히 mAOE 감소가 연구 방향과 잘 맞는다.
+다만 seed/epoch variance가 있으므로 논문용으로는 같은 seed rerun이 필요하다.
+```
+
+### 현재 실행 중인 실험
+
+병원 로비 입구 시퀀스를 train에 추가하고, val은 기존 KB val로 유지한 rerun.
+
+```text
+config:
+  configs/sparse4d_kb20_car_ped_cyc_ablation_30e_cleanrel_stable_hospitaltrain.py
+
+train:
+  /home/airlab/user/kdh/new_dataset/kb20_plus_hospital/pkl/
+  kb20_seq29_49_hospital_train_idvel.pkl
+
+val:
+  /home/airlab/user/kdh/new_dataset/kb20_plus_hospital/pkl/
+  kb20_seq29_49_hospital_val_idvel.pkl
+
+work_dir:
+  work_dirs/sparse4d_kb20_car_ped_cyc_ablation_30e_cleanrel_stable_hospitaltrain
+```
+
+이 run의 목적:
+
+```text
+1. hospital sequence 추가가 Car/Ped 안정성에 도움 되는지 확인
+2. box 수 증가가 cleanrel_stable의 overfit/variance를 줄이는지 확인
+3. id 기반 velocity pkl + mAVE metric 정리 이후의 기준 성능 확보
+```
+
+주의:
+
+```text
+velocity/mAVE 관련 loader/metric 수정은 MFTracker 쪽 코드에 있으며,
+현재 이 Sparse4D repository commit에는 포함되어 있지 않다.
+```
+
+### 다음에 할 일
+
+1. `cleanrel_stable_hospitaltrain` 30epoch 결과 확인.
+2. 같은 train/val split에서 vanilla Sparse4D baseline도 rerun.
+3. 같은 seed 기준으로 baseline vs cleanrel_stable 재비교.
+4. mAP/NDS만 보지 말고 다음 breakdown을 확인.
+
+```text
+mAOE by class
+mAOE by distance
+mAOE by radial image position
+mAOE in camera overlap region
+mAOE by visible camera count
+Car / Pedestrian / Cyclist AP
+```
+
+5. 그 다음 main novelty를 `yaw-specific fisheye observation attention`으로 확장.
+
+최소 구조:
+
+```text
+F_common = Σ softmax(logit_common + bias_common) * f_obs
+F_yaw    = Σ softmax(logit_yaw    + bias_yaw)    * f_obs
+
+F_common -> class / center / size / velocity
+F_yaw    -> yaw sin/cos / yawness
+```
+
+안정화 구조:
+
+```text
+F_yaw_final = F_common + λ * (F_yaw - F_common)
+```
+
+`λ`는 0 근처에서 시작하는 learnable scalar/gate로 두어, yaw branch가 초반에
+망해도 기존 cleanrel_stable feature에서 크게 벗어나지 않게 한다.
+
+6. patch는 main이 아니라 다음 ablation으로만 사용.
+
+```text
+baseline
+cleanrel_stable
+cleanrel_stable + yaw-specific attention
+cleanrel_stable + tangent patch
+cleanrel_stable + yaw-specific attention + tangent patch
+```
+
+### GA-HF / DAPETR와의 구분
+
+GA-HF와 DAPETR 모두 "fisheye geometry를 고려해야 한다"는 문제의식은 겹친다.
+하지만 본 연구의 단위는 다르다.
+
+```text
+GA-HF:
+  BEV-level
+  LiDAR + fisheye fusion
+  polar/cartesian BEV alignment
+  warped camera BEV feature 보정
+
+DAPETR:
+  PETR-style projection-free dense image-token adaptation
+  distortion-aware PE / FiLM co-modulation
+
+Ours:
+  Sparse4D query-level
+  camera-keypoint observation aggregation
+  fisheye geometry-conditioned view/keypoint reliability
+  yaw-specific observation attention for mAOE
+```
+
+따라서 논문 표현은 넓은 `geometry-aware fisheye fusion`이 아니라 다음처럼 둔다.
+
+```text
+yaw-aware query-level observation aggregation
+for sparse fisheye 3D detection
+```
 
 현재까지 수행한 기초 검증은 다음과 같다.
 
