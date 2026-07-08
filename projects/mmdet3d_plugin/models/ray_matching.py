@@ -56,8 +56,16 @@ def project_points_with_mask(
         points_2d = ocam_project_points(points_lidar, metas, image_wh)
     else:
         raise ValueError(f"unsupported projection_type={projection_type}")
-    valid = (points_2d[..., 0] >= 0.0) & (points_2d[..., 0] <= 1.0)
-    valid = valid & (points_2d[..., 1] >= 0.0) & (points_2d[..., 1] <= 1.0)
+    finite = torch.isfinite(points_2d).all(dim=-1)
+    safe_points_2d = torch.nan_to_num(
+        points_2d, nan=-1.0, posinf=2.0, neginf=-1.0
+    )
+    valid = (safe_points_2d[..., 0] >= 0.0) & (safe_points_2d[..., 0] <= 1.0)
+    valid = valid & (safe_points_2d[..., 1] >= 0.0) & (
+        safe_points_2d[..., 1] <= 1.0
+    )
+    valid = valid & finite
+    points_2d = safe_points_2d
     return points_2d, valid
 
 
@@ -222,6 +230,8 @@ def compute_gt_ray_matching(
     offsets: torch.Tensor,
     feature_level: int = 0,
     projection_type: str = "kb_fisheye",
+    max_support_views: Optional[int] = 1,
+    min_support_quality: float = 0.0,
 ) -> RayMatchingResult:
     """Compute GT-based range reliability curves for object centers."""
     image_wh = metas["image_wh"]
@@ -258,8 +268,20 @@ def compute_gt_ray_matching(
                     continue
                 feats = sampled[b, view_mask, n, k]
                 cos = F.cosine_similarity(ref_feat[None, :], feats, dim=-1)
+                qualities = quality_per_view[b, view_mask, n, k]
+                if min_support_quality > 0.0:
+                    keep_quality = qualities >= float(min_support_quality)
+                    if not bool(keep_quality.any()):
+                        continue
+                    cos = cos[keep_quality]
+                    qualities = qualities[keep_quality]
+                if max_support_views is not None and max_support_views > 0:
+                    topk = min(int(max_support_views), cos.numel())
+                    keep = qualities.topk(topk).indices
+                    cos = cos[keep]
+                    qualities = qualities[keep]
                 matching[b, n, k] = cos.mean()
-                proj_quality[b, n, k] = quality_per_view[b, view_mask, n, k].mean()
+                proj_quality[b, n, k] = qualities.mean()
                 reliability[b, n, k] = matching[b, n, k] * proj_quality[b, n, k]
 
     return RayMatchingResult(
@@ -283,6 +305,8 @@ def compute_gt_ray_keypoint_matching(
     feature_level: int = 0,
     projection_type: str = "kb_fisheye",
     min_keypoints_per_view: int = 2,
+    max_support_views: Optional[int] = 1,
+    min_support_quality: float = 0.0,
 ) -> RayMatchingResult:
     """Compute GT-based reliability curves using sparse box keypoints.
 
@@ -368,8 +392,21 @@ def compute_gt_ray_keypoint_matching(
                     )
                 if not view_scores:
                     continue
-                matching[b, n, k] = torch.stack(view_scores).mean()
-                proj_quality[b, n, k] = torch.stack(view_qualities).mean()
+                scores = torch.stack(view_scores)
+                qualities = torch.stack(view_qualities)
+                if min_support_quality > 0.0:
+                    keep_quality = qualities >= float(min_support_quality)
+                    if not bool(keep_quality.any()):
+                        continue
+                    scores = scores[keep_quality]
+                    qualities = qualities[keep_quality]
+                if max_support_views is not None and max_support_views > 0:
+                    topk = min(int(max_support_views), scores.numel())
+                    keep = qualities.topk(topk).indices
+                    scores = scores[keep]
+                    qualities = qualities[keep]
+                matching[b, n, k] = scores.mean()
+                proj_quality[b, n, k] = qualities.mean()
                 reliability[b, n, k] = matching[b, n, k] * proj_quality[b, n, k]
 
     return RayMatchingResult(

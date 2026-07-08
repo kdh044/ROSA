@@ -13,6 +13,7 @@ from typing import List, Optional, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from mmengine.model import BaseModule
 from mmengine.dist import all_reduce
@@ -21,6 +22,7 @@ import torch.distributed as dist
 from mmdet3d.registry import MODELS, TASK_UTILS
 
 from .blocks import DeformableFeatureAggregation as DFG  # noqa: F401
+from projects.mmdet3d_plugin.core.box3d import X, Y, Z, W, L, H
 
 __all__ = ["Sparse4DHead"]
 
@@ -102,6 +104,7 @@ class Sparse4DHead(BaseModule):
         dn_loss_weight: float = 5.0,
         decouple_attn: bool = True,
         gate_invalid_temp_gnn: bool = False,
+        ray_range_aux: Optional[dict] = None,
         init_cfg: dict = None,
         **kwargs,
     ):
@@ -114,6 +117,32 @@ class Sparse4DHead(BaseModule):
         self.dn_loss_weight = dn_loss_weight
         self.decouple_attn = decouple_attn
         self.gate_invalid_temp_gnn = gate_invalid_temp_gnn
+        default_ray_range_aux = dict(
+            enabled=False,
+            loss_weight=0.01,
+            min_range=0.2,
+            max_range=40.0,
+            beta=0.1,
+            target_z_is_bottom=True,
+            min_visible_views=2,
+            min_projection_quality=0.02,
+            boundary_margin=0.08,
+            boundary_weight=1.0,
+            center_weight=0.0,
+            incidence_weight=0.0,
+            max_incidence_deg=95.0,
+            detach_geometry=True,
+            projection_type=None,
+            use_fusion_support=False,
+            multiply_target_quality=False,
+        )
+        if ray_range_aux is not None:
+            default_ray_range_aux.update(ray_range_aux)
+        self.ray_range_aux_cfg = default_ray_range_aux
+        self.use_ray_range_aux = bool(
+            self.ray_range_aux_cfg["enabled"]
+            and float(self.ray_range_aux_cfg["loss_weight"]) > 0.0
+        )
 
         if reg_weights is None:
             self.reg_weights = [1.0] * 10
@@ -159,6 +188,23 @@ class Sparse4DHead(BaseModule):
                 raise NotImplementedError(f"unknown operation '{op}'")
 
         self.embed_dims = self.instance_bank.embed_dims
+        if self.use_ray_range_aux:
+            hidden_dims = max(64, self.embed_dims // 2)
+            self.ray_range_relation_encoder = nn.Sequential(
+                nn.Linear(8, hidden_dims),
+                nn.ReLU(inplace=True),
+                nn.LayerNorm(hidden_dims),
+                nn.Linear(hidden_dims, self.embed_dims),
+            )
+            self.ray_range_head = nn.Sequential(
+                nn.Linear(self.embed_dims, self.embed_dims),
+                nn.ReLU(inplace=True),
+                nn.LayerNorm(self.embed_dims),
+                nn.Linear(self.embed_dims, 1),
+            )
+        else:
+            self.ray_range_relation_encoder = None
+            self.ray_range_head = None
         if self.decouple_attn:
             self.fc_before = nn.Linear(
                 self.embed_dims, self.embed_dims * 2, bias=False
@@ -181,6 +227,17 @@ class Sparse4DHead(BaseModule):
         for m in self.modules():
             if hasattr(m, "init_weight"):
                 m.init_weight()
+        if self.ray_range_relation_encoder is not None:
+            for m in self.ray_range_relation_encoder:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.constant_(m.bias, 0.0)
+            for m in self.ray_range_head[:-1]:
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight)
+                    nn.init.constant_(m.bias, 0.0)
+            nn.init.constant_(self.ray_range_head[-1].weight, 0.0)
+            nn.init.constant_(self.ray_range_head[-1].bias, 0.0)
 
     def graph_model(
         self,
@@ -314,6 +371,9 @@ class Sparse4DHead(BaseModule):
         prediction = []
         classification = []
         quality = []
+        decoder_instance_features = []
+        decoder_view_supports = []
+        last_view_support = None
         for i, op in enumerate(self.operation_order):
             if self.layers[i] is None:
                 continue
@@ -352,13 +412,18 @@ class Sparse4DHead(BaseModule):
             elif op == "norm" or op == "ffn":
                 instance_feature = self.layers[i](instance_feature)
             elif op == "deformable":
-                instance_feature = self.layers[i](
+                deformable_layer = self.layers[i]
+                instance_feature = deformable_layer(
                     instance_feature,
                     anchor,
                     anchor_embed,
                     feature_maps,
                     metas,
                 )
+                if self.use_ray_range_aux:
+                    last_view_support = getattr(
+                        deformable_layer, "_last_view_support", None
+                    )
             elif op == "refine":
                 anchor, cls, qt = self.layers[i](
                     instance_feature,
@@ -374,6 +439,9 @@ class Sparse4DHead(BaseModule):
                 prediction.append(anchor)
                 classification.append(cls)
                 quality.append(qt)
+                if self.use_ray_range_aux:
+                    decoder_instance_features.append(instance_feature)
+                    decoder_view_supports.append(last_view_support)
                 if len(prediction) == self.num_single_frame_decoder:
                     instance_feature, anchor = self.instance_bank.update(
                         instance_feature, anchor, cls
@@ -421,6 +489,14 @@ class Sparse4DHead(BaseModule):
             classification = [x[:, :num_free_instance] for x in classification]
             dn_prediction = [x[:, num_free_instance:] for x in prediction]
             prediction = [x[:, :num_free_instance] for x in prediction]
+            if self.use_ray_range_aux:
+                decoder_instance_features = [
+                    x[:, :num_free_instance] for x in decoder_instance_features
+                ]
+                decoder_view_supports = [
+                    x[:, :num_free_instance] if x is not None else None
+                    for x in decoder_view_supports
+                ]
             quality = [
                 x[:, :num_free_instance] if x is not None else None
                 for x in quality
@@ -465,6 +541,9 @@ class Sparse4DHead(BaseModule):
                 "quality": quality,
             }
         )
+        if self.use_ray_range_aux:
+            output["decoder_instance_features"] = decoder_instance_features
+            output["decoder_view_supports"] = decoder_view_supports
 
         self.instance_bank.cache(
             instance_feature, anchor, cls, metas, feature_maps
@@ -480,6 +559,8 @@ class Sparse4DHead(BaseModule):
         cls_scores = model_outs["classification"]
         reg_preds = model_outs["prediction"]
         quality = model_outs["quality"]
+        decoder_instance_features = model_outs.get("decoder_instance_features")
+        decoder_view_supports = model_outs.get("decoder_view_supports")
         output = {}
         for decoder_idx, (cls, reg, qt) in enumerate(
             zip(cls_scores, reg_preds, quality)
@@ -498,6 +579,28 @@ class Sparse4DHead(BaseModule):
             num_pos = max(
                 reduce_mean(torch.sum(mask).to(dtype=reg.dtype)), 1.0
             )
+            if (
+                self.use_ray_range_aux
+                and decoder_instance_features is not None
+                and decoder_idx < len(decoder_instance_features)
+            ):
+                view_support = None
+                if (
+                    decoder_view_supports is not None
+                    and decoder_idx < len(decoder_view_supports)
+                ):
+                    view_support = decoder_view_supports[decoder_idx]
+                output.update(
+                    self.loss_ray_range_aux(
+                        decoder_instance_features[decoder_idx],
+                        reg,
+                        reg_target,
+                        mask_valid,
+                        data,
+                        decoder_idx,
+                        view_support=view_support,
+                    )
+                )
             if self.cls_threshold_to_reg > 0:
                 threshold = self.cls_threshold_to_reg
                 mask = torch.logical_and(
@@ -580,6 +683,253 @@ class Sparse4DHead(BaseModule):
             output[f"loss_cls_dn_{decoder_idx}"] = cls_loss
             output.update(reg_loss)
         return output
+
+    def loss_ray_range_aux(
+        self,
+        instance_feature,
+        reg_pred,
+        reg_target,
+        mask_valid,
+        data,
+        decoder_idx,
+        view_support=None,
+    ):
+        """Object/query-level camera ray-range auxiliary loss.
+
+        GT boxes are used only as matched supervision targets. The head input
+        uses the predicted query geometry plus query feature, so inference does
+        not require GT centers.
+        """
+        if "lidar2cam" not in data or "image_wh" not in data:
+            return {}
+        cfg = self.ray_range_aux_cfg
+        pred_center = self._ray_aux_geometric_center(reg_pred, cfg)
+        pred_center = torch.nan_to_num(
+            pred_center, nan=0.0, posinf=0.0, neginf=0.0
+        )
+        target_center = self._ray_aux_geometric_center(reg_target, cfg)
+        target_center = torch.nan_to_num(
+            target_center, nan=0.0, posinf=0.0, neginf=0.0
+        )
+
+        target_points = target_center[:, :, None, :]
+        target_points_2d = self._project_ray_aux_points(
+            target_points, data, cfg
+        )
+        target_quality, target_view_mask = self._ray_aux_projection_quality(
+            target_points_2d, target_center, data, cfg
+        )
+
+        visible = target_view_mask & (
+            target_quality > float(cfg["min_projection_quality"])
+        )
+        visible_count = visible.sum(dim=1)
+        query_mask = mask_valid & (
+            visible_count >= int(cfg["min_visible_views"])
+        )
+        view_mask = visible & query_mask[:, None]
+        if not bool(view_mask.any()):
+            return {f"loss_ray_range_{decoder_idx}": reg_pred.new_zeros(())}
+
+        pred_for_relation = pred_center
+        if bool(cfg["detach_geometry"]):
+            pred_for_relation = pred_for_relation.detach()
+        relation = self._build_ray_aux_relation(pred_for_relation, data, cfg)
+        relation_embed = self.ray_range_relation_encoder(relation)
+        ray_feature = instance_feature[:, :, None, :] + relation_embed
+        pred = self.ray_range_head(ray_feature).squeeze(-1)
+        pred = torch.nan_to_num(pred, nan=0.0, posinf=1.0, neginf=0.0)
+
+        target_cam = self._points_to_cam(target_center, data["lidar2cam"])
+        target_range = torch.linalg.norm(target_cam, dim=-1).transpose(1, 2)
+        target = self._normalize_ray_range(target_range, cfg)
+        target = torch.nan_to_num(target, nan=0.0, posinf=1.0, neginf=0.0)
+
+        view_mask_bn = view_mask.transpose(1, 2)
+        if bool(cfg["use_fusion_support"]) and view_support is not None:
+            weights = self._reduce_view_support(view_support).to(dtype=pred.dtype)
+            weights = weights * view_mask_bn.to(dtype=pred.dtype)
+            if bool(cfg["multiply_target_quality"]):
+                weights = weights * target_quality.transpose(1, 2).to(
+                    dtype=pred.dtype
+                )
+        else:
+            weights = target_quality.transpose(1, 2).to(dtype=pred.dtype)
+            weights = weights * view_mask_bn.to(dtype=pred.dtype)
+        weights = torch.nan_to_num(
+            weights, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(min=0.0)
+
+        raw_loss = F.smooth_l1_loss(
+            pred,
+            target.to(dtype=pred.dtype),
+            beta=float(cfg["beta"]),
+            reduction="none",
+        )
+        raw_loss = torch.nan_to_num(raw_loss, nan=0.0, posinf=0.0, neginf=0.0)
+        denom = weights.sum().clamp(min=1.0)
+        loss = (raw_loss * weights).sum() / denom
+        loss = loss * float(cfg["loss_weight"])
+        return {f"loss_ray_range_{decoder_idx}": loss}
+
+    @staticmethod
+    def _reduce_view_support(view_support):
+        """Reduce DFA support from keypoint/group support to object-camera support."""
+        support = view_support
+        while support.dim() > 3:
+            support = support.mean(dim=-1)
+        return torch.nan_to_num(
+            support, nan=0.0, posinf=1.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+
+    @staticmethod
+    def _ray_aux_geometric_center(box, cfg):
+        center = box[..., [X, Y, Z]].clone()
+        if bool(cfg["target_z_is_bottom"]) and box.shape[-1] > H:
+            height = box[..., H].clamp(min=-10.0, max=10.0).exp()
+            center[..., 2] = center[..., 2] + height * 0.5
+        return center
+
+    def _project_ray_aux_points(self, points, data, cfg):
+        projection_type = cfg.get("projection_type")
+        if projection_type is None:
+            if "kb_intrinsic" in data and "kb_distortion" in data:
+                projection_type = "kb_fisheye"
+            elif "ocam_intrinsic" in data and "ocam_pol" in data:
+                projection_type = "ocam_fisheye"
+            else:
+                projection_type = "pinhole"
+        if projection_type == "kb_fisheye":
+            from .projection import kb_project_points
+
+            return kb_project_points(points, data, data["image_wh"])
+        if projection_type == "ocam_fisheye":
+            from .projection import ocam_project_points
+
+            return ocam_project_points(points, data, data["image_wh"])
+        return DFG._project_points_pinhole(
+            points, data["projection_mat"], data["image_wh"]
+        )
+
+    def _ray_aux_projection_quality(self, points_2d, center_lidar, data, cfg):
+        points_2d = points_2d[..., 0, :]
+        finite = torch.isfinite(points_2d).all(dim=-1)
+        safe_points = torch.nan_to_num(
+            points_2d, nan=-1.0, posinf=2.0, neginf=-1.0
+        )
+        valid = (
+            (safe_points[..., 0] >= 0.0)
+            & (safe_points[..., 0] <= 1.0)
+            & (safe_points[..., 1] >= 0.0)
+            & (safe_points[..., 1] <= 1.0)
+            & finite
+        )
+        boundary = torch.minimum(
+            torch.minimum(safe_points[..., 0], 1.0 - safe_points[..., 0]),
+            torch.minimum(safe_points[..., 1], 1.0 - safe_points[..., 1]),
+        )
+        boundary_conf = (
+            boundary / max(float(cfg["boundary_margin"]), 1e-6)
+        ).clamp(0.0, 1.0)
+        center_dist = torch.linalg.norm(safe_points - 0.5, dim=-1) / (
+            0.5 ** 0.5
+        )
+        center_conf = (1.0 - center_dist).clamp(0.0, 1.0)
+        angle_conf = self._ray_aux_incidence_confidence(center_lidar, data, cfg)
+        quality = valid.to(dtype=points_2d.dtype)
+        quality = quality * boundary_conf.pow(float(cfg["boundary_weight"]))
+        quality = quality * center_conf.pow(float(cfg["center_weight"]))
+        quality = quality * angle_conf.pow(float(cfg["incidence_weight"]))
+        quality = torch.nan_to_num(
+            quality, nan=0.0, posinf=0.0, neginf=0.0
+        ).clamp(0.0, 1.0)
+        return quality, valid
+
+    def _ray_aux_incidence_confidence(self, center_lidar, data, cfg):
+        pts_cam = self._points_to_cam(center_lidar, data["lidar2cam"])
+        x, y, z = pts_cam[..., 0], pts_cam[..., 1], pts_cam[..., 2]
+        radial = torch.sqrt(x * x + y * y + 1e-12)
+        projection_type = cfg.get("projection_type")
+        if projection_type is None and "kb_intrinsic" in data:
+            projection_type = "kb_fisheye"
+        if projection_type == "ocam_fisheye":
+            incidence = torch.atan2(radial, -z)
+            lens_key = "ocam_lens_fov_deg"
+        else:
+            incidence = torch.atan2(radial, z)
+            lens_key = "kb_lens_fov_deg"
+
+        max_incidence_deg = cfg.get("max_incidence_deg")
+        if max_incidence_deg is None:
+            lens_fov = data.get(lens_key, data.get("ocam_lens_fov_deg", 360.0))
+            if isinstance(lens_fov, torch.Tensor):
+                max_incidence_deg = float(lens_fov.flatten()[0].item()) / 2.0
+            else:
+                max_incidence_deg = float(lens_fov) / 2.0
+        max_incidence = torch.deg2rad(
+            center_lidar.new_tensor(float(max_incidence_deg))
+        )
+        confidence = (1.0 - incidence / max_incidence.clamp(min=1e-6)).clamp(
+            0.0, 1.0
+        )
+        return torch.nan_to_num(confidence, nan=0.0, posinf=0.0, neginf=0.0)
+
+    def _build_ray_aux_relation(self, center_lidar, data, cfg):
+        pts_cam = self._points_to_cam(center_lidar, data["lidar2cam"])
+        pts_cam_bn = pts_cam.transpose(1, 2)
+        cam_range = torch.linalg.norm(pts_cam_bn, dim=-1).clamp(
+            min=float(cfg["min_range"])
+        )
+        direction = pts_cam_bn / cam_range[..., None]
+        range_norm = self._normalize_ray_range(cam_range, cfg).unsqueeze(-1)
+
+        points_2d = self._project_ray_aux_points(
+            center_lidar[:, :, None, :], data, cfg
+        )
+        points_2d = torch.nan_to_num(
+            points_2d[..., 0, :], nan=-1.0, posinf=2.0, neginf=-1.0
+        ).transpose(1, 2)
+        xy_norm = ((points_2d - 0.5) * 2.0).clamp(-2.0, 2.0)
+        boundary = torch.minimum(
+            torch.minimum(points_2d[..., 0], 1.0 - points_2d[..., 0]),
+            torch.minimum(points_2d[..., 1], 1.0 - points_2d[..., 1]),
+        )
+        boundary_conf = (
+            boundary / max(float(cfg["boundary_margin"]), 1e-6)
+        ).clamp(0.0, 1.0)
+        center_dist = torch.linalg.norm(points_2d - 0.5, dim=-1) / (
+            0.5 ** 0.5
+        )
+        center_conf = (1.0 - center_dist).clamp(0.0, 1.0)
+        relation = torch.cat(
+            [
+                direction,
+                range_norm,
+                xy_norm,
+                boundary_conf.unsqueeze(-1),
+                center_conf.unsqueeze(-1),
+            ],
+            dim=-1,
+        )
+        return torch.nan_to_num(relation, nan=0.0, posinf=0.0, neginf=0.0)
+
+    @staticmethod
+    def _points_to_cam(points_lidar, lidar2cam):
+        bs, num_points = points_lidar.shape[:2]
+        ones = points_lidar.new_ones(bs, num_points, 1)
+        points_h = torch.cat([points_lidar, ones], dim=-1)
+        points_h = points_h[:, None, :, :, None]
+        points_cam = torch.matmul(lidar2cam[:, :, None], points_h).squeeze(-1)
+        return points_cam[..., :3]
+
+    @staticmethod
+    def _normalize_ray_range(ray_range, cfg):
+        min_range = float(cfg["min_range"])
+        max_range = float(cfg["max_range"])
+        min_log = ray_range.new_tensor(min_range).log()
+        max_log = ray_range.new_tensor(max_range).log()
+        ray_range = ray_range.clamp(min=min_range, max=max_range)
+        return (ray_range.log() - min_log) / (max_log - min_log).clamp(min=1e-6)
 
     def prepare_for_dn_loss(self, model_outs, prefix=""):
         dn_valid_mask = model_outs[f"{prefix}dn_valid_mask"].flatten(end_dim=1)

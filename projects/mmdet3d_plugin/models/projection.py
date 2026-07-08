@@ -51,7 +51,8 @@ def ocam_project_points(
     """Project 3D points (lidar frame) to normalized fisheye pixel coords.
 
     Args:
-        key_points: (B, N_anc, num_pts, 3) — lidar-frame 3D points.
+        key_points: (B, N_anc, num_pts, 3) or
+                    (B, N_cam, N_anc, num_pts, 3) — lidar-frame 3D points.
         metas:      dict with keys
                       "lidar2cam":      (B, N_cam, 4, 4)
                       "ocam_intrinsic": (B, N_cam, 3, 3) — affine A (OV)
@@ -63,7 +64,6 @@ def ocam_project_points(
         points_2d: (B, N_cam, N_anc, num_pts, 2) normalized to [0, 1].
                    Invalid points set to 2.0.
     """
-    B, N_anc, num_pts = key_points.shape[:3]
     lidar2cam = metas["lidar2cam"]               # (B, N_cam, 4, 4)
     A = metas["ocam_intrinsic"]                  # (B, N_cam, 3, 3)
     pol = metas["ocam_pol"]                      # (B, N_cam, P)
@@ -75,15 +75,24 @@ def ocam_project_points(
         lens_fov_deg = float(lens_fov_raw)
     theta_max = math.radians(lens_fov_deg / 2.0)
 
+    B = key_points.shape[0]
     N_cam = lidar2cam.shape[1]
-
-    # (B, N_anc, num_pts, 4) homogeneous
-    ones = key_points.new_ones(B, N_anc, num_pts, 1)
-    pts_h = torch.cat([key_points, ones], dim=-1)
-
-    # (B, 1, N_anc, num_pts, 4, 1) ← matmul → (B, N_cam, N_anc, num_pts, 4, 1)
-    pts_h = pts_h[:, None, ..., None]
-    P_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
+    if key_points.dim() == 5:
+        if key_points.shape[1] != N_cam:
+            raise ValueError(
+                "camera-conditioned key_points camera dimension must match "
+                f"lidar2cam: {key_points.shape[1]} vs {N_cam}"
+            )
+        N_anc, num_pts = key_points.shape[2:4]
+        ones = key_points.new_ones(B, N_cam, N_anc, num_pts, 1)
+        pts_h = torch.cat([key_points, ones], dim=-1)[..., None]
+        P_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
+    else:
+        N_anc, num_pts = key_points.shape[1:3]
+        ones = key_points.new_ones(B, N_anc, num_pts, 1)
+        pts_h = torch.cat([key_points, ones], dim=-1)
+        pts_h = pts_h[:, None, ..., None]
+        P_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
     X = P_cam[..., 0]                            # row direction (down)
     Y = P_cam[..., 1]                            # col direction (right)
     Z = P_cam[..., 2]                            # forward = -Z
@@ -150,7 +159,6 @@ def kb_project_points(
     fisheye lenses wider than 180 degrees. Visibility is therefore gated by
     incidence angle and image bounds, not by a hard Z>0 cutoff.
     """
-    B, N_anc, num_pts = key_points.shape[:3]
     lidar2cam = metas["lidar2cam"]               # (B, N_cam, 4, 4)
     K = metas.get("kb_intrinsic", metas.get("ocam_intrinsic"))
     D = metas.get("kb_distortion", metas.get("ocam_pol"))
@@ -169,12 +177,24 @@ def kb_project_points(
         lens_fov_deg = float(lens_fov_raw)
     theta_max = math.radians(lens_fov_deg / 2.0)
 
+    B = key_points.shape[0]
     N_cam = lidar2cam.shape[1]
-
-    ones = key_points.new_ones(B, N_anc, num_pts, 1)
-    pts_h = torch.cat([key_points, ones], dim=-1)
-    pts_h = pts_h[:, None, ..., None]
-    P_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
+    if key_points.dim() == 5:
+        if key_points.shape[1] != N_cam:
+            raise ValueError(
+                "camera-conditioned key_points camera dimension must match "
+                f"lidar2cam: {key_points.shape[1]} vs {N_cam}"
+            )
+        N_anc, num_pts = key_points.shape[2:4]
+        ones = key_points.new_ones(B, N_cam, N_anc, num_pts, 1)
+        pts_h = torch.cat([key_points, ones], dim=-1)[..., None]
+        P_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
+    else:
+        N_anc, num_pts = key_points.shape[1:3]
+        ones = key_points.new_ones(B, N_anc, num_pts, 1)
+        pts_h = torch.cat([key_points, ones], dim=-1)
+        pts_h = pts_h[:, None, ..., None]
+        P_cam = torch.matmul(lidar2cam[:, :, None, None], pts_h).squeeze(-1)
     X = P_cam[..., 0]
     Y = P_cam[..., 1]
     Z = P_cam[..., 2]

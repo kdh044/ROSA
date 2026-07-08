@@ -53,6 +53,21 @@ def parse_args():
         help="center: 3D center one-point check, sparse-keypoints: fixed Sparse4D box keypoints",
     )
     parser.add_argument("--min-keypoints-per-view", type=int, default=2)
+    parser.add_argument(
+        "--max-support-views",
+        type=int,
+        default=1,
+        help=(
+            "Number of non-reference support views to keep by projection quality. "
+            "Use 0 to average all valid support views."
+        ),
+    )
+    parser.add_argument(
+        "--min-support-quality",
+        type=float,
+        default=0.0,
+        help="Drop support views with projection quality below this threshold.",
+    )
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     parser.add_argument("--plot", action="store_true")
@@ -212,6 +227,12 @@ def main():
                     feature_level=args.feature_level,
                     projection_type=cfg.model.head.deformable_model.projection_type,
                     min_keypoints_per_view=args.min_keypoints_per_view,
+                    max_support_views=(
+                        None
+                        if args.max_support_views <= 0
+                        else args.max_support_views
+                    ),
+                    min_support_quality=args.min_support_quality,
                 )
             else:
                 result = compute_gt_ray_matching(
@@ -221,6 +242,12 @@ def main():
                     offsets=offsets,
                     feature_level=args.feature_level,
                     projection_type=cfg.model.head.deformable_model.projection_type,
+                    max_support_views=(
+                        None
+                        if args.max_support_views <= 0
+                        else args.max_support_views
+                    ),
+                    min_support_quality=args.min_support_quality,
                 )
 
         token = data_samples[0].metainfo.get("token", str(frame_idx))
@@ -254,6 +281,8 @@ def main():
                     object_index=obj_idx,
                     label=label,
                     sampling_mode=args.sampling_mode,
+                    max_support_views=args.max_support_views,
+                    min_support_quality=args.min_support_quality,
                     reference_camera=ref,
                     reference_camera_name=ref_name,
                     center_visible_views=int(visible_count[obj_idx].item()),
@@ -274,6 +303,8 @@ def main():
                     object_index=obj_idx,
                     label=label,
                     sampling_mode=args.sampling_mode,
+                    max_support_views=args.max_support_views,
+                    min_support_quality=args.min_support_quality,
                     reference_camera=ref,
                     reference_camera_name=ref_name,
                     center_visible_views=int(visible_count[obj_idx].item()),

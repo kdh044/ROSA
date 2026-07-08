@@ -266,9 +266,10 @@ test_dataloader = val_dataloader
 val_evaluator = dict(
     type="FisheyeBev3DMetric",
     class_names=class_names,
-    dist_thresholds=(0.5, 1.0, 2.0),
+    dist_thresholds=(0.5, 1.0, 2.0, 4.0),
     score_threshold=0.1,
     max_predictions=300,
+    use_velocity_metric=True,
 )
 test_evaluator = val_evaluator
 

@@ -8,8 +8,8 @@ metainfo = dict(classes=class_names)
 num_classes = len(class_names)
 
 data_root = "/home/airlab/user/kdh/incoming/new_dataset/xtreme1_5seq_mftracker/"
-ann_train = data_root + "pkl/kb20_seq29_49_train_vel.pkl"
-ann_val = data_root + "pkl/kb20_seq29_49_val_vel.pkl"
+ann_train = data_root + "pkl/kb20_seq29_49_train_idvel.pkl"
+ann_val = data_root + "pkl/kb20_seq29_49_val_idvel.pkl"
 cam_names = ["CAM_FRONT", "CAM_RIGHT", "CAM_LEFT", "CAM_BACK"]
 
 point_cloud_range = [-20.0, -20.0, -5.0, 20.0, 20.0, 5.0]
@@ -89,10 +89,11 @@ test_dataloader = val_dataloader
 val_evaluator = dict(
     type="FisheyeBev3DMetric",
     class_names=class_names,
-    dist_thresholds=(0.5, 1.0, 2.0),
+    dist_thresholds=(0.5, 1.0, 2.0, 4.0),
     score_threshold=0.0,
     max_predictions=300,
     max_eval_dist=max_eval_dist,
+    use_velocity_metric=True,
 )
 test_evaluator = val_evaluator
 
