@@ -1,0 +1,75 @@
+{
+  "uniform_nll": 1.6094379124341003,
+  "train_matched": 743,
+  "val_matched": 196,
+  "train_common": 487,
+  "val_common": 137,
+  "target_mode_histogram": [
+    15,
+    17,
+    63,
+    24,
+    18
+  ],
+  "empirical_prior": {
+    "probability": [
+      0.11846943944692612,
+      0.12249578535556793,
+      0.5198716521263123,
+      0.16614042222499847,
+      0.07302267849445343
+    ],
+    "val_nll": 1.4707671403884888,
+    "val_accuracy": 0.45985400676727295
+  },
+  "true": {
+    "train_nll": 1.1423789262771606,
+    "val_nll": 1.3716517686843872,
+    "val_accuracy": 0.45985400676727295,
+    "val_noncurrent_direction_accuracy": 0.054054055362939835,
+    "val_count": 137
+  },
+  "feature_shuffle": {
+    "train_nll": 1.30585777759552,
+    "val_nll": 1.4653522968292236,
+    "val_accuracy": 0.45985400676727295,
+    "val_noncurrent_direction_accuracy": 0.0,
+    "val_count": 137
+  },
+  "geometry_only": {
+    "train_nll": 1.179989218711853,
+    "val_nll": 1.3218557834625244,
+    "val_accuracy": 0.45985400676727295,
+    "val_noncurrent_direction_accuracy": 0.0,
+    "val_count": 137
+  },
+  "direction": {
+    "chance_bce": 0.6931471805599453,
+    "true": {
+      "train_balanced_bce": 0.5042708516120911,
+      "val_balanced_bce": 0.6602374315261841,
+      "val_balanced_accuracy": 0.6257440447807312,
+      "val_near_count": 32,
+      "val_far_count": 42
+    },
+    "feature_shuffle": {
+      "train_balanced_bce": 0.668868899345398,
+      "val_balanced_bce": 0.6992518901824951,
+      "val_balanced_accuracy": 0.543154776096344,
+      "val_near_count": 32,
+      "val_far_count": 42
+    },
+    "geometry_only": {
+      "train_balanced_bce": 0.6901997327804565,
+      "val_balanced_bce": 0.6956830620765686,
+      "val_balanced_accuracy": 0.4486607313156128,
+      "val_near_count": 32,
+      "val_far_count": 42
+    }
+  },
+  "true_minus_controls": {
+    "uniform_nll_gap": 0.23778614374971307,
+    "shuffle_nll_gap": 0.09370052814483643,
+    "geometry_nll_gap": -0.04979598522186279
+  }
+}

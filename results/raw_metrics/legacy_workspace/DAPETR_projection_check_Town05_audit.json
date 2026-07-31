@@ -1,0 +1,91 @@
+{
+  "box_contract": "gravity-centred [x,y,z,length,width,height,yaw]",
+  "box_lidar_point_counts": [
+    194,
+    31,
+    83,
+    930,
+    1677,
+    149,
+    7,
+    88
+  ],
+  "cameras": {
+    "fisheye_camera_front": {
+      "bridge_comparison_points": 2880,
+      "drawn_polyline_runs": 65,
+      "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_front/00153187.png",
+      "official_vs_sparse_bridge_max_error_px": 4.875282599539548e-05,
+      "official_vs_sparse_bridge_mean_error_px": 1.929910606393606e-05,
+      "visible_label_count": 6
+    },
+    "fisheye_camera_left": {
+      "bridge_comparison_points": 1730,
+      "drawn_polyline_runs": 57,
+      "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_left/00153187.png",
+      "official_vs_sparse_bridge_max_error_px": 4.830685993651911e-05,
+      "official_vs_sparse_bridge_mean_error_px": 1.6867154026247194e-05,
+      "visible_label_count": 5
+    },
+    "fisheye_camera_rear": {
+      "bridge_comparison_points": 1152,
+      "drawn_polyline_runs": 36,
+      "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_rear/00153187.png",
+      "official_vs_sparse_bridge_max_error_px": 5.341391168442647e-05,
+      "official_vs_sparse_bridge_mean_error_px": 1.722567965455509e-05,
+      "visible_label_count": 3
+    },
+    "fisheye_camera_right": {
+      "bridge_comparison_points": 1984,
+      "drawn_polyline_runs": 70,
+      "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_right/00153187.png",
+      "official_vs_sparse_bridge_max_error_px": 2.9698493041082705e-05,
+      "official_vs_sparse_bridge_mean_error_px": 1.4657763954267846e-05,
+      "visible_label_count": 6
+    }
+  },
+  "class_histogram": {
+    "Car": 2,
+    "Cyclist": 1,
+    "Pedestrian": 2,
+    "Truck": 2,
+    "Van": 1
+  },
+  "data_root": "/home/airlab/user/kdh/Fisheye3DODdataset",
+  "frame_id": "00153187",
+  "label_count": 12,
+  "label_path": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/label_3d/00153187.json",
+  "lidar_overlay": {
+    "cameras": {
+      "fisheye_camera_front": {
+        "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_front/00153187.png",
+        "projected_points": 25443
+      },
+      "fisheye_camera_left": {
+        "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_left/00153187.png",
+        "projected_points": 26927
+      },
+      "fisheye_camera_rear": {
+        "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_rear/00153187.png",
+        "projected_points": 26106
+      },
+      "fisheye_camera_right": {
+        "image": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/fisheye_camera_right/00153187.png",
+        "projected_points": 27043
+      }
+    },
+    "input_points": 49296,
+    "lidar": "/home/airlab/user/kdh/Fisheye3DODdataset/train-Town05_Opt-ClearSunset-2024_09_28_23_05_23/ego0/lidar/00153187.bin",
+    "montage": "/home/airlab/user/kdh/DAPETR_projection_check_Town05_full_lidar.png",
+    "schema": "fisheye3dod-lidar-projection/v1",
+    "selected_points_below_80m": 49296
+  },
+  "max_distance_m": 30.0,
+  "montage": "/home/airlab/user/kdh/DAPETR_projection_check_Town05_GT_boxes_lidar.png",
+  "points_per_box_edge": 48,
+  "projection": "released OcamCamera.world2cam, 220-degree FOV",
+  "scene": "train-Town05_Opt-ClearSunset-2024_09_28_23_05_23",
+  "schema": "fisheye3dod-label-projection/v1",
+  "selected_label_count": 8,
+  "vehicle": "ego0"
+}

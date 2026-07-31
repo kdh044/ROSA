@@ -1,0 +1,69 @@
+section,dataset,method_or_condition,epoch,n,metric,value,ci_low,ci_high,status,notes
+main,Fisheye3DOD,FisheyePETR,,,mAP,0.3883,,,confirmed,official checkpoint same evaluator
+main,Fisheye3DOD,FisheyePETR,,,FDS,0.4842,,,confirmed,evaluator NDS-style aggregate
+main,Fisheye3DOD,FisheyePETR,,,mATE,0.7110,,,confirmed,lower is better
+main,Fisheye3DOD,FisheyePETR,,,mASE,0.1413,,,confirmed,lower is better
+main,Fisheye3DOD,FisheyePETR,,,mAOE,0.4075,,,confirmed,lower is better
+main,Fisheye3DOD,FisheyeBEVDet,,,mAP,0.3987,,,confirmed,official checkpoint same evaluator
+main,Fisheye3DOD,FisheyeBEVDet,,,FDS,0.5000,,,confirmed,evaluator NDS-style aggregate
+main,Fisheye3DOD,FisheyeBEVDet,,,mATE,0.5821,,,confirmed,lower is better
+main,Fisheye3DOD,FisheyeBEVDet,,,mASE,0.1616,,,confirmed,lower is better
+main,Fisheye3DOD,FisheyeBEVDet,,,mAOE,0.4523,,,confirmed,lower is better
+main,Fisheye3DOD,Sparse4D B0,20,,mAP,0.5145,,,confirmed,R18 temporal-off fixed-20
+main,Fisheye3DOD,Sparse4D B0,20,,FDS,0.5936,,,confirmed,R18 temporal-off fixed-20
+main,Fisheye3DOD,Sparse4D B0,20,,mATE,0.5090,,,confirmed,lower is better
+main,Fisheye3DOD,Sparse4D B0,20,,mASE,0.1003,,,confirmed,lower is better
+main,Fisheye3DOD,Sparse4D B0,20,,mAOE,0.3725,,,confirmed,lower is better
+main,Fisheye3DOD,Ours Full,20,,mAP,0.5256,,,confirmed,R18 temporal-off fixed-20
+main,Fisheye3DOD,Ours Full,20,,FDS,0.6029,,,confirmed,R18 temporal-off fixed-20
+main,Fisheye3DOD,Ours Full,20,,mATE,0.4860,,,confirmed,lower is better
+main,Fisheye3DOD,Ours Full,20,,mASE,0.0979,,,confirmed,lower is better
+main,Fisheye3DOD,Ours Full,20,,mAOE,0.3753,,,confirmed,slightly worse than B0
+main_delta,Fisheye3DOD,Full minus B0,20,,mAP,0.0111,,,confirmed,higher is better
+main_delta,Fisheye3DOD,Full minus B0,20,,FDS,0.0093,,,confirmed,higher is better
+main_delta,Fisheye3DOD,Full minus B0,20,,mATE,-0.0230,,,confirmed,negative is better
+main_delta,Fisheye3DOD,Full minus B0,20,,mASE,-0.0024,,,confirmed,negative is better
+main_delta,Fisheye3DOD,Full minus B0,20,,mAOE,0.0028,,,confirmed,positive is worse
+ablation,Fisheye3DOD,w/o radial refinement,20,,mAP,0.5186,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o radial refinement,20,,FDS,0.5999,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o RFL,20,,mAP,0.5212,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o RFL,20,,FDS,0.5987,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o ROSA geometry,20,,mAP,0.5193,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o ROSA geometry,20,,FDS,0.5998,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o second re-observation,20,,mAP,0.5176,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o second re-observation,20,,FDS,0.5987,,,confirmed,fixed-20
+ablation,Fisheye3DOD,uniform camera fusion,20,,mAP,0.5187,,,confirmed,fixed-20
+ablation,Fisheye3DOD,uniform camera fusion,20,,FDS,0.5977,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o RFL and geometry,20,,mAP,0.5137,,,confirmed,fixed-20
+ablation,Fisheye3DOD,w/o RFL and geometry,20,,FDS,0.5931,,,confirmed,fixed-20
+trajectory,Fisheye3DOD,B0,,19606,mean_center_error_m,0.6867,,,confirmed,same matched predictions
+trajectory,Fisheye3DOD,B1,,19606,mean_center_error_m,0.6826,,,confirmed,same matched predictions
+trajectory,Fisheye3DOD,B2,,19606,mean_center_error_m,0.6814,,,confirmed,same matched predictions
+trajectory,Fisheye3DOD,B0,,19606,median_center_error_m,0.5387,,,confirmed,same matched predictions
+trajectory,Fisheye3DOD,B1,,19606,median_center_error_m,0.5355,,,confirmed,same matched predictions
+trajectory,Fisheye3DOD,B2,,19606,median_center_error_m,0.5348,,,confirmed,same matched predictions
+condition,Fisheye3DOD,overall,,22496,Recall@2m_delta,0.0096,0.0039,0.0153,confirmed,scene-cluster bootstrap
+condition,Fisheye3DOD,short_axis_below_8px,,2438,Recall@2m_delta,0.0250,0.0053,0.0467,confirmed,small projected support
+condition,Fisheye3DOD,Pedestrian,,3692,Recall@2m_delta,0.0217,0.0085,0.0359,confirmed,class breakdown
+condition,Fisheye3DOD,anisotropy_gap_at_least_0.4,,1692,Recall@2m_delta,0.0183,0.0006,0.0351,confirmed,cross-camera quality gap
+condition,Fisheye3DOD,distance_20_to_30m,,5257,Recall@2m_delta,0.0173,0.0060,0.0291,confirmed,mid range
+matching,Fisheye3DOD,recovered_B0_FN_to_Full_TP,,22496,count,1073,,,confirmed,
+matching,Fisheye3DOD,lost_B0_TP_to_Full_FN,,22496,count,858,,,confirmed,
+matching,Fisheye3DOD,net_TP_gain,,22496,count,215,,,confirmed,
+main,RealWorld,Sparse4D B0,20,,mAP,,,,pending,final fair protocol not yet measured
+main,RealWorld,Ours Full,20,,mAP,,,,pending,final fair protocol not yet measured
+interim,RealWorld,FisheyePETR R50 geometry-fixed,4,,mAP,0.0006,,,interim,20e run currently at epoch 7
+interim,RealWorld,FisheyePETR R50 geometry-fixed,4,,NDS,0.0829,,,interim,early validation not final
+interim,RealWorld,FisheyePETR R50 geometry-fixed,4,,mATE,1.1756,,,interim,lower is better
+interim,RealWorld,FisheyePETR R50 geometry-fixed,4,,mASE,0.5607,,,interim,lower is better
+interim,RealWorld,FisheyePETR R50 geometry-fixed,4,,mAOE,0.9435,,,interim,lower is better
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,4,,mAP,0.1337,,,interim,best validation so far
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,4,,NDS,0.1513,,,interim,best validation so far
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,4,,mATE,0.9620,,,interim,lower is better
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,4,,mASE,0.5312,,,interim,lower is better
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,4,,mAOE,1.1897,,,interim,lower is better
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,8,,mAP,0.1283,,,interim,20e run currently finishing epoch 11
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,8,,NDS,0.1484,,,interim,below epoch-4 best
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,8,,mATE,0.9518,,,interim,lower is better
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,8,,mASE,0.5430,,,interim,lower is better
+interim,RealWorld,FisheyeBEVDet R50 geometry-fixed,8,,mAOE,1.2373,,,interim,lower is better

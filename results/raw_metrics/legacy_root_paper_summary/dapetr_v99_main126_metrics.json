@@ -1,0 +1,32 @@
+{
+  "method": "DAPETR",
+  "backbone": "VoVNet-99",
+  "best_epoch": 16,
+  "selection_metric": "NDS (reported as FDS)",
+  "selection_metric_raw_value": 0.5047642566200823,
+  "metrics": {
+    "mAP": 0.4396,
+    "NDS": 0.5047,
+    "mATE": 0.7319,
+    "mASE": 0.1598,
+    "mAOE": 0.3987,
+    "Car_AP": 0.4765,
+    "Van_AP": 0.4473,
+    "Truck_AP": 0.4317,
+    "Bus_AP": 0.4525,
+    "Pedestrian_AP": 0.3769,
+    "Cyclist_AP": 0.4526
+  },
+  "checkpoint": "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/dapetr_vovnet99_main126_20e_official_port/epoch_16.pth",
+  "checkpoint_sha256": "3ad0143199d72e3932527e853fbed31d75a929f125ac6f2dce573b498f959e69",
+  "prediction_dump": "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/dapetr_vovnet99_main126_20e_official_port/best_nds_evaluation/predictions_3906.pkl",
+  "prediction_dump_sha256": "75f475d79f750cabdfb77e2c940e507b09a3f4a5b6c8e96681b3a690dc45d6f9",
+  "prediction_records": 3906,
+  "same_frame_prediction_dump": "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/dapetr_vovnet99_main126_20e_official_port/best_nds_evaluation/predictions_same_frames.pkl",
+  "same_frame_prediction_dump_sha256": "2516ac9f49475004fa96c286cafac459a5c64deb1e3e759179a27367dad36268",
+  "frame_alignment_manifest": "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/dapetr_vovnet99_main126_20e_official_port/best_nds_evaluation/same_frame_manifest.json",
+  "ordered_token_matches": 3906,
+  "source_manifest": "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/dapetr_vovnet99_main126_20e_official_port/source_manifest.json",
+  "source_commit": "127340afb1c45f535d90b03b7ac39b83128b4376",
+  "backbone_checkpoint_sha256": "e09844c0ac1e20ff32877676df208a708f1745ebd978cc1b9780b368aa930c15"
+}

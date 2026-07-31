@@ -1,0 +1,65 @@
+"""Deterministic multiview feature sampling."""
+
+from __future__ import annotations
+
+import torch
+from torch import Tensor, nn
+
+
+class DeterministicBilinearSampler(nn.Module):
+    """Sample ``[B,C,D,H,W]`` feature maps at normalized fisheye pixels.
+
+    This explicit four-gather implementation is equivalent to
+    ``grid_sample(..., align_corners=False)`` while retaining deterministic
+    CUDA backward behavior.
+    """
+
+    def forward(self, feature: Tensor, uv: Tensor) -> Tensor:
+        if feature.ndim != 5:
+            raise ValueError("feature must be [B,C,D,H,W]")
+        batch, cameras, channels, height, width = feature.shape
+        if (
+            uv.ndim != 6
+            or uv.shape[0] != batch
+            or uv.shape[2] != cameras
+            or uv.shape[-1] != 2
+        ):
+            raise ValueError("uv must be [B,N,C,S,P,2]")
+
+        queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
+        camera_batches = batch * cameras
+        sample_count = queries * samples * patch
+        coordinates = uv.permute(0, 2, 1, 3, 4, 5).reshape(
+            camera_batches, sample_count, 2
+        )
+        coordinates = torch.nan_to_num(coordinates, nan=-2.0, posinf=-2.0, neginf=-2.0)
+        x = coordinates[..., 0] * width - 0.5
+        y = coordinates[..., 1] * height - 0.5
+        x0, y0 = x.floor().long(), y.floor().long()
+        x1, y1 = x0 + 1, y0 + 1
+        wx1 = (x - x0.to(x.dtype)).to(feature.dtype)
+        wy1 = (y - y0.to(y.dtype)).to(feature.dtype)
+        wx0, wy0 = 1.0 - wx1, 1.0 - wy1
+        flattened = feature.reshape(camera_batches, channels, height * width)
+
+        def gather(ix: Tensor, iy: Tensor) -> Tensor:
+            valid = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+            linear = iy.clamp(0, height - 1) * width + ix.clamp(0, width - 1)
+            values = torch.gather(
+                flattened,
+                2,
+                linear[:, None].expand(-1, channels, -1),
+            )
+            return values * valid[:, None].to(values.dtype)
+
+        sampled = (
+            gather(x0, y0) * (wx0 * wy0)[:, None]
+            + gather(x1, y0) * (wx1 * wy0)[:, None]
+            + gather(x0, y1) * (wx0 * wy1)[:, None]
+            + gather(x1, y1) * (wx1 * wy1)[:, None]
+        )
+        sampled = sampled.reshape(batch, cameras, channels, queries, samples, patch)
+        return sampled.permute(0, 3, 1, 4, 5, 2).contiguous()
+
+
+__all__ = ["DeterministicBilinearSampler"]

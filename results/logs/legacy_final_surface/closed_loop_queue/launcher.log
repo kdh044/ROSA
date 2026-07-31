@@ -1,0 +1,931 @@
+B0 finished; starting one-step closed-loop ROSA preflight.
+
+*****************************************
+Setting OMP_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+*****************************************
+/usr/local/lib/python3.10/dist-packages/matplotlib/projections/__init__.py:63: UserWarning: Unable to import Axes3D. This may be due to multiple versions of Matplotlib being installed (e.g. as a system package and as a pip package). As a result, the 3D projection is not available.
+  warnings.warn("Unable to import Axes3D. This may be due to multiple versions of "
+/usr/local/lib/python3.10/dist-packages/matplotlib/projections/__init__.py:63: UserWarning: Unable to import Axes3D. This may be due to multiple versions of Matplotlib being installed (e.g. as a system package and as a pip package). As a result, the 3D projection is not available.
+  warnings.warn("Unable to import Axes3D. This may be due to multiple versions of "
+/usr/local/lib/python3.10/dist-packages/mmengine/utils/dl_utils/setup_env.py:56: UserWarning: Setting MKL_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+  warnings.warn(
+/usr/local/lib/python3.10/dist-packages/mmengine/utils/dl_utils/setup_env.py:56: UserWarning: Setting MKL_NUM_THREADS environment variable for each process to be 1 in default, to avoid your system being overloaded, please further tune the variable for optimal performance in your application as needed.
+  warnings.warn(
+07/27 15:43:10 - mmengine - INFO -
+------------------------------------------------------------
+System environment:
+    sys.platform: linux
+    Python: 3.10.12 (main, Mar  3 2026, 11:56:32) [GCC 11.4.0]
+    CUDA available: True
+    MUSA available: False
+    numpy_random_seed: 3407
+    GPU 0,1: NVIDIA RTX PRO 6000 Blackwell Server Edition
+    CUDA_HOME: /usr/local/cuda
+    NVCC: Cuda compilation tools, release 12.8, V12.8.61
+    GCC: x86_64-linux-gnu-gcc (Ubuntu 11.4.0-1ubuntu1~22.04.3) 11.4.0
+    PyTorch: 2.11.0+cu128
+    PyTorch compiling details: PyTorch built with:
+  - GCC 13.3
+  - C++ Version: 201703
+  - Intel(R) oneAPI Math Kernel Library Version 2024.2-Product Build 20240605 for Intel(R) 64 architecture applications
+  - Intel(R) MKL-DNN v3.10.2 (Git Hash f1d471933dc852f956fd05389f9313c7148783d5)
+  - OpenMP 201511 (a.k.a. OpenMP 4.5)
+  - LAPACK is enabled (usually provided by MKL)
+  - NNPACK is enabled
+  - CPU capability usage: AVX512
+  - CUDA Runtime 12.8
+  - NVCC architecture flags: -gencode;arch=compute_75,code=sm_75;-gencode;arch=compute_80,code=sm_80;-gencode;arch=compute_86,code=sm_86;-gencode;arch=compute_90,code=sm_90;-gencode;arch=compute_100,code=sm_100;-gencode;arch=compute_120,code=sm_120
+  - CuDNN 91.9  (built against CUDA 12.9)
+  - Magma 2.6.1
+  - Build settings: BLAS_INFO=mkl, BUILD_TYPE=Release, COMMIT_SHA=70d99e998b4955e0049d13a98d77ae1b14db1f45, CUDA_VERSION=12.8, CUDNN_VERSION=9.19.0, CXX_COMPILER=/opt/rh/gcc-toolset-13/root/usr/bin/c++, CXX_FLAGS= -fvisibility-inlines-hidden -DUSE_PTHREADPOOL -DNDEBUG -DUSE_KINETO -DLIBKINETO_NOROCTRACER -DLIBKINETO_NOXPUPTI=ON -DUSE_FBGEMM -DUSE_MSLK -DUSE_PYTORCH_QNNPACK -DUSE_XNNPACK -DSYMBOLICATE_MOBILE_DEBUG_HANDLE -O2 -fPIC -DC10_NODEPRECATED -Wall -Wextra -Werror=return-type -Werror=non-virtual-dtor -Werror=range-loop-construct -Werror=bool-operation -Wnarrowing -Wno-missing-field-initializers -Wno-unknown-pragmas -Wno-unused-parameter -Wno-strict-overflow -Wno-strict-aliasing -Wno-stringop-overflow -Wsuggest-override -Wno-psabi -Wno-error=old-style-cast -faligned-new -Wno-maybe-uninitialized -fno-math-errno -fno-trapping-math -Werror=format -Wno-dangling-reference -Wno-error=dangling-reference -Wno-stringop-overflow, LAPACK_INFO=mkl, PERF_WITH_AVX=1, PERF_WITH_AVX2=1, TORCH_VERSION=2.11.0, USE_CUDA=ON, USE_CUDNN=ON, USE_CUSPARSELT=1, USE_GFLAGS=OFF, USE_GLOG=OFF, USE_GLOO=ON, USE_MKL=ON, USE_MKLDNN=ON, USE_MPI=OFF, USE_NCCL=1, USE_NNPACK=ON, USE_OPENMP=ON, USE_ROCM=OFF, USE_ROCM_KERNEL_ASSERT=OFF, USE_XCCL=OFF, USE_XPU=OFF,
+
+    TorchVision: 0.26.0+cu128
+    OpenCV: 4.13.0
+    MMEngine: 0.10.7
+
+Runtime environment:
+    cudnn_benchmark: False
+    mp_cfg: {'mp_start_method': 'fork', 'opencv_num_threads': 0}
+    dist_cfg: {'backend': 'nccl'}
+    seed: 3407
+    deterministic: True
+    Distributed launcher: pytorch
+    Distributed training: True
+    GPU number: 2
+------------------------------------------------------------
+
+07/27 15:43:11 - mmengine - INFO - Config:
+_decoder0 = [
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+]
+_decoder_later = [
+    'gnn',
+    'norm',
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+]
+anchor_file = '/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/artifacts/fisheye3dod_main126_train_kmeans300_seed3407.npy'
+ann_root = '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz'
+ann_train = '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_train.pkl'
+ann_val = '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_val.pkl'
+cameras = (
+    'fisheye_camera_front',
+    'fisheye_camera_left',
+    'fisheye_camera_right',
+    'fisheye_camera_rear',
+)
+classes = (
+    'Car',
+    'Van',
+    'Truck',
+    'Bus',
+    'Pedestrian',
+    'Cyclist',
+)
+custom_hooks = [
+    dict(priority='NORMAL', type='SyncBuffersHook'),
+]
+custom_imports = dict(
+    allow_failed_imports=False,
+    imports=[
+        'projects.mmdet3d_plugin',
+        'fisheye3dod_official.dataset',
+        'fisheye3dod_official.model',
+        'fisheye3dod_official.metric',
+        'final_surface_rosa_rfl',
+    ])
+data_root = '/home/airlab/user/kdh/Fisheye3DODdataset'
+default_hooks = dict(
+    checkpoint=dict(
+        by_epoch=False, interval=1, max_keep_ckpts=1, type='CheckpointHook'),
+    logger=dict(interval=1, type='LoggerHook'),
+    param_scheduler=dict(type='ParamSchedulerHook'),
+    sampler_seed=dict(type='DistSamplerSeedHook'),
+    timer=dict(type='IterTimerHook'))
+default_scope = 'mmdet3d'
+embed_dims = 256
+env_cfg = dict(
+    cudnn_benchmark=False,
+    dist_cfg=dict(backend='nccl'),
+    mp_cfg=dict(mp_start_method='fork', opencv_num_threads=0))
+experiment_contract = dict(
+    backbone='ImageNet-pretrained ResNet-18',
+    camera_model='official OCamCalib native 800x800',
+    dataset='Fisheye3DOD',
+    extra_surface_points=0,
+    feedback_flow=
+    'posterior-weighted candidate feature -> bounded shape2 + localization-quality rank residual',
+    global_batch_size=8,
+    initial_flow=
+    '13 native keypoints -> OCam FPN observations -> SH-RFL -> query-conditioned camera-softmax ROSA',
+    keep_threshold_m=0.5,
+    max_epochs=20,
+    native_sparse4d_keypoints='7 fixed + 6 learnable = 13',
+    radial_candidate_offsets=(
+        -2,
+        -1,
+        0,
+        1,
+        2,
+    ),
+    radial_step_m=0.5,
+    seed=3407,
+    shape_center_flow=
+    'shape1 + tangent -> detached five radial hypotheses -> cross-camera candidate agreement -> uncertainty-gated radial update',
+    split='local-main126-8820-train-3906-val',
+    temporal=False)
+find_unused_parameters = True
+fixed_keypoints = [
+    [
+        0.0,
+        0.0,
+        0.0,
+    ],
+    [
+        0.45,
+        0.0,
+        0.0,
+    ],
+    [
+        -0.45,
+        0.0,
+        0.0,
+    ],
+    [
+        0.0,
+        0.45,
+        0.0,
+    ],
+    [
+        0.0,
+        -0.45,
+        0.0,
+    ],
+    [
+        0.0,
+        0.0,
+        0.45,
+    ],
+    [
+        0.0,
+        0.0,
+        -0.45,
+    ],
+]
+launcher = 'pytorch'
+load_from = None
+log_level = 'INFO'
+log_processor = dict(by_epoch=True, type='LogProcessor', window_size=50)
+metainfo = dict(
+    classes=(
+        'Car',
+        'Van',
+        'Truck',
+        'Bus',
+        'Pedestrian',
+        'Cyclist',
+    ))
+model = dict(
+    data_preprocessor=dict(
+        bgr_to_rgb=True,
+        mean=[
+            123.675,
+            116.28,
+            103.53,
+        ],
+        pad_size_divisor=32,
+        std=[
+            58.395,
+            57.12,
+            57.375,
+        ],
+        type='Sparse4DDataPreprocessor'),
+    head=dict(
+        anchor_encoder=dict(
+            embed_dims=[
+                128,
+                32,
+                32,
+                64,
+            ],
+            in_loops=1,
+            mode='cat',
+            out_loops=4,
+            output_fc=False,
+            type='SparseBox3DEncoder',
+            vel_dims=2),
+        cache_decoder_index=5,
+        canonical_task_splice_cfg=dict(
+            anchor_z_is_bottom=False,
+            contract_version=
+            'late-canonical-geometry/2026-07-25/v15-native-joint-score-residual',
+            generate_fisheye_mask=False,
+            min_patch_samples=1,
+            min_projected_fpn_cells=1.0,
+            num_classes=6,
+            patch_cols=1,
+            patch_rows=1,
+            point_cloud_xy_half_extent=(
+                48.0,
+                48.0,
+            ),
+            projection_type='ocam_fisheye'),
+        closed_loop_rosa_cfg=dict(
+            candidate_loss_weight=0.5,
+            candidate_target_sigma_m=0.5,
+            center_keep_loss_weight=1.0,
+            center_move_loss_weight=1.0,
+            detach_candidate_geometry=True,
+            embed_dims=256,
+            enable_quality_score=True,
+            enable_radial=True,
+            enable_shape1=True,
+            enable_shape2_feedback=True,
+            enable_tangent=True,
+            hidden_dims=128,
+            keep_threshold_m=0.5,
+            max_log_size_delta=0.2,
+            max_shape2_log_size_delta=0.05,
+            max_shape2_yaw_delta_rad=0.08,
+            max_tangent_delta_m=0.75,
+            max_yaw_delta_rad=0.25,
+            num_cameras=4,
+            num_keypoints=13,
+            num_levels=4,
+            quality_loss_weight=0.5,
+            radial_offset_loss_weight=0.5,
+            radial_step_m=0.5,
+            shape_loss_weight=1.0,
+            tangent_loss_weight=0.25),
+        cls_threshold_to_reg=0.05,
+        decoder=dict(num_output=300, type='SparseBox3DDecoder'),
+        decouple_attn=True,
+        deformable_model=dict(
+            attn_drop=0.15,
+            embed_dims=256,
+            kps_generator=dict(
+                anchor_z_is_bottom=False,
+                fix_scale=[
+                    [
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    [
+                        0.45,
+                        0.0,
+                        0.0,
+                    ],
+                    [
+                        -0.45,
+                        0.0,
+                        0.0,
+                    ],
+                    [
+                        0.0,
+                        0.45,
+                        0.0,
+                    ],
+                    [
+                        0.0,
+                        -0.45,
+                        0.0,
+                    ],
+                    [
+                        0.0,
+                        0.0,
+                        0.45,
+                    ],
+                    [
+                        0.0,
+                        0.0,
+                        -0.45,
+                    ],
+                ],
+                num_learnable_pts=6,
+                type='SparseBox3DKeyPointsGenerator'),
+            num_cams=4,
+            num_groups=8,
+            num_levels=4,
+            projection_type='ocam_fisheye',
+            residual_mode='cat',
+            type='DeformableFeatureAggregation',
+            use_camera_embed=True,
+            use_deformable_func=True),
+        ffn=dict(
+            act_cfg=dict(inplace=True, type='ReLU'),
+            embed_dims=256,
+            feedforward_channels=1024,
+            ffn_drop=0.1,
+            in_channels=512,
+            num_fcs=2,
+            pre_norm=dict(type='LN'),
+            type='AsymmetricFFN'),
+        graph_model=dict(
+            batch_first=True,
+            dropout=0.1,
+            embed_dims=512,
+            num_heads=8,
+            type='MultiheadAttention'),
+        inference_box_source_by_dimension=None,
+        inference_classification_decoder_index=5,
+        inference_output_decoder_index=5,
+        inference_quality_decoder_index=5,
+        instance_bank=dict(
+            anchor=
+            '/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/artifacts/fisheye3dod_main126_train_kmeans300_seed3407.npy',
+            anchor_handler=dict(
+                anchor_z_is_bottom=False,
+                type='SparseBox3DKeyPointsGenerator'),
+            confidence_decay=0.6,
+            embed_dims=256,
+            feat_grad=False,
+            num_anchor=300,
+            num_temp_instances=0,
+            type='InstanceBank'),
+        loss_cls=dict(
+            alpha=0.25,
+            gamma=2.0,
+            loss_weight=2.0,
+            type='mmdet.FocalLoss',
+            use_sigmoid=True),
+        loss_reg=dict(
+            loss_box=dict(loss_weight=0.25, type='mmdet.L1Loss'),
+            loss_centerness=dict(
+                type='mmdet.CrossEntropyLoss', use_sigmoid=True),
+            loss_yawness=dict(type='mmdet.GaussianFocalLoss'),
+            type='SparseBox3DLoss'),
+        max_temporal_gnn_interactions=0,
+        norm_layer=dict(normalized_shape=256, type='LN'),
+        num_decoder=6,
+        num_single_frame_decoder=1,
+        operation_order=[
+            'deformable',
+            'ffn',
+            'norm',
+            'refine',
+            'gnn',
+            'norm',
+            'deformable',
+            'ffn',
+            'norm',
+            'refine',
+            'gnn',
+            'norm',
+            'deformable',
+            'ffn',
+            'norm',
+            'refine',
+            'gnn',
+            'norm',
+            'deformable',
+            'ffn',
+            'norm',
+            'refine',
+            'gnn',
+            'norm',
+            'deformable',
+            'ffn',
+            'norm',
+            'refine',
+            'gnn',
+            'norm',
+            'deformable',
+            'ffn',
+            'norm',
+            'refine',
+        ],
+        refine_layer=dict(
+            embed_dims=256,
+            num_cls=6,
+            refine_yaw=True,
+            type='SparseBox3DRefinementModule',
+            with_quality_estimation=True),
+        reg_weights=[
+            2.0,
+            2.0,
+            2.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+            1.0,
+        ],
+        sampler=dict(
+            add_neg_dn=True,
+            box_weight=0.25,
+            cls_weight=2.0,
+            dn_noise_scale=[
+                2.0,
+                2.0,
+                2.0,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+                0.5,
+            ],
+            max_dn_gt=32,
+            num_dn_groups=5,
+            num_temp_dn_groups=0,
+            reg_weights=[
+                2.0,
+                2.0,
+                2.0,
+                0.5,
+                0.5,
+                0.5,
+                0.0,
+                0.0,
+                0.0,
+                0.0,
+            ],
+            type='SparseBox3DTarget'),
+        temp_graph_model=dict(
+            batch_first=True,
+            dropout=0.1,
+            embed_dims=512,
+            num_heads=8,
+            type='MultiheadAttention'),
+        type='ClosedLoopROSAHead'),
+    img_backbone=dict(
+        depth=18,
+        frozen_stages=-1,
+        init_cfg=dict(checkpoint='torchvision://resnet18', type='Pretrained'),
+        norm_cfg=dict(requires_grad=True, type='BN'),
+        norm_eval=False,
+        num_stages=4,
+        out_indices=(
+            0,
+            1,
+            2,
+            3,
+        ),
+        style='pytorch',
+        type='mmdet.ResNet',
+        with_cp=False),
+    img_neck=dict(
+        add_extra_convs='on_output',
+        in_channels=[
+            64,
+            128,
+            256,
+            512,
+        ],
+        num_outs=4,
+        out_channels=256,
+        relu_before_extra_convs=True,
+        start_level=0,
+        type='mmdet.FPN'),
+    type='Fisheye3DODGravityCenterSparse4D',
+    use_deformable_func=True,
+    use_grid_mask=False)
+num_decoder = 6
+num_groups = 8
+num_levels = 4
+operation_order = [
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+    'gnn',
+    'norm',
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+    'gnn',
+    'norm',
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+    'gnn',
+    'norm',
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+    'gnn',
+    'norm',
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+    'gnn',
+    'norm',
+    'deformable',
+    'ffn',
+    'norm',
+    'refine',
+]
+optim_wrapper = dict(
+    clip_grad=dict(error_if_nonfinite=True, max_norm=25, norm_type=2),
+    optimizer=dict(lr=0.0002, type='AdamW', weight_decay=0.001),
+    paramwise_cfg=dict(custom_keys=dict(img_backbone=dict(lr_mult=0.5))),
+    type='OptimWrapper')
+param_scheduler = [
+    dict(
+        begin=0,
+        by_epoch=False,
+        end=500,
+        start_factor=0.3333333333333333,
+        type='LinearLR'),
+    dict(
+        T_max=20,
+        begin=0,
+        by_epoch=True,
+        convert_to_iter_based=True,
+        end=20,
+        eta_min_ratio=0.001,
+        type='CosineAnnealingLR'),
+]
+point_cloud_range = [
+    -48.0,
+    -48.0,
+    -5.0,
+    48.0,
+    48.0,
+    5.0,
+]
+randomness = dict(deterministic=True, seed=3407)
+resume = False
+seed = 3407
+strides = [
+    4,
+    8,
+    16,
+    32,
+]
+test_cfg = dict()
+test_dataloader = dict(
+    batch_size=4,
+    collate_fn=dict(type='default_collate'),
+    dataset=dict(
+        ann_file=
+        '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_val.pkl',
+        data_root='/home/airlab/user/kdh/Fisheye3DODdataset',
+        filter_empty_gt=False,
+        metainfo=dict(
+            classes=(
+                'Car',
+                'Van',
+                'Truck',
+                'Bus',
+                'Pedestrian',
+                'Cyclist',
+            )),
+        pipeline=[
+            dict(
+                cam_names=(
+                    'fisheye_camera_front',
+                    'fisheye_camera_left',
+                    'fisheye_camera_right',
+                    'fisheye_camera_rear',
+                ),
+                to_float32=True,
+                type='LoadOfficialFisheye3DODForSparse4D'),
+            dict(ocam_lens_fov_deg=220.0, type='PackSparse4DInputs'),
+        ],
+        test_mode=True,
+        type='Fisheye3DODSparse4DDataset',
+        with_velocity=True),
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(shuffle=False, type='DefaultSampler'))
+test_evaluator = dict(
+    prefix='fisheye_bev', type='Fisheye3DODReleasedMetricBridge')
+test_pipeline = [
+    dict(
+        cam_names=(
+            'fisheye_camera_front',
+            'fisheye_camera_left',
+            'fisheye_camera_right',
+            'fisheye_camera_rear',
+        ),
+        to_float32=True,
+        type='LoadOfficialFisheye3DODForSparse4D'),
+    dict(ocam_lens_fov_deg=220.0, type='PackSparse4DInputs'),
+]
+train_cfg = dict(max_iters=1, type='IterBasedTrainLoop', val_interval=1000)
+train_dataloader = dict(
+    batch_size=4,
+    collate_fn=dict(type='default_collate'),
+    dataset=dict(
+        ann_file=
+        '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_train.pkl',
+        data_root='/home/airlab/user/kdh/Fisheye3DODdataset',
+        filter_empty_gt=True,
+        metainfo=dict(
+            classes=(
+                'Car',
+                'Van',
+                'Truck',
+                'Bus',
+                'Pedestrian',
+                'Cyclist',
+            )),
+        pipeline=[
+            dict(
+                cam_names=(
+                    'fisheye_camera_front',
+                    'fisheye_camera_left',
+                    'fisheye_camera_right',
+                    'fisheye_camera_rear',
+                ),
+                to_float32=True,
+                type='LoadOfficialFisheye3DODForSparse4D'),
+            dict(
+                type='LoadAnnotations3D',
+                with_bbox=False,
+                with_bbox_3d=True,
+                with_label=False,
+                with_label_3d=True),
+            dict(type='OfficialFisheye3DODRangeFilter'),
+            dict(ocam_lens_fov_deg=220.0, type='PackSparse4DInputs'),
+        ],
+        test_mode=False,
+        type='Fisheye3DODSparse4DDataset',
+        with_velocity=True),
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(shuffle=True, type='DefaultSampler'))
+train_pipeline = [
+    dict(
+        cam_names=(
+            'fisheye_camera_front',
+            'fisheye_camera_left',
+            'fisheye_camera_right',
+            'fisheye_camera_rear',
+        ),
+        to_float32=True,
+        type='LoadOfficialFisheye3DODForSparse4D'),
+    dict(
+        type='LoadAnnotations3D',
+        with_bbox=False,
+        with_bbox_3d=True,
+        with_label=False,
+        with_label_3d=True),
+    dict(type='OfficialFisheye3DODRangeFilter'),
+    dict(ocam_lens_fov_deg=220.0, type='PackSparse4DInputs'),
+]
+val_cfg = dict()
+val_dataloader = dict(
+    batch_size=4,
+    collate_fn=dict(type='default_collate'),
+    dataset=dict(
+        ann_file=
+        '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_val.pkl',
+        data_root='/home/airlab/user/kdh/Fisheye3DODdataset',
+        filter_empty_gt=False,
+        metainfo=dict(
+            classes=(
+                'Car',
+                'Van',
+                'Truck',
+                'Bus',
+                'Pedestrian',
+                'Cyclist',
+            )),
+        pipeline=[
+            dict(
+                cam_names=(
+                    'fisheye_camera_front',
+                    'fisheye_camera_left',
+                    'fisheye_camera_right',
+                    'fisheye_camera_rear',
+                ),
+                to_float32=True,
+                type='LoadOfficialFisheye3DODForSparse4D'),
+            dict(ocam_lens_fov_deg=220.0, type='PackSparse4DInputs'),
+        ],
+        test_mode=True,
+        type='Fisheye3DODSparse4DDataset',
+        with_velocity=True),
+    num_workers=4,
+    persistent_workers=True,
+    sampler=dict(shuffle=False, type='DefaultSampler'))
+val_evaluator = dict(
+    prefix='fisheye_bev', type='Fisheye3DODReleasedMetricBridge')
+vis_backends = [
+    dict(type='LocalVisBackend'),
+]
+visualizer = dict(
+    name='visualizer',
+    type='Det3DLocalVisualizer',
+    vis_backends=[
+        dict(type='LocalVisBackend'),
+    ])
+work_dir = '/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/r18_closed_loop_rosa_preflight_1iter_2gpu_b4'
+
+07/27 15:43:12 - mmengine - INFO - Hooks will be executed in the following order:
+before_run:
+(VERY_HIGH   ) RuntimeInfoHook
+(BELOW_NORMAL) LoggerHook
+ --------------------
+before_train:
+(VERY_HIGH   ) RuntimeInfoHook
+(NORMAL      ) IterTimerHook
+(VERY_LOW    ) CheckpointHook
+ --------------------
+before_train_epoch:
+(VERY_HIGH   ) RuntimeInfoHook
+(NORMAL      ) IterTimerHook
+(NORMAL      ) DistSamplerSeedHook
+ --------------------
+before_train_iter:
+(VERY_HIGH   ) RuntimeInfoHook
+(NORMAL      ) IterTimerHook
+ --------------------
+after_train_iter:
+(VERY_HIGH   ) RuntimeInfoHook
+(NORMAL      ) IterTimerHook
+(BELOW_NORMAL) LoggerHook
+(LOW         ) ParamSchedulerHook
+(VERY_LOW    ) CheckpointHook
+ --------------------
+after_train_epoch:
+(NORMAL      ) IterTimerHook
+(NORMAL      ) SyncBuffersHook
+(LOW         ) ParamSchedulerHook
+(VERY_LOW    ) CheckpointHook
+ --------------------
+before_val:
+(VERY_HIGH   ) RuntimeInfoHook
+ --------------------
+before_val_epoch:
+(NORMAL      ) IterTimerHook
+(NORMAL      ) SyncBuffersHook
+ --------------------
+before_val_iter:
+(NORMAL      ) IterTimerHook
+ --------------------
+after_val_iter:
+(NORMAL      ) IterTimerHook
+(BELOW_NORMAL) LoggerHook
+ --------------------
+after_val_epoch:
+(VERY_HIGH   ) RuntimeInfoHook
+(NORMAL      ) IterTimerHook
+(BELOW_NORMAL) LoggerHook
+(LOW         ) ParamSchedulerHook
+(VERY_LOW    ) CheckpointHook
+ --------------------
+after_val:
+(VERY_HIGH   ) RuntimeInfoHook
+ --------------------
+after_train:
+(VERY_HIGH   ) RuntimeInfoHook
+(VERY_LOW    ) CheckpointHook
+ --------------------
+before_test:
+(VERY_HIGH   ) RuntimeInfoHook
+ --------------------
+before_test_epoch:
+(NORMAL      ) IterTimerHook
+ --------------------
+before_test_iter:
+(NORMAL      ) IterTimerHook
+ --------------------
+after_test_iter:
+(NORMAL      ) IterTimerHook
+(BELOW_NORMAL) LoggerHook
+ --------------------
+after_test_epoch:
+(VERY_HIGH   ) RuntimeInfoHook
+(NORMAL      ) IterTimerHook
+(BELOW_NORMAL) LoggerHook
+ --------------------
+after_test:
+(VERY_HIGH   ) RuntimeInfoHook
+ --------------------
+after_run:
+(BELOW_NORMAL) LoggerHook
+ --------------------
+[rank1]: Traceback (most recent call last):
+[rank1]:   File "/home/airlab/user/kdh/sphere_stream_sparse4d/tools/train_mmengine.py", line 88, in <module>
+[rank1]:     main()
+[rank1]:   File "/home/airlab/user/kdh/sphere_stream_sparse4d/tools/train_mmengine.py", line 84, in main
+[rank1]:     runner.train()
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/runner.py", line 1728, in train
+[rank1]:     self._train_loop = self.build_train_loop(
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/runner.py", line 1520, in build_train_loop
+[rank1]:     loop = LOOPS.build(
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/registry.py", line 570, in build
+[rank1]:     return self.build_func(cfg, *args, **kwargs, registry=self)
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/build_functions.py", line 121, in build_from_cfg
+[rank1]:     obj = obj_cls(**args)  # type: ignore
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/loops.py", line 222, in __init__
+[rank1]:     super().__init__(runner, dataloader)
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/base_loop.py", line 26, in __init__
+[rank1]:     self.dataloader = runner.build_dataloader(
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/runner.py", line 1370, in build_dataloader
+[rank1]:     dataset = DATASETS.build(dataset_cfg)
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/registry.py", line 570, in build
+[rank1]:     return self.build_func(cfg, *args, **kwargs, registry=self)
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/build_functions.py", line 121, in build_from_cfg
+[rank1]:     obj = obj_cls(**args)  # type: ignore
+[rank1]:   File "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/fisheye3dod_official/dataset.py", line 79, in __init__
+[rank1]:     super().__init__(
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmdet3d/datasets/det3d_dataset.py", line 126, in __init__
+[rank1]:     super().__init__(
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/dataset/base_dataset.py", line 247, in __init__
+[rank1]:     self.full_init()
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/dataset/base_dataset.py", line 298, in full_init
+[rank1]:     self.data_list = self.load_data_list()
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/dataset/base_dataset.py", line 435, in load_data_list
+[rank1]:     annotations = load(self.ann_file)
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/fileio/io.py", line 855, in load
+[rank1]:     with BytesIO(file_backend.get(file)) as f:
+[rank1]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/fileio/backends/local_backend.py", line 33, in get
+[rank1]:     with open(filepath, 'rb') as f:
+[rank1]: FileNotFoundError: [Errno 2] No such file or directory: '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_train.pkl'
+[rank0]: Traceback (most recent call last):
+[rank0]:   File "/home/airlab/user/kdh/sphere_stream_sparse4d/tools/train_mmengine.py", line 88, in <module>
+[rank0]:     main()
+[rank0]:   File "/home/airlab/user/kdh/sphere_stream_sparse4d/tools/train_mmengine.py", line 84, in main
+[rank0]:     runner.train()
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/runner.py", line 1728, in train
+[rank0]:     self._train_loop = self.build_train_loop(
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/runner.py", line 1520, in build_train_loop
+[rank0]:     loop = LOOPS.build(
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/registry.py", line 570, in build
+[rank0]:     return self.build_func(cfg, *args, **kwargs, registry=self)
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/build_functions.py", line 121, in build_from_cfg
+[rank0]:     obj = obj_cls(**args)  # type: ignore
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/loops.py", line 222, in __init__
+[rank0]:     super().__init__(runner, dataloader)
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/base_loop.py", line 26, in __init__
+[rank0]:     self.dataloader = runner.build_dataloader(
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/runner/runner.py", line 1370, in build_dataloader
+[rank0]:     dataset = DATASETS.build(dataset_cfg)
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/registry.py", line 570, in build
+[rank0]:     return self.build_func(cfg, *args, **kwargs, registry=self)
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/registry/build_functions.py", line 121, in build_from_cfg
+[rank0]:     obj = obj_cls(**args)  # type: ignore
+[rank0]:   File "/home/airlab/user/kdh/fisheye3dod_sparse4d_r50_official_20260726/fisheye3dod_official/dataset.py", line 79, in __init__
+[rank0]:     super().__init__(
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmdet3d/datasets/det3d_dataset.py", line 126, in __init__
+[rank0]:     super().__init__(
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/dataset/base_dataset.py", line 247, in __init__
+[rank0]:     self.full_init()
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/dataset/base_dataset.py", line 298, in full_init
+[rank0]:     self.data_list = self.load_data_list()
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/dataset/base_dataset.py", line 435, in load_data_list
+[rank0]:     annotations = load(self.ann_file)
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/fileio/io.py", line 855, in load
+[rank0]:     with BytesIO(file_backend.get(file)) as f:
+[rank0]:   File "/usr/local/lib/python3.10/dist-packages/mmengine/fileio/backends/local_backend.py", line 33, in get
+[rank0]:     with open(filepath, 'rb') as f:
+[rank0]: FileNotFoundError: [Errno 2] No such file or directory: '/home/airlab/user/kdh/Fisheye3DODdataset/ImageSets-2hz/fisheye3dod_infos_train.pkl'
+[rank0]:[W727 15:43:13.868403748 ProcessGroupNCCL.cpp:1575] Warning: WARNING: destroy_process_group() was not called before program exit, which can leak resources. For more info, please see https://pytorch.org/docs/stable/distributed.html#shutdown (function operator())
+W0727 15:43:14.287000 27209 torch/distributed/elastic/multiprocessing/api.py:1012] Sending process 27341 closing signal SIGTERM
+E0727 15:43:14.451000 27209 torch/distributed/elastic/multiprocessing/api.py:986] failed (exitcode: 1) local_rank: 1 (pid: 27342) of binary: /usr/bin/python3
+Traceback (most recent call last):
+  File "/usr/lib/python3.10/runpy.py", line 196, in _run_module_as_main
+    return _run_code(code, main_globals, None,
+  File "/usr/lib/python3.10/runpy.py", line 86, in _run_code
+    exec(code, run_globals)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 994, in <module>
+    main()
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/elastic/multiprocessing/errors/__init__.py", line 362, in wrapper
+    return f(*args, **kwargs)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 990, in main
+    run(args)
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/run.py", line 981, in run
+    elastic_launch(
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/launcher/api.py", line 170, in __call__
+    return launch_agent(self._config, self._entrypoint, list(args))
+  File "/usr/local/lib/python3.10/dist-packages/torch/distributed/launcher/api.py", line 317, in launch_agent
+    raise ChildFailedError(
+torch.distributed.elastic.multiprocessing.errors.ChildFailedError:
+============================================================
+/home/airlab/user/kdh/sphere_stream_sparse4d/tools/train_mmengine.py FAILED
+------------------------------------------------------------
+Failures:
+[1]:
+  time      : 2026-07-27_15:43:14
+  host      : 0b518057e458
+  rank      : 0 (local_rank: 0)
+  exitcode  : -15 (pid: 27341)
+  error_file: <N/A>
+  traceback : Signal 15 (SIGTERM) received by PID 27341
+------------------------------------------------------------
+Root Cause (first observed failure):
+[0]:
+  time      : 2026-07-27_15:43:14
+  host      : 0b518057e458
+  rank      : 1 (local_rank: 1)
+  exitcode  : 1 (pid: 27342)
+  error_file: <N/A>
+  traceback : To enable traceback see: https://pytorch.org/docs/stable/elastic/errors.html
+============================================================

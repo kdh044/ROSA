@@ -1,0 +1,33 @@
+{
+  "status": "PASS",
+  "expected_samples": 3906,
+  "dump_samples": 3906,
+  "checkpoint": "legacy-workspace/external/checkpoints/fisheye_petr.pth",
+  "checkpoint_sha256": "a2334020c5dfc44087269dbcd25bd2d27efa3658390ca71b4fefd835e76f5e3f",
+  "checkpoint_meta": {
+    "epoch": 14,
+    "experiment_name": "fisheye_petr_48_20250219_221639",
+    "dataset_meta": {
+      "classes": [
+        "Car",
+        "Van",
+        "Truck",
+        "Bus",
+        "Pedestrian",
+        "Cyclist"
+      ],
+      "categories": {
+        "Car": 0,
+        "Van": 1,
+        "Truck": 2,
+        "Bus": 3,
+        "Pedestrian": 4,
+        "Cyclist": 5
+      },
+      "dataset": "omni3d",
+      "version": "2hz-0.7-all"
+    }
+  },
+  "official_repo_commit": "a28726ed002a02cb1328960848c0f4f2473748de",
+  "failures": []
+}

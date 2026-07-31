@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosa-fisheye"
+version = "0.1.0"
+description = "Ray-aware multiview refinement for native fisheye 3D detection"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "numpy>=1.24"]
+integration = [
+  "numpy>=1.24",
+  "torchvision>=0.16",
+  "mmcv>=2.0,<2.3",
+  "mmengine>=0.10,<0.11",
+  "mmdet>=3.2,<3.3",
+  "mmdet3d>=1.4,<1.5",
+  "nuscenes-devkit>=1.1.11",
+  "pyquaternion>=0.9.9",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.black]
+target-version = ["py310"]

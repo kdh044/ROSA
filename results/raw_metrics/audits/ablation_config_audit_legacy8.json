@@ -1,0 +1,106 @@
+{
+  "reference_config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_main126_20e.py",
+  "reference_contract": {
+    "dataset_train": "legacy-workspace/Fisheye3DODdataset/ImageSets-main126/fisheye3dod_infos_train.pkl",
+    "dataset_validation": "legacy-workspace/Fisheye3DODdataset/ImageSets-main126/fisheye3dod_infos_val.pkl",
+    "global_batch_size_2gpu": 8,
+    "max_epochs": 20,
+    "validation_interval": 4,
+    "seed": 3407,
+    "backbone_depth": 18,
+    "temporal": false
+  },
+  "controlled_ablations": [
+    {
+      "method": "Radial-Off",
+      "config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_no_radial_update_main126_20e.py",
+      "declared_overrides": {
+        "enable_radial": false
+      },
+      "actual_overrides": {
+        "enable_radial": false
+      },
+      "declared_runtime_overrides": {
+        "find_unused_parameters": true
+      },
+      "actual_runtime_overrides": {
+        "find_unused_parameters": true
+      },
+      "declared_flags_match": true,
+      "all_other_config_equal_to_full": true
+    },
+    {
+      "method": "RFL-Off",
+      "config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_no_rfl_main126_20e.py",
+      "declared_overrides": {
+        "enable_rfl": false
+      },
+      "actual_overrides": {
+        "enable_rfl": false
+      },
+      "declared_runtime_overrides": {},
+      "actual_runtime_overrides": {},
+      "declared_flags_match": true,
+      "all_other_config_equal_to_full": true
+    },
+    {
+      "method": "Geometry-Off",
+      "config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_no_rosa_geometry_main126_20e.py",
+      "declared_overrides": {
+        "enable_rosa_geometry": false
+      },
+      "actual_overrides": {
+        "enable_rosa_geometry": false
+      },
+      "declared_runtime_overrides": {},
+      "actual_runtime_overrides": {},
+      "declared_flags_match": true,
+      "all_other_config_equal_to_full": true
+    },
+    {
+      "method": "Second-Pass-Off",
+      "config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_no_second_pass_main126_20e.py",
+      "declared_overrides": {
+        "num_refinement_steps": 1
+      },
+      "actual_overrides": {
+        "num_refinement_steps": 1
+      },
+      "declared_runtime_overrides": {},
+      "actual_runtime_overrides": {},
+      "declared_flags_match": true,
+      "all_other_config_equal_to_full": true
+    },
+    {
+      "method": "Uniform-Camera",
+      "config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_uniform_camera_main126_20e.py",
+      "declared_overrides": {
+        "uniform_camera_fusion": true
+      },
+      "actual_overrides": {
+        "uniform_camera_fusion": true
+      },
+      "declared_runtime_overrides": {},
+      "actual_runtime_overrides": {},
+      "declared_flags_match": true,
+      "all_other_config_equal_to_full": true
+    },
+    {
+      "method": "RFL+Geometry-Off",
+      "config": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/configs/fisheye3dod_sparse4d_r18_iterative_distribution_rosa_top100_no_rfl_no_geometry_main126_20e.py",
+      "declared_overrides": {
+        "enable_rfl": false,
+        "enable_rosa_geometry": false
+      },
+      "actual_overrides": {
+        "enable_rfl": false,
+        "enable_rosa_geometry": false
+      },
+      "declared_runtime_overrides": {},
+      "actual_runtime_overrides": {},
+      "declared_flags_match": true,
+      "all_other_config_equal_to_full": true
+    }
+  ],
+  "status": "PASS"
+}

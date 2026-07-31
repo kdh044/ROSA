@@ -1,0 +1,5 @@
+visible_camera_count,gt_count,gt_percentage,B0_recall_at_2m,FisheyePETR_recall_at_2m,FisheyeBEVDet_recall_at_2m,Ours_recall_at_2m,Ours_minus_B0
+1,4922,0.218750,0.932141,0.932751,0.886631,0.941690,0.009549
+2,17574,0.781250,0.856834,0.866849,0.741550,0.866394,0.009560
+3,0,0.000000,,,,,
+4,0,0.000000,,,,,

@@ -1,0 +1,116 @@
+{
+  "active_target_records": 40,
+  "auto_selection": {
+    "camera_hits": 52,
+    "class_count": {
+      "car": 21,
+      "truck": 1
+    },
+    "multiview_objects": 16,
+    "score": 60.0,
+    "visible_objects": 22
+  },
+  "box_xml": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_3d_bboxes/train/2013_05_28_drive_0000_sync.xml",
+  "cameras": {
+    "image_00": {
+      "drawn_edge_runs": 55,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0000_sync/image_00/data_rect/0000002113.png",
+      "model": "perspective",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0000_clean_GT_projection_cameras/image_00_0000002113.png",
+      "visible_boxes": 6
+    },
+    "image_01": {
+      "drawn_edge_runs": 53,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0000_sync/image_01/data_rect/0000002113.png",
+      "model": "perspective",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0000_clean_GT_projection_cameras/image_01_0000002113.png",
+      "visible_boxes": 5
+    },
+    "image_02": {
+      "drawn_edge_runs": 60,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0000_sync/image_02/data_rgb/0000002113.png",
+      "model": "fisheye",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0000_clean_GT_projection_cameras/image_02_0000002113.png",
+      "visible_boxes": 5
+    },
+    "image_03": {
+      "drawn_edge_runs": 36,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0000_sync/image_03/data_rgb/0000002113.png",
+      "model": "fisheye",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0000_clean_GT_projection_cameras/image_03_0000002113.png",
+      "visible_boxes": 3
+    }
+  },
+  "dataset_root": "/home/airlab/user/kdh/kitti-360/KITTI-360",
+  "edge_samples": 64,
+  "frame": 2113,
+  "max_distance_m": 30.0,
+  "montage": "/home/airlab/user/kdh/KITTI360_seq0000_clean_GT_projection.png",
+  "object_distance_m": {
+    "car:130:-1:10": 11.269186366158577,
+    "car:131:-1:11": 8.760307051231695,
+    "car:132:-1:12": 7.958521394403733,
+    "car:133:-1:13": 9.74848860282344,
+    "car:134:-1:14": 8.261947626063048,
+    "car:139:-1:19": 13.822727639498693,
+    "car:140:-1:20": 9.889127901359188,
+    "car:141:-1:21": 7.7275008484953815
+  },
+  "object_visibility": {
+    "car:130:-1:10": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "car:131:-1:11": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "car:132:-1:12": [
+      "image_00",
+      "image_02"
+    ],
+    "car:133:-1:13": [
+      "image_02"
+    ],
+    "car:134:-1:14": [
+      "image_02"
+    ],
+    "car:139:-1:19": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:140:-1:20": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:141:-1:21": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ]
+  },
+  "projected_target_records": 8,
+  "projection_contract": {
+    "box_edges": "released KITTI360Bbox3D.lines ordering",
+    "image_00_01": "released rectified perspective calibration",
+    "image_02_03": "released unified MEI fisheye calibration",
+    "world_to_camera": "released poses + calib_cam_to_pose"
+  },
+  "schema": "kitti360-mixed-camera-box-projection/v1",
+  "sequence": "2013_05_28_drive_0000_sync",
+  "target_classes": [
+    "bus",
+    "car",
+    "truck"
+  ],
+  "visibility_histogram": {
+    "1": 2,
+    "2": 1,
+    "3": 5,
+    "4": 0
+  }
+}

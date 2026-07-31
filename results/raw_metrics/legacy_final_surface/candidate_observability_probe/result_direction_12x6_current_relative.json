@@ -1,0 +1,75 @@
+{
+  "uniform_nll": 1.6094379124341003,
+  "train_matched": 939,
+  "val_matched": 308,
+  "train_common": 625,
+  "val_common": 236,
+  "target_mode_histogram": [
+    22,
+    30,
+    110,
+    37,
+    37
+  ],
+  "empirical_prior": {
+    "probability": [
+      0.11771679669618607,
+      0.1230756863951683,
+      0.5019446015357971,
+      0.17201296985149384,
+      0.08524993062019348
+    ],
+    "val_nll": 1.5066068172454834,
+    "val_accuracy": 0.4661017060279846
+  },
+  "true": {
+    "train_nll": 1.184124231338501,
+    "val_nll": 1.3799283504486084,
+    "val_accuracy": 0.4788135588169098,
+    "val_noncurrent_direction_accuracy": 0.1587301641702652,
+    "val_count": 236
+  },
+  "feature_shuffle": {
+    "train_nll": 1.389736294746399,
+    "val_nll": 1.482350468635559,
+    "val_accuracy": 0.4661017060279846,
+    "val_noncurrent_direction_accuracy": 0.0,
+    "val_count": 236
+  },
+  "geometry_only": {
+    "train_nll": 1.218940258026123,
+    "val_nll": 1.357972502708435,
+    "val_accuracy": 0.4661017060279846,
+    "val_noncurrent_direction_accuracy": 0.0,
+    "val_count": 236
+  },
+  "direction": {
+    "chance_bce": 0.6931471805599453,
+    "true": {
+      "train_balanced_bce": 0.42099836468696594,
+      "val_balanced_bce": 0.5772480964660645,
+      "val_balanced_accuracy": 0.7437630295753479,
+      "val_near_count": 52,
+      "val_far_count": 74
+    },
+    "feature_shuffle": {
+      "train_balanced_bce": 0.6194740533828735,
+      "val_balanced_bce": 0.7050797939300537,
+      "val_balanced_accuracy": 0.48856550455093384,
+      "val_near_count": 52,
+      "val_far_count": 74
+    },
+    "geometry_only": {
+      "train_balanced_bce": 0.6942077875137329,
+      "val_balanced_bce": 0.6964322924613953,
+      "val_balanced_accuracy": 0.4784303605556488,
+      "val_near_count": 52,
+      "val_far_count": 74
+    }
+  },
+  "true_minus_controls": {
+    "uniform_nll_gap": 0.22950956198549188,
+    "shuffle_nll_gap": 0.10242211818695068,
+    "geometry_nll_gap": -0.02195584774017334
+  }
+}

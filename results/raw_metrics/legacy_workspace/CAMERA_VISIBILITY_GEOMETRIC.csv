@@ -1,0 +1,9 @@
+dataset,projectable_camera_count,gt_count,gt_ratio,criterion,occlusion_aware,status
+Fisheye3DOD,1,3317,0.147448435,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+Fisheye3DOD,2,18860,0.838371266,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+Fisheye3DOD,3,319,0.014180299,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+Fisheye3DOD,4,0,0.000000000,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+RealWorld,1,0,0.000000000,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+RealWorld,2,1559,0.497923986,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+RealWorld,3,1571,0.501756627,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only
+RealWorld,4,1,0.000319387,at_least_one_valid_3d_box_corner,false,confirmed_geometric_only

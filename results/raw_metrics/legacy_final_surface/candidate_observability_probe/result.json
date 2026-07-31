@@ -1,0 +1,37 @@
+{
+  "uniform_nll": 1.6094379124341003,
+  "train_matched": 743,
+  "val_matched": 196,
+  "train_common": 487,
+  "val_common": 137,
+  "target_mode_histogram": [
+    15,
+    17,
+    63,
+    24,
+    18
+  ],
+  "true": {
+    "train_nll": 1.214030146598816,
+    "val_nll": 1.4215552806854248,
+    "val_accuracy": 0.45985400676727295,
+    "val_count": 137
+  },
+  "feature_shuffle": {
+    "train_nll": 1.365311622619629,
+    "val_nll": 1.4666458368301392,
+    "val_accuracy": 0.45985400676727295,
+    "val_count": 137
+  },
+  "geometry_only": {
+    "train_nll": 1.1827510595321655,
+    "val_nll": 1.325303554534912,
+    "val_accuracy": 0.45985400676727295,
+    "val_count": 137
+  },
+  "true_minus_controls": {
+    "uniform_nll_gap": 0.18788263174867548,
+    "shuffle_nll_gap": 0.045090556144714355,
+    "geometry_nll_gap": -0.0962517261505127
+  }
+}

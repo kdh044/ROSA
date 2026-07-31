@@ -1,0 +1,16 @@
+{
+  "config": "../../configs/expanded/b0.py",
+  "checkpoint": "../../checkpoints/MANIFEST.csv#B0-best",
+  "warmup_iterations": 20,
+  "measured_iterations": 100,
+  "samples": 400,
+  "mean_batch_size": 4.0,
+  "mean_iteration_ms": 72.21057968985406,
+  "median_iteration_ms": 71.95307750953361,
+  "p95_iteration_ms": 77.17616856098175,
+  "mean_latency_per_sample_ms": 18.052644922463514,
+  "samples_per_second": 55.39354506195745,
+  "peak_cuda_memory_mib": 2733.53515625,
+  "parameter_count": 29667109,
+  "trainable_parameter_count": 29590180
+}

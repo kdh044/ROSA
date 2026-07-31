@@ -1,0 +1,6 @@
+method,backbone,temporal,mAP,FDS,mATE,mASE,mAOE,validation_frames
+FisheyePETR,R18,official,0.3883,0.4842,0.7110,0.1413,0.4075,3906
+FisheyeBEVDet,R18,official,0.3987,0.5000,0.5821,0.1616,0.4523,3906
+Sparse4D B0,R18,false,0.5145,0.5936,0.5090,0.1003,0.3725,3906
+Full (Ours),R18,false,0.5256,0.6029,0.4860,0.0979,0.3753,3906
+DAPETR,VoVNet-99,false,0.4396,0.5047,0.7319,0.1598,0.3987,3906

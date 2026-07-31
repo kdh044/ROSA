@@ -1,0 +1,27 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Local datasets and experiment products
+/data/
+/datasets/
+/external/
+/work_dirs/
+/outputs/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.pkl
+*.tiff
+*.tif
+
+# Editors and operating systems
+.idea/
+.vscode/
+.DS_Store

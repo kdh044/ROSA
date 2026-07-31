@@ -1,0 +1,71 @@
+section,method_or_condition,epoch,n,metric,value,ci_low,ci_high,notes
+official_main126,FisheyePETR,,,mAP,0.3883,,,official checkpoint same evaluator
+official_main126,FisheyePETR,,,NDS,0.4842,,,official checkpoint same evaluator
+official_main126,FisheyePETR,,,mATE,0.7110,,,lower is better
+official_main126,FisheyePETR,,,mASE,0.1413,,,lower is better
+official_main126,FisheyePETR,,,mAOE,0.4075,,,lower is better
+official_main126,FisheyeBEVDet,,,mAP,0.3987,,,official checkpoint same evaluator
+official_main126,FisheyeBEVDet,,,NDS,0.5000,,,official checkpoint same evaluator
+official_main126,FisheyeBEVDet,,,mATE,0.5821,,,lower is better
+official_main126,FisheyeBEVDet,,,mASE,0.1616,,,lower is better
+official_main126,FisheyeBEVDet,,,mAOE,0.4523,,,lower is better
+main_fixed20,B0,20,,mAP,0.5145,,,same 20-epoch budget
+main_fixed20,B0,20,,NDS,0.5936,,,same 20-epoch budget
+main_fixed20,B0,20,,mATE,0.5090,,,lower is better
+main_fixed20,B0,20,,mASE,0.1003,,,lower is better
+main_fixed20,B0,20,,mAOE,0.3725,,,lower is better
+main_fixed20,Full,20,,mAP,0.5256,,,same 20-epoch budget
+main_fixed20,Full,20,,NDS,0.6029,,,same 20-epoch budget
+main_fixed20,Full,20,,mATE,0.4860,,,lower is better
+main_fixed20,Full,20,,mASE,0.0979,,,lower is better
+main_fixed20,Full,20,,mAOE,0.3753,,,lower is better
+main_delta,Full-B0,20,,mAP,0.0111,,,higher is better
+main_delta,Full-B0,20,,NDS,0.0093,,,higher is better
+main_delta,Full-B0,20,,mATE,-0.0230,,,negative is better
+main_delta,Full-B0,20,,mASE,-0.0024,,,negative is better
+main_delta,Full-B0,20,,mAOE,0.0028,,,positive is worse
+best_nds,B0,20,,mAP,0.5145,,,checkpoint selected by NDS
+best_nds,B0,20,,NDS,0.5936,,,checkpoint selected by NDS
+best_nds,Full,16,,mAP,0.5291,,,checkpoint selected by NDS
+best_nds,Full,16,,NDS,0.6035,,,checkpoint selected by NDS
+ablation_fixed20,Radial-Off,20,,mAP,0.5186,,,controlled ablation
+ablation_fixed20,RFL-Off,20,,mAP,0.5212,,,controlled ablation
+ablation_fixed20,Geometry-Off,20,,mAP,0.5193,,,controlled ablation
+ablation_fixed20,Second-Pass-Off,20,,mAP,0.5176,,,controlled ablation
+ablation_fixed20,Uniform-Camera,20,,mAP,0.5187,,,controlled ablation
+ablation_fixed20,RFL+Geometry-Off,20,,mAP,0.5137,,,controlled interaction
+matching,overall,,22496,Recall@2m_delta,0.0096,0.0039,0.0153,scene-cluster bootstrap
+matching,overall,,22496,recovered_count,1073,,,B0 FN to Full TP
+matching,overall,,22496,lost_count,858,,,B0 TP to Full FN
+condition,short_axis_[0_8),,2438,Recall@2m_delta,0.0250,0.0053,0.0467,small projected support
+condition,Pedestrian,,3692,Recall@2m_delta,0.0217,0.0085,0.0359,class breakdown
+condition,anisotropy_gap_[0.4_inf),,1692,Recall@2m_delta,0.0183,0.0006,0.0351,cross-camera quality gap
+condition,distance_[20_30),,5257,Recall@2m_delta,0.0173,0.0060,0.0291,mid range
+condition,boundary_gap_[0.75_1.01),,921,Recall@2m_delta,0.0228,-0.0023,0.0483,CI includes zero
+condition,Cyclist,,2711,Recall@2m_delta,-0.0192,-0.0326,-0.0070,current limitation
+trajectory,B0,,19606,mean_center_error_m,0.6867,,,same matched predictions
+trajectory,B1,,19606,mean_center_error_m,0.6826,,,same matched predictions
+trajectory,B2,,19606,mean_center_error_m,0.6814,,,same matched predictions
+trajectory,B0,,19606,median_center_error_m,0.5387,,,same matched predictions
+trajectory,B1,,19606,median_center_error_m,0.5355,,,same matched predictions
+trajectory,B2,,19606,median_center_error_m,0.5348,,,same matched predictions
+paired_error,Full-B0,,18788,center_error_m,-0.0099,-0.0181,-0.0012,common TP negative is better
+attention,valid_fraction_pass1,,2167,spearman,0.8078,,,matched queries
+attention,valid_fraction_pass2,,2171,spearman,0.8082,,,matched queries
+attention,boundary_quality_pass1,,16153,spearman,0.3695,,,matched queries
+attention,boundary_quality_pass2,,16155,spearman,0.3708,,,matched queries
+attention,anisotropy_quality_pass1,,16153,spearman,0.3720,,,matched queries
+attention,anisotropy_quality_pass2,,16155,spearman,0.3734,,,matched queries
+runtime,B0,,,latency_ms_per_sample,18.0526,,,RTX PRO 6000 batch 4
+runtime,Full,,,latency_ms_per_sample,27.6290,,,RTX PRO 6000 batch 4
+runtime,B0,,,samples_per_second,55.3935,,,RTX PRO 6000 batch 4
+runtime,Full,,,samples_per_second,36.1939,,,RTX PRO 6000 batch 4
+runtime,B0,,,peak_vram_mib,2733.5,,,RTX PRO 6000 batch 4
+runtime,Full,,,peak_vram_mib,2737.4,,,RTX PRO 6000 batch 4
+runtime,B0,,,parameters_million,29.67,,,train/eval model
+runtime,Full,,,parameters_million,30.46,,,train/eval model
+dapetr_v99_main126_best_nds,DAPETR,16,,mAP,0.4396,,,VoVNet-99; best checkpoint selected by NDS/FDS
+dapetr_v99_main126_best_nds,DAPETR,16,,NDS,0.5047,,,VoVNet-99; best checkpoint selected by NDS/FDS
+dapetr_v99_main126_best_nds,DAPETR,16,,mATE,0.7319,,,VoVNet-99; best checkpoint selected by NDS/FDS
+dapetr_v99_main126_best_nds,DAPETR,16,,mASE,0.1598,,,VoVNet-99; best checkpoint selected by NDS/FDS
+dapetr_v99_main126_best_nds,DAPETR,16,,mAOE,0.3987,,,VoVNet-99; best checkpoint selected by NDS/FDS

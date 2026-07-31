@@ -1,0 +1,101 @@
+{
+  "mode": "checkpoint",
+  "checkpoint": "/home/airlab/user/kdh/final_surface_rosa_rfl_20260726/work_dirs/current_relative_offset_canary_3e/epoch_2.pth",
+  "split": "val",
+  "requested_scenes": 2,
+  "frames_per_scene": 120,
+  "frames_evaluated": 240,
+  "inference_contract": {
+    "model_training": false,
+    "grid_mask": false,
+    "model_forward_received_gt": false,
+    "gt_use": "post_forward_hungarian_matching_and_labels_only",
+    "checkpoint_logits": true,
+    "checkpoint_load_strict": true,
+    "probe_readout_trained": false,
+    "cyclic_shuffle": "checkpoint_builtin_query_axis_camera_stagger",
+    "comparison_support": "exact_true_and_cyclic_shuffle_validity_intersection"
+  },
+  "selection": {
+    "all_queries": 72000,
+    "hungarian_matched": 1467,
+    "supported_matched": 1284,
+    "common_valid_matched": 539,
+    "common_valid_noncurrent": 235,
+    "near_count": 122,
+    "far_count": 113,
+    "target_mode_histogram_on_common": [
+      38,
+      84,
+      304,
+      83,
+      30
+    ],
+    "noncurrent_definition": "posthoc_bracketing_target_argmax_not_CURRENT"
+  },
+  "direction": {
+    "definition": "logsumexp(FAR_1,FAR_2)-logsumexp(NEAR_2,NEAR_1)",
+    "chance_balanced_bce": 0.6931471805599453,
+    "chance_balanced_accuracy": 0.5,
+    "true": {
+      "balanced_accuracy": 0.420063853263855,
+      "balanced_bce": 0.7097874879837036,
+      "near_accuracy": 0.2295081913471222,
+      "far_accuracy": 0.6106194853782654,
+      "near_bce": 0.75112384557724,
+      "far_bce": 0.6684510707855225,
+      "near_count": 122,
+      "far_count": 113,
+      "direction_logit_mean": 0.08330691605806351,
+      "direction_logit_std": 0.225916787981987
+    },
+    "cyclic_shuffle": {
+      "balanced_accuracy": 0.48810386657714844,
+      "balanced_bce": 0.6969144344329834,
+      "near_accuracy": 0.4098360538482666,
+      "far_accuracy": 0.5663716793060303,
+      "near_bce": 0.7136942744255066,
+      "far_bce": 0.6801345348358154,
+      "near_count": 122,
+      "far_count": 113,
+      "direction_logit_mean": 0.032980695366859436,
+      "direction_logit_std": 0.24400965869426727
+    },
+    "true_minus_control": {
+      "balanced_accuracy": -0.06804001331329346,
+      "balanced_bce_improvement": -0.012873053550720215
+    }
+  },
+  "mean_offset": {
+    "definition": "sum(softmax(checkpoint_logits)*radial_log_offsets)",
+    "target": "log(gt_xy_range/native_query_xy_range)",
+    "true": {
+      "balanced_sign_accuracy": 0.44628608226776123,
+      "near_sign_accuracy": 0.23770491778850555,
+      "far_sign_accuracy": 0.6548672318458557,
+      "pearson_correlation_with_target": 0.03488210236267354,
+      "mean_absolute_error": 0.1090717539191246,
+      "predicted_mean": 0.002028142334893346,
+      "predicted_std": 0.0065636588260531425,
+      "target_mean": -0.005016339011490345,
+      "target_std": 0.15036875009536743,
+      "zero_prediction_count": 0
+    },
+    "cyclic_shuffle": {
+      "balanced_sign_accuracy": 0.48810386657714844,
+      "near_sign_accuracy": 0.4098360538482666,
+      "far_sign_accuracy": 0.5663716793060303,
+      "pearson_correlation_with_target": 0.016258271819833914,
+      "mean_absolute_error": 0.10893166810274124,
+      "predicted_mean": 0.0006613192381337285,
+      "predicted_std": 0.008778027258813381,
+      "target_mean": -0.005016339011490345,
+      "target_std": 0.15036875009536743,
+      "zero_prediction_count": 0
+    },
+    "true_minus_control": {
+      "balanced_sign_accuracy": -0.04181778430938721,
+      "pearson_correlation": 0.01862383054283963
+    }
+  }
+}

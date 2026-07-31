@@ -1,0 +1,5 @@
+visible_camera_count,gt_count,gt_percentage,visibility_definition
+1,3317,0.147448435,at_least_one_valid_3d_box_corner
+2,18860,0.838371266,at_least_one_valid_3d_box_corner
+3,319,0.014180299,at_least_one_valid_3d_box_corner
+4,0,0.000000000,at_least_one_valid_3d_box_corner

@@ -1,0 +1,16 @@
+{
+  "config": "../../configs/expanded/full.py",
+  "checkpoint": "../../checkpoints/MANIFEST.csv#Full-best",
+  "warmup_iterations": 20,
+  "measured_iterations": 100,
+  "samples": 400,
+  "mean_batch_size": 4.0,
+  "mean_iteration_ms": 110.51599479062133,
+  "median_iteration_ms": 109.76059650420211,
+  "p95_iteration_ms": 114.6998479962349,
+  "mean_latency_per_sample_ms": 27.628998697655334,
+  "samples_per_second": 36.19385598960785,
+  "peak_cuda_memory_mib": 2737.3544921875,
+  "parameter_count": 30455756,
+  "trainable_parameter_count": 30378827
+}

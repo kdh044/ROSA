@@ -1,0 +1,54 @@
+{
+  "schema": "canonical-surface-ocam-adapter/v1",
+  "status": "CPU_TESTED_SURFACE_PROJECTION_READY",
+  "projection_type": "ocam_fisheye",
+  "camera_coordinates": {
+    "official_fisheye3dod": "x=right,y=down,z=forward",
+    "sparse_runtime": "X=down,Y=right,Z=back",
+    "surface_points": "lidar/ego frame"
+  },
+  "required_runtime_metadata": {
+    "lidar2cam": "[B,C,4,4], official transform converted to sparse OCam basis",
+    "ocam_intrinsic": "[B,C,3,3], converted affine matrix",
+    "ocam_pol": "[B,C,K], inverse polynomial for 3D-to-pixel projection",
+    "image_wh": "[B,C,2], width then height",
+    "ocam_lens_fov_deg": "scalar, [B], [C], or [B,C]"
+  },
+  "canonical_inputs": {
+    "points_lidar": "[B,N,S,P,3]",
+    "tangent_s_lidar": "[B,N,S,3]",
+    "tangent_t_lidar": "[B,N,S,3]",
+    "external_valid": "optional bool [B,N,C,S,P] carrying first-hit and lens-mask decisions"
+  },
+  "canonical_outputs": {
+    "normalized_uv": "[B,N,C,S,P,2]",
+    "pixels": "[B,N,C,S,P,2]",
+    "projection_valid": "[B,N,C,S,P]",
+    "xyz_jacobian": "[B,N,C,S,P,2,3]",
+    "surface_jacobian": "[B,N,C,S,P,2,2]",
+    "singular_values": "[B,N,C,S,P,2], descending",
+    "projected_cell_area_pixels": "[B,N,C,S]",
+    "footprint_geometry": "[B,N,C,S,6]"
+  },
+  "footprint_geometry_layout": [
+    "mean_log_sigma_max",
+    "mean_log_sigma_min",
+    "mean_log_area_scale",
+    "mean_log_anisotropy",
+    "visible_ratio",
+    "mean_boundary_support"
+  ],
+  "intentionally_external_to_adapter": [
+    "cuboid chart construction",
+    "first-hit self-visibility",
+    "external-object occlusion",
+    "fisheye valid-mask sampling",
+    "object-relative ray rotation",
+    "face-incidence computation",
+    "feature-map sampling and ROSA fusion"
+  ],
+  "missing_for_future_pixel_to_ray_center_branch": [
+    "the current official dataset runtime packs only ocam_pol; also pack ocam_direct_pol before arbitrary pixel-to-ray inversion"
+  ],
+  "data_gate": "official 144-scene extraction and runtime batch are not available; no real-data/GPU integration has been claimed"
+}

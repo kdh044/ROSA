@@ -1,0 +1,18 @@
+{
+  "status": "PASS",
+  "analysis_root": "legacy-workspace/fisheye3dod_sparse4d_r50_official_20260726/work_dirs/fisheye_failure_analysis",
+  "checks": {
+    "eight_methods_all_validation_epochs": "PASS",
+    "rfl_geometry_2x2_interaction": "PASS",
+    "condition_and_paired_failure_analysis": "PASS",
+    "two_pass_and_attention_diagnostics": "PASS",
+    "paper_plots": "PASS",
+    "prediction_dumps_and_runtime": "PASS",
+    "configuration_and_written_summary": "PASS"
+  },
+  "method_count": 8,
+  "evaluation_gt_count": 22496,
+  "trajectory_rows": 19606,
+  "attention_rows": 24,
+  "plot_count": 11
+}

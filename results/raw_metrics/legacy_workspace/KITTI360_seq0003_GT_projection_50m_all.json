@@ -1,0 +1,203 @@
+{
+  "active_target_records": 31,
+  "auto_selection": null,
+  "box_xml": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_3d_bboxes/train/2013_05_28_drive_0003_sync.xml",
+  "cameras": {
+    "image_00": {
+      "drawn_edge_runs": 228,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0003_sync/image_00/data_rect/0000000751.png",
+      "model": "perspective",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0003_GT_projection_50m_all_cameras/image_00_0000000751.png",
+      "visible_boxes": 19
+    },
+    "image_01": {
+      "drawn_edge_runs": 228,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0003_sync/image_01/data_rect/0000000751.png",
+      "model": "perspective",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0003_GT_projection_50m_all_cameras/image_01_0000000751.png",
+      "visible_boxes": 19
+    },
+    "image_02": {
+      "drawn_edge_runs": 120,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0003_sync/image_02/data_rgb/0000000751.png",
+      "model": "fisheye",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0003_GT_projection_50m_all_cameras/image_02_0000000751.png",
+      "visible_boxes": 10
+    },
+    "image_03": {
+      "drawn_edge_runs": 164,
+      "image": "/home/airlab/user/kdh/kitti-360/KITTI-360/data_2d_raw/2013_05_28_drive_0003_sync/image_03/data_rgb/0000000751.png",
+      "model": "fisheye",
+      "render": "/home/airlab/user/kdh/KITTI360_seq0003_GT_projection_50m_all_cameras/image_03_0000000751.png",
+      "visible_boxes": 14
+    }
+  },
+  "dataset_root": "/home/airlab/user/kdh/kitti-360/KITTI-360",
+  "edge_samples": 64,
+  "frame": 751,
+  "max_distance_m": 50.0,
+  "montage": "/home/airlab/user/kdh/KITTI360_seq0003_GT_projection_50m_all.png",
+  "object_distance_m": {
+    "car:39:751:24": 9.891638305157672,
+    "car:40:751:25": 12.568970977013109,
+    "car:41:751:26": 24.113705620385137,
+    "car:42:751:27": 17.957211207868628,
+    "car:43:751:28": 33.333268370025515,
+    "car:44:751:29": 35.671001805181,
+    "car:45:751:30": 42.53981943973646,
+    "car:6:-1:0": 44.34360168069683,
+    "car:7:-1:2": 45.17202201884102,
+    "trafficSign:33:-1:3": 27.670603583146413,
+    "trafficSign:35:-1:5": 45.60382828894886,
+    "trafficSign:36:-1:6": 47.16677359733089,
+    "trafficSign:40:-1:10": 20.14448143507899,
+    "trafficSign:41:-1:11": 40.05566437710039,
+    "trafficSign:43:-1:13": 33.98717383086974,
+    "trafficSign:44:-1:14": 30.555830657562193,
+    "trafficSign:45:-1:15": 29.861399672123785,
+    "trafficSign:46:-1:16": 18.67945563302355,
+    "trafficSign:47:-1:17": 8.768655277917883,
+    "trafficSign:48:-1:18": 13.38878533948896,
+    "trafficSign:49:-1:19": 20.508089073044374,
+    "truck:1:-1:1": 41.765119335108764,
+    "truck:2:-1:20": 47.9356877155053,
+    "truck:3:751:23": 13.360282151788805
+  },
+  "object_visibility": {
+    "car:39:751:24": [
+      "image_03"
+    ],
+    "car:40:751:25": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:41:751:26": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:42:751:27": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:43:751:28": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:44:751:29": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:45:751:30": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "car:6:-1:0": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "car:7:-1:2": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "trafficSign:33:-1:3": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "trafficSign:35:-1:5": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "trafficSign:36:-1:6": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "trafficSign:40:-1:10": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "trafficSign:41:-1:11": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "trafficSign:43:-1:13": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "trafficSign:44:-1:14": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "trafficSign:45:-1:15": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "trafficSign:46:-1:16": [
+      "image_02"
+    ],
+    "trafficSign:47:-1:17": [
+      "image_02"
+    ],
+    "trafficSign:48:-1:18": [
+      "image_02"
+    ],
+    "trafficSign:49:-1:19": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "truck:1:-1:1": [
+      "image_00",
+      "image_01",
+      "image_02"
+    ],
+    "truck:2:-1:20": [
+      "image_00",
+      "image_01",
+      "image_03"
+    ],
+    "truck:3:751:23": [
+      "image_03"
+    ]
+  },
+  "projected_target_records": 24,
+  "projection_contract": {
+    "box_edges": "released KITTI360Bbox3D.lines ordering",
+    "image_00_01": "released rectified perspective calibration",
+    "image_02_03": "released unified MEI fisheye calibration",
+    "world_to_camera": "released poses + calib_cam_to_pose"
+  },
+  "schema": "kitti360-mixed-camera-box-projection/v1",
+  "sequence": "2013_05_28_drive_0003_sync",
+  "target_classes": [
+    "bicycle",
+    "bus",
+    "car",
+    "motorcycle",
+    "pedestrian",
+    "trafficSign",
+    "trailer",
+    "truck"
+  ],
+  "visibility_histogram": {
+    "1": 5,
+    "2": 0,
+    "3": 19,
+    "4": 0
+  }
+}

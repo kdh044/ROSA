@@ -1,0 +1,126 @@
+/usr/local/lib/python3.10/dist-packages/matplotlib/projections/__init__.py:63: UserWarning: Unable to import Axes3D. This may be due to multiple versions of Matplotlib being installed (e.g. as a system package and as a pip package). As a result, the 3D projection is not available.
+  warnings.warn("Unable to import Axes3D. This may be due to multiple versions of "
+07/27 01:40:10 - mmengine - INFO - ------------------------------
+07/27 01:40:10 - mmengine - INFO - The length of test dataset: 442
+07/27 01:40:10 - mmengine - INFO - The number of instances per category in the dataset:
++------------+--------+
+| category   | number |
++------------+--------+
+| Car        | 1935   |
+| Pedestrian | 997    |
+| Cyclist    | 199    |
++------------+--------+
+/usr/local/lib/python3.10/dist-packages/mmengine/runner/checkpoint.py:347: UserWarning: Environment variable TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD detected, since the`weights_only` argument was not explicitly passed to `torch.load`, forcing weights_only=False.
+  checkpoint = torch.load(filename, map_location=map_location)
+Loads checkpoint by local backend from path: /home/airlab/user/kdh/final_surface_rosa_rfl_20260726/work_dirs/direction_first_canary_3e/epoch_1.pth
+07/27 01:40:11 - mmengine - INFO - ------------------------------
+07/27 01:40:11 - mmengine - INFO - The length of test dataset: 240
+07/27 01:40:11 - mmengine - INFO - The number of instances per category in the dataset:
++------------+--------+
+| category   | number |
++------------+--------+
+| Car        | 1935   |
+| Pedestrian | 997    |
+| Cyclist    | 199    |
++------------+--------+
+{
+  "mode": "checkpoint",
+  "checkpoint": "/home/airlab/user/kdh/final_surface_rosa_rfl_20260726/work_dirs/direction_first_canary_3e/epoch_1.pth",
+  "split": "val",
+  "requested_scenes": 2,
+  "frames_per_scene": 120,
+  "frames_evaluated": 240,
+  "inference_contract": {
+    "model_training": false,
+    "grid_mask": false,
+    "model_forward_received_gt": false,
+    "gt_use": "post_forward_hungarian_matching_and_labels_only",
+    "checkpoint_logits": true,
+    "checkpoint_load_strict": true,
+    "probe_readout_trained": false,
+    "cyclic_shuffle": "checkpoint_builtin_query_axis_camera_stagger",
+    "comparison_support": "exact_true_and_cyclic_shuffle_validity_intersection"
+  },
+  "selection": {
+    "all_queries": 72000,
+    "hungarian_matched": 1467,
+    "supported_matched": 1284,
+    "common_valid_matched": 531,
+    "common_valid_noncurrent": 176,
+    "near_count": 84,
+    "far_count": 92,
+    "target_mode_histogram_on_common": [
+      29,
+      55,
+      355,
+      64,
+      28
+    ],
+    "noncurrent_definition": "posthoc_bracketing_target_argmax_not_CURRENT"
+  },
+  "direction": {
+    "definition": "logsumexp(FAR_1,FAR_2)-logsumexp(NEAR_2,NEAR_1)",
+    "chance_balanced_bce": 0.6931471805599453,
+    "chance_balanced_accuracy": 0.5,
+    "true": {
+      "balanced_accuracy": 0.489130437374115,
+      "balanced_bce": 0.6938774585723877,
+      "near_accuracy": 0.5,
+      "far_accuracy": 0.47826087474823,
+      "near_bce": 0.6936702728271484,
+      "far_bce": 0.694084644317627,
+      "near_count": 84,
+      "far_count": 92,
+      "direction_logit_mean": -0.00048601729213260114,
+      "direction_logit_std": 0.01954633928835392
+    },
+    "cyclic_shuffle": {
+      "balanced_accuracy": 0.4860248565673828,
+      "balanced_bce": 0.6931494474411011,
+      "near_accuracy": 0.4285714328289032,
+      "far_accuracy": 0.54347825050354,
+      "near_bce": 0.6943414211273193,
+      "far_bce": 0.691957414150238,
+      "near_count": 84,
+      "far_count": 92,
+      "direction_logit_mean": 0.002388194901868701,
+      "direction_logit_std": 0.017368795350193977
+    },
+    "true_minus_control": {
+      "balanced_accuracy": 0.0031055808067321777,
+      "balanced_bce_improvement": -0.0007280111312866211
+    }
+  },
+  "mean_offset": {
+    "definition": "sum(softmax(checkpoint_logits)*radial_log_offsets)",
+    "target": "log(gt_xy_range/native_query_xy_range)",
+    "true": {
+      "balanced_sign_accuracy": 0.4886128306388855,
+      "near_sign_accuracy": 0.488095223903656,
+      "far_sign_accuracy": 0.489130437374115,
+      "pearson_correlation_with_target": -0.10152064673490374,
+      "mean_absolute_error": 0.11173209547996521,
+      "predicted_mean": -9.719007357489318e-05,
+      "predicted_std": 0.0009986934019252658,
+      "target_mean": -0.004324786830693483,
+      "target_std": 0.1570587307214737,
+      "zero_prediction_count": 0
+    },
+    "cyclic_shuffle": {
+      "balanced_sign_accuracy": 0.4692028760910034,
+      "near_sign_accuracy": 0.4166666567325592,
+      "far_sign_accuracy": 0.52173912525177,
+      "pearson_correlation_with_target": -0.03748378260638825,
+      "mean_absolute_error": 0.11165392398834229,
+      "predicted_mean": 0.00010301952715963125,
+      "predicted_std": 0.0009010735666379333,
+      "target_mean": -0.004324786830693483,
+      "target_std": 0.1570587307214737,
+      "zero_prediction_count": 0
+    },
+    "true_minus_control": {
+      "balanced_sign_accuracy": 0.01940995454788208,
+      "pearson_correlation": -0.06403686412851549
+    }
+  }
+}

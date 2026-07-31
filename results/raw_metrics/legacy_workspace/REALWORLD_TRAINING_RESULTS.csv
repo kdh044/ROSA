@@ -1,0 +1,4 @@
+dataset,method,backbone,protocol,epoch,mAP,NDS,mATE,mASE,mAOE,AP_car,AP_pedestrian,AP_cyclist,status,checked_kst,notes
+RealWorld,FisheyePETR,ResNet-50,geometry-fixed 20e,4,0.0006,0.0829,1.1756,0.5607,0.9435,0.0016,0.0000,0.0000,interim,2026-07-29 18:09,"Training currently in epoch 7; early validation only, not a final comparison"
+RealWorld,FisheyeBEVDet,ResNet-50,geometry-fixed 20e,4,0.1337,0.1513,0.9620,0.5312,1.1897,0.3236,0.0775,0.0000,interim,2026-07-29 18:09,"Best validation so far"
+RealWorld,FisheyeBEVDet,ResNet-50,geometry-fixed 20e,8,0.1283,0.1484,0.9518,0.5430,1.2373,0.3117,0.0732,0.0000,interim,2026-07-29 18:09,"Training currently finishing epoch 11; below epoch-4 best"

@@ -1,0 +1,8 @@
+model,prediction_dump_available,common_3906_frames,training_protocol_status,use_now,required_note_or_work
+BEVDet,no,no,not prepared,no,train and infer on Main126 then map coordinates and classes
+PETR,no,no,not prepared,no,define native-fisheye input and train/infer on Main126
+FisheyeBEVDet,no,no,not prepared,no,obtain official implementation/checkpoint and create common-frame dump
+FisheyePETR,yes,yes,common official evaluation setting,yes,same frames and evaluator coordinates
+Sparse4D B0,yes,yes,Main126 R18 20 epochs seed3407,yes,baseline
+Full Ours,yes,yes,Main126 R18 20 epochs seed3407,yes,proposed
+Ground truth,yes,yes,same validation annotations,yes,reference
