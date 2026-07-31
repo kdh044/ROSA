@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor, nn
+import torch.nn.functional as F
 
 
 class DeterministicBilinearSampler(nn.Module):
@@ -62,4 +63,59 @@ class DeterministicBilinearSampler(nn.Module):
         return sampled.permute(0, 3, 1, 4, 5, 2).contiguous()
 
 
-__all__ = ["DeterministicBilinearSampler"]
+class FusedBilinearSampler(nn.Module):
+    """Sample all points with one optimized grid-sampling call per FPN level."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fallback = DeterministicBilinearSampler()
+
+    def forward(self, feature: Tensor, uv: Tensor) -> Tensor:
+        if feature.ndim != 5:
+            raise ValueError("feature must be [B,C,D,H,W]")
+        batch, cameras, channels, height, width = feature.shape
+        if (
+            uv.ndim != 6
+            or uv.shape[0] != batch
+            or uv.shape[2] != cameras
+            or uv.shape[-1] != 2
+        ):
+            raise ValueError("uv must be [B,N,C,S,P,2]")
+        if (
+            feature.dtype != uv.dtype
+            or feature.requires_grad
+            or uv.requires_grad
+        ):
+            return self.fallback(feature, uv)
+
+        queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
+        grid = (
+            torch.nan_to_num(
+                uv.permute(0, 2, 1, 3, 4, 5),
+                nan=-2.0,
+                posinf=-2.0,
+                neginf=-2.0,
+            )
+            .reshape(batch * cameras, queries * samples * patch, 1, 2)
+            .mul(2.0)
+            .sub(1.0)
+        )
+        sampled = F.grid_sample(
+            feature.reshape(batch * cameras, channels, height, width),
+            grid,
+            mode="bilinear",
+            padding_mode="zeros",
+            align_corners=False,
+        )
+        sampled = sampled.reshape(
+            batch,
+            cameras,
+            channels,
+            queries,
+            samples,
+            patch,
+        )
+        return sampled.permute(0, 3, 1, 4, 5, 2).contiguous()
+
+
+__all__ = ["DeterministicBilinearSampler", "FusedBilinearSampler"]

@@ -1,12 +1,12 @@
 """Released top-100 ROSA R18 configuration for Fisheye3DOD Main126."""
 
-from pathlib import Path
 import os
+import pathlib
 import sys
 
-_project_root = Path("{{ fileDirname }}").resolve().parent
+_project_root = pathlib.Path("{{ fileDirname }}").resolve().parent
 _src_root = _project_root / "src"
-_detector_host_root = Path(
+_detector_host_root = pathlib.Path(
     os.environ.get(
         "ROSA_DETECTOR_HOST_ROOT",
         os.environ.get(
@@ -25,24 +25,24 @@ os.environ.setdefault(
 )
 
 data_root = str(
-    Path(
+    pathlib.Path(
         os.environ.get(
             "FISHEYE3DOD_DATA_ROOT",
             _project_root.parent / "datasets" / "Fisheye3DODdataset",
         )
     ).resolve()
 )
-ann_root = Path(
+ann_root = pathlib.Path(
     os.environ.get(
         "FISHEYE3DOD_ANN_ROOT",
-        Path(data_root) / "ImageSets-main126",
+        pathlib.Path(data_root) / "ImageSets-main126",
     )
 ).resolve()
-anchor_root = Path(
+anchor_root = pathlib.Path(
     os.environ.get("FISHEYE3DOD_ANCHOR_ROOT", _project_root / "assets")
 ).resolve()
 anchor_file = str(
-    Path(
+    pathlib.Path(
         os.environ.get(
             "FISHEYE3DOD_ANCHOR",
             anchor_root / "fisheye3dod_main126_train_kmeans300_seed3407.npy",
@@ -133,51 +133,9 @@ model = dict(
     ),
     head=dict(
         type="ROSARefinementHead",
-        rosa_cfg=dict(
-            embed_dims=embed_dims,
-            hidden_dims=128,
-            num_keypoints=13,
-            num_cameras=4,
-            num_levels=num_levels,
-            refine_topk=100,
-            num_refinement_steps=2,
-            initial_log_range_std=0.05,
-            min_log_range_std=0.01,
-            max_log_range_std=0.50,
-            min_candidate_range_m=0.50,
-            max_candidate_range_m=48.0,
-            radial_step_m=0.50,
-            max_log_size_delta=0.20,
-            max_yaw_delta_rad=0.25,
-            max_tangent_delta_m=0.75,
-            max_second_log_size_delta=0.05,
-            max_second_yaw_delta_rad=0.08,
-            max_quality_delta_logit=1.0,
-            keep_threshold_m=0.50,
-            candidate_target_sigma_m=0.50,
-            shape_loss_weight=1.0,
-            distribution_nll_weight=0.25,
-            candidate_loss_weight=0.50,
-            radial_offset_loss_weight=0.50,
-            center_move_loss_weight=1.0,
-            center_keep_loss_weight=1.0,
-            tangent_loss_weight=0.25,
-            quality_loss_weight=0.0,
-            intermediate_step_loss_weight=0.50,
-            enable_shape_refinement=True,
-            enable_tangent=True,
-            enable_radial=True,
-            enable_quality_score=True,
-            enable_rfl=True,
-            enable_rosa_geometry=True,
-            uniform_camera_fusion=False,
-            uniform_point_fusion=False,
-            force_radial_gate_one=False,
-            fixed_metric_radial_hypotheses=False,
-            detach_candidate_geometry=True,
-            export_diagnostics=False,
-            projection_contract="legacy_front_only",
-        ),
+        # One profile reproduces every published ROSA setting. Individual
+        # fields are reserved for controlled ablations in frozen result configs.
+        rosa_cfg=dict(profile="published"),
         num_decoder=num_decoder,
         num_single_frame_decoder=1,
         cls_threshold_to_reg=0.05,
@@ -429,7 +387,7 @@ load_from = None
 resume = False
 launcher = "pytorch"
 work_dir = str(
-    Path(
+    pathlib.Path(
         os.environ.get(
             "ROSA_WORK_DIR",
             _project_root / "work_dirs" / "rosa_r18_main126",
@@ -450,3 +408,7 @@ experiment_contract = dict(
     seed=seed,
     projection_contract="legacy_front_only",
 )
+
+# MMEngine serializes every remaining config variable when constructing a
+# Runner; pathlib objects are setup helpers, not part of the experiment.
+del _project_root, _src_root, _detector_host_root, _path, ann_root, anchor_root

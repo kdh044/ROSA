@@ -8,8 +8,11 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
-from .geometry import ocam_project_points, ocam_projection_scales
-from .sampling import DeterministicBilinearSampler
+from .geometry import (
+    ocam_full_fov_boundary,
+    ocam_project_points,
+    ocam_projection_scales,
+)
 
 
 def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
@@ -30,6 +33,8 @@ def project_and_describe(
     anchor: Tensor,
     metadata: dict,
     projection_contract: str,
+    *,
+    anchor_z_is_bottom: bool = False,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Project keypoints and encode calibrated observation geometry."""
 
@@ -70,6 +75,7 @@ def project_and_describe(
     radial_scale, tangential_scale = ocam_projection_scales(
         ray,
         metadata,
+        contract=projection_contract,
     )
     boundary = (
         torch.minimum(
@@ -79,6 +85,16 @@ def project_and_describe(
         .mul(2.0)
         .clamp(0.0, 1.0)
     )
+    if projection_contract == "full_fov":
+        boundary = torch.minimum(
+            boundary,
+            ocam_full_fov_boundary(
+                ray,
+                radial_scale,
+                metadata,
+                metadata["image_wh"],
+            ),
+        )
 
     positive_inf = torch.full_like(safe_uv, float("inf"))
     negative_inf = torch.full_like(safe_uv, float("-inf"))
@@ -104,8 +120,11 @@ def project_and_describe(
     short_axis = torch.log1p(short_axis).clamp(max=6.0) / 6.0
     short_axis = short_axis[..., None].expand_as(boundary)
 
-    center = anchor[..., :3]
     size = anchor[..., 3:6].exp().clamp_min(1e-3)
+    center = anchor[..., :3]
+    if anchor_z_is_bottom:
+        center = center.clone()
+        center[..., 2] = center[..., 2] + size[..., 2] * 0.5
     yaw_sin = anchor[..., 6]
     yaw_cos = anchor[..., 7]
     local = keypoints - center[..., None, :]
@@ -157,7 +176,7 @@ def sample_multiscale_features(
     fpn: Sequence[Tensor],
     uv: Tensor,
     query: Tensor,
-    sampler: DeterministicBilinearSampler,
+    sampler: nn.Module,
     level_head: nn.Linear,
 ) -> Tensor:
     """Sample each FPN level and fuse it with query-specific weights."""

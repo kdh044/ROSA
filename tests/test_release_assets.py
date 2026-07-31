@@ -5,6 +5,8 @@ from pathlib import Path
 
 import numpy as np
 
+from rosa import ROSAConfig
+
 ROOT = Path(__file__).resolve().parents[1]
 ANCHOR = ROOT / "assets" / "fisheye3dod_main126_train_kmeans300_seed3407.npy"
 ANCHOR_SHA256 = "2a08ac6a28b6eb519e59e9d9c16bae009184785f2b8745cd857576a28496b812"
@@ -29,4 +31,8 @@ def test_release_config_uses_only_clean_integration_imports():
         "rosa.integrations.fisheye3dod.metric",
     ):
         assert module in source
-    assert 'projection_contract="legacy_front_only"' in source
+    assert 'profile="published"' in source
+    assert (
+        ROSAConfig.from_mapping({"profile": "published"}).projection_contract
+        == "legacy_front_only"
+    )

@@ -1,6 +1,9 @@
+import pytest
 import torch
 
 from rosa.refiner import (
+    _CandidateEvidence,
+    _candidate_confidence,
     ROSAConfig,
     ROSARefiner,
 )
@@ -305,3 +308,196 @@ def test_fixed_metric_hypotheses_keep_two_pass_full_graph():
     ]
     assert gradients
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+def test_balanced_profile_vectorizes_three_full_span_candidates():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "balanced",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    query_counts = []
+
+    def counted_generator(box, sidecar_query):
+        query_counts.append(int(box.shape[1]))
+        return generator(box, sidecar_query)
+
+    output = stage(anchor, query, fpn, metas, counted_generator)
+
+    # Current boxes, all three candidates in one batch, then the second pass.
+    assert query_counts == [2, 6, 2]
+    assert output.iteration_candidate_offsets.shape == (1, 2, 2, 3)
+    assert output.candidate_features.shape == (1, 2, 3, 16)
+    assert torch.equal(output.final_anchor, anchor)
+
+    legacy, *_ = _fixture(
+        ROSAConfig(embed_dims=16, hidden_dims=8)
+    )
+    legacy_output = legacy(anchor, query, fpn, metas, generator)
+    torch.testing.assert_close(
+        output.iteration_candidate_offsets[:, :, 0, (0, 2)],
+        legacy_output.iteration_candidate_offsets[:, :, 0, (0, 4)],
+    )
+
+
+def test_fast_profile_uses_one_vectorized_refinement_pass():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    query_counts = []
+
+    def counted_generator(box, sidecar_query):
+        query_counts.append(int(box.shape[1]))
+        return generator(box, sidecar_query)
+
+    output = stage(anchor, query, fpn, metas, counted_generator)
+    assert query_counts == [2, 6]
+    assert output.iteration_candidate_offsets.shape == (1, 2, 1, 3)
+    assert output.iteration_anchors.shape == (1, 2, 1, 11)
+
+
+def test_compact_refiner_parameter_contract():
+    balanced = ROSARefiner(ROSAConfig.from_mapping({"profile": "balanced"}))
+    fast = ROSARefiner(ROSAConfig.from_mapping({"profile": "fast"}))
+    assert sum(parameter.numel() for parameter in balanced.parameters()) == 120_559
+    assert sum(parameter.numel() for parameter in fast.parameters()) == 120_559
+    assert len(balanced.state_dict()) == 39
+
+
+def test_compact_candidate_confidence_uses_only_supported_hypotheses():
+    probabilities = torch.tensor(
+        (
+            (0.5, 0.5, 0.0),
+            (1.0, 0.0, 0.0),
+            (0.6, 0.0, 0.4),
+            (1 / 3, 1 / 3, 1 / 3),
+        )
+    )
+    supported = torch.tensor(
+        (
+            (True, True, False),
+            (True, False, False),
+            (True, False, True),
+            (False, False, False),
+        )
+    )
+    entropy, margin = _candidate_confidence(
+        probabilities,
+        supported,
+        legacy=False,
+    )
+    torch.testing.assert_close(
+        entropy[:2],
+        torch.tensor((1.0, 0.0)),
+    )
+    torch.testing.assert_close(margin, torch.tensor((0.0, 1.0, 0.2, 0.0)))
+    assert 0.9 < float(entropy[2]) < 1.0
+    assert entropy[3] == 0
+
+
+def test_balanced_profile_keeps_unsupported_boxes_exactly_unchanged():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "balanced",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    anchor[:, 1, 2] = 5.0
+    with torch.no_grad():
+        stage.shared_shape_head[-1].bias.fill_(1.0)
+        stage.shared_tangent_head[-1].bias.fill_(1.0)
+        stage.range_distribution_head[-1].bias[0] = 0.2
+        stage.center_gate_head[-1].bias.fill_(2.0)
+
+    output = stage(anchor, query, fpn, metas, generator)
+    assert output.initial_supported[0, 0]
+    assert not output.initial_supported[0, 1]
+    assert torch.equal(output.final_anchor[:, 1], anchor[:, 1])
+    assert not torch.equal(output.final_anchor[:, 0], anchor[:, 0])
+
+
+def test_yaw_off_keeps_yaw_while_size_refinement_remains_active():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "balanced",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "yaw_update_steps": "off",
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    with torch.no_grad():
+        stage.shared_shape_head[-1].bias[:3].fill_(0.5)
+        stage.shared_shape_head[-1].bias[3] = 1.0
+
+    output = stage(anchor, query, fpn, metas, generator)
+    assert torch.equal(output.final_anchor[..., 6:8], anchor[..., 6:8])
+    assert not torch.equal(output.final_anchor[..., 3:6], anchor[..., 3:6])
+
+
+@pytest.mark.parametrize("fixed_metric", (False, True))
+def test_partial_candidate_support_has_an_exact_zero_initial_prior(fixed_metric):
+    config = ROSAConfig.from_mapping({"profile": "balanced"})
+    stage = ROSARefiner(config)
+    probabilities = torch.tensor([[[0.5, 0.5, 0.0]]])
+    supported = torch.tensor([[[True, True, False]]])
+    offsets = torch.tensor([[[-1.0, 0.0, 1.0]]])
+    features = torch.zeros(1, 1, 3, config.embed_dims)
+    evidence = _CandidateEvidence(
+        features=features,
+        supported=supported,
+        logits=torch.zeros_like(probabilities),
+        probabilities=probabilities,
+        offsets=offsets,
+        radial_delta=torch.zeros(1, 1),
+        entropy=torch.zeros(1, 1),
+        margin=torch.zeros(1, 1),
+        weighted_feature=torch.zeros(1, 1, config.embed_dims),
+    )
+
+    proposal = stage._posterior_radial_proposal(
+        evidence,
+        current_range=torch.full((1, 1), 10.0),
+        distribution_mean=torch.zeros(1, 1),
+        distribution_std=torch.full((1, 1), 0.05),
+        sigma_points=torch.tensor((-2.0, 0.0, 2.0)),
+        fixed_metric=fixed_metric,
+        step=0,
+    )
+    assert torch.equal(proposal, torch.zeros_like(proposal))
+
+
+def test_corrected_geometry_normalizes_yaw_without_changing_native_box():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    anchor[..., 6] = 0.0
+    anchor[..., 7] = 2.0
+    observed_norms = []
+
+    def captured_generator(box, sidecar_query):
+        observed_norms.append(
+            torch.linalg.vector_norm(box[..., 6:8], dim=-1)
+        )
+        return generator(box, sidecar_query)
+
+    output = stage(anchor, query, fpn, metas, captured_generator)
+    assert observed_norms
+    for norm in observed_norms:
+        torch.testing.assert_close(norm, torch.ones_like(norm))
+    assert torch.equal(output.final_anchor[..., 6:8], anchor[..., 6:8])

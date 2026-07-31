@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import numpy as np
+import torch
+from mmdet3d.structures import LiDARInstance3DBoxes
 
 from rosa.integrations.fisheye3dod.calibration import (
     convert_lidar2cam,
     convert_ocamcamera,
     project_rosa_compatible_numpy,
+)
+from rosa.integrations.fisheye3dod.dataset import (
+    Fisheye3DODEvaluatorRangeFilter,
 )
 
 
@@ -50,3 +55,32 @@ def test_numpy_reference_separates_legacy_and_full_fov_contracts():
     )
     assert np.array_equal(legacy, np.full((1, 2), -1.0))
     assert np.all((full_fov >= 0) & (full_fov < 800))
+
+
+def test_evaluator_range_filter_matches_strict_class_radial_contract():
+    raw = torch.tensor(
+        [
+            [47.9, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0],
+            [48.0, 0.0, 0.0, 2.0, 4.0, 1.5, 0.0],
+            [37.0, 0.0, 0.0, 1.0, 1.0, 1.7, 0.0],
+            [35.9, 0.0, 0.0, 1.0, 1.0, 1.7, 0.0],
+            [40.0, 40.0, 0.0, 2.0, 4.0, 1.5, 0.0],
+            [1.0, 0.0, 100.0, 2.0, 4.0, 1.5, 0.0],
+        ]
+    )
+    labels = np.asarray([0, 0, 4, 4, 0, 0], dtype=np.int64)
+    annotation = {
+        "gt_bboxes_3d": LiDARInstance3DBoxes(raw),
+        "gt_labels_3d": labels,
+        "instance_inds": np.arange(len(labels)) + 100,
+    }
+    result = Fisheye3DODEvaluatorRangeFilter()(
+        {"ann_info": annotation}
+    )
+    filtered = result["ann_info"]
+    assert filtered["gt_labels_3d"].tolist() == [0, 4, 0]
+    assert filtered["instance_inds"].tolist() == [100, 103, 105]
+    torch.testing.assert_close(
+        filtered["gt_bboxes_3d"].tensor[:, :3],
+        raw[[0, 3, 5], :3],
+    )

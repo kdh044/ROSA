@@ -43,6 +43,11 @@ class ROSAOutput:
     initial_supported: Tensor
     posterior_entropy: Tensor
     posterior_margin: Tensor
+    searched_candidate_probabilities: Tensor | None = None
+    searched_candidate_logits: Tensor | None = None
+    searched_candidate_supported: Tensor | None = None
+    total_radial_delta: Tensor | None = None
+    total_tangent_delta: Tensor | None = None
     distribution_mean: Tensor | None = None
     distribution_std: Tensor | None = None
     candidate_offsets: Tensor | None = None
@@ -53,8 +58,17 @@ class ROSAOutput:
     iteration_candidate_offsets: Tensor | None = None
     iteration_candidate_probabilities: Tensor | None = None
     iteration_candidate_supported: Tensor | None = None
+    iteration_observation_supported: Tensor | None = None
+    iteration_radial_proposal: Tensor | None = None
+    iteration_radial_gate: Tensor | None = None
+    iteration_radial_gate_logit: Tensor | None = None
     iteration_radial_safe: Tensor | None = None
     iteration_tangent_delta: Tensor | None = None
+    iteration_yaw_raw_delta: Tensor | None = None
+    iteration_yaw_gate: Tensor | None = None
+    iteration_yaw_gate_logit: Tensor | None = None
+    iteration_yaw_delta: Tensor | None = None
+    iteration_reliability_context: Tensor | None = None
     iteration_camera_weight_mean: Tensor | None = None
     iteration_camera_geometry_summary: Tensor | None = None
 

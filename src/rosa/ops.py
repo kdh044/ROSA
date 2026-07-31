@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 
 class _ExactZeroDetachedBaseAdd(torch.autograd.Function):
@@ -68,6 +69,32 @@ def exact_zero_detached_base_yaw_rotation(base: Tensor, delta_yaw: Tensor) -> Te
     return _ExactZeroDetachedBaseYawRotation.apply(base, delta_yaw)
 
 
+def yaw_vector_to_angle(yaw: Tensor) -> Tensor:
+    """Decode an encoded ``[sin(yaw), cos(yaw)]`` vector."""
+
+    if yaw.shape[-1] != 2:
+        raise ValueError("yaw encoding must end in [sin, cos]")
+    return torch.atan2(yaw[..., 0], yaw[..., 1])
+
+
+def wrapped_angle_difference(prediction: Tensor, target: Tensor) -> Tensor:
+    """Return the signed shortest angular difference between yaw vectors."""
+
+    if prediction.shape != target.shape or prediction.shape[-1] != 2:
+        raise ValueError("yaw tensors must share shape [...,2]")
+    prediction = F.normalize(prediction, dim=-1, eps=1e-6)
+    target = F.normalize(target, dim=-1, eps=1e-6)
+    sine = prediction[..., 0] * target[..., 1] - prediction[..., 1] * target[..., 0]
+    cosine = (prediction * target).sum(dim=-1)
+    return torch.atan2(sine, cosine)
+
+
+def wrap_angle(angle: Tensor) -> Tensor:
+    """Map a scalar angle to the differentiable principal interval [-pi, pi]."""
+
+    return torch.atan2(angle.sin(), angle.cos())
+
+
 def bitwise_equal(left: Tensor, right: Tensor) -> bool:
     """Compare floating tensors including signed zero and NaN bit patterns."""
 
@@ -93,4 +120,7 @@ __all__ = [
     "bitwise_equal",
     "exact_zero_detached_base_add",
     "exact_zero_detached_base_yaw_rotation",
+    "wrap_angle",
+    "wrapped_angle_difference",
+    "yaw_vector_to_angle",
 ]

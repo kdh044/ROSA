@@ -11,10 +11,25 @@ from typing import Mapping
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
 
 try:
     from mmdet3d.registry import MODELS
-    from projects.mmdet3d_plugin.core.box3d import CNS
+    from projects.mmdet3d_plugin.core.box3d import (
+        CNS,
+        COS_YAW,
+        SIN_YAW,
+        YNS,
+    )
+    from projects.mmdet3d_plugin.models.blocks import (
+        DeformableFeatureAggregation,
+    )
+    from projects.mmdet3d_plugin.models.detection3d.detection3d_blocks import (
+        SparseBox3DKeyPointsGenerator,
+    )
+    from projects.mmdet3d_plugin.models.detection3d.losses import (
+        SparseBox3DLoss,
+    )
     from projects.mmdet3d_plugin.models.sparse4d_head import Sparse4DHead
 except ImportError as exc:  # pragma: no cover - exercised in host environment
     raise ImportError(
@@ -23,9 +38,13 @@ except ImportError as exc:  # pragma: no cover - exercised in host environment
         "ROSAConfig, ROSARefiner`."
     ) from exc
 
+from ..geometry import ocam_project_points
 from ..ops import bitwise_equal
 from ..refiner import ROSAConfig, ROSARefiner
-from .sparse4d_losses import rosa_losses
+from .sparse4d_losses import (
+    evaluator_aligned_centerness_target,
+    rosa_losses,
+)
 from .sparse4d_runtime import (
     SingleCallCapture,
     detached_fpn,
@@ -85,6 +104,138 @@ _EXPECTED_OPERATION_ORDER = (
     "norm",
     "refine",
 )
+
+
+def _normalized_yaw_geometry(anchor: Tensor) -> Tensor:
+    """Normalize the sin/cos pair used for geometry without changing boxes."""
+
+    yaw = anchor[..., [SIN_YAW, COS_YAW]]
+    finite = torch.isfinite(yaw).all(dim=-1, keepdim=True)
+    safe_yaw = torch.where(finite, yaw, torch.zeros_like(yaw))
+    norm = torch.linalg.vector_norm(safe_yaw, dim=-1, keepdim=True)
+    fallback = torch.zeros_like(safe_yaw)
+    fallback[..., 1] = 1.0
+    normalized = torch.where(
+        finite & norm.gt(1e-6),
+        safe_yaw / norm.clamp_min(1e-6),
+        fallback,
+    )
+    geometry_anchor = anchor.clone()
+    geometry_anchor[..., SIN_YAW] = normalized[..., 0]
+    geometry_anchor[..., COS_YAW] = normalized[..., 1]
+    return geometry_anchor
+
+
+@MODELS.register_module()
+class ROSANormalizedBottomKeyPointsGenerator(SparseBox3DKeyPointsGenerator):
+    """Generate centered keypoints from a unit yaw direction.
+
+    Sparse4D's yaw two-vector is not guaranteed to have unit norm. The raw
+    pair therefore scales every non-central keypoint by ``||yaw||``. Only a
+    geometry copy is normalized here; detector state and regression targets
+    remain untouched.
+    """
+
+    def __init__(self, *args, anchor_z_is_bottom: bool = True, **kwargs) -> None:
+        super().__init__(
+            *args,
+            anchor_z_is_bottom=anchor_z_is_bottom,
+            **kwargs,
+        )
+
+    def forward(self, anchor: Tensor, *args, **kwargs):
+        return super().forward(
+            _normalized_yaw_geometry(anchor),
+            *args,
+            **kwargs,
+        )
+
+
+@MODELS.register_module()
+class ROSAFullFOVDeformableFeatureAggregation(DeformableFeatureAggregation):
+    """Use the declared OCam lens cone in every native decoder block."""
+
+    def __init__(self, *args, projection_type: str = "ocam_fisheye", **kwargs):
+        if projection_type != "ocam_fisheye":
+            raise ValueError(
+                "ROSAFullFOVDeformableFeatureAggregation requires "
+                "projection_type='ocam_fisheye'"
+            )
+        super().__init__(
+            *args,
+            projection_type=projection_type,
+            **kwargs,
+        )
+
+    def project_points(
+        self,
+        key_points: Tensor,
+        projection_mat: Tensor,
+        image_wh: Tensor | None = None,
+        metas: dict | None = None,
+    ) -> Tensor:
+        if metas is None or image_wh is None:
+            raise ValueError("full-FOV OCam projection requires metadata and image_wh")
+        return ocam_project_points(
+            key_points,
+            metas,
+            image_wh,
+            contract="full_fov",
+        )
+
+
+@MODELS.register_module()
+class ROSAEvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
+    """Sparse4D box loss with a detached BEV-centerness target."""
+
+    def forward(
+        self,
+        box: Tensor,
+        box_target: Tensor,
+        weight: Tensor | None = None,
+        avg_factor=None,
+        suffix: str = "",
+        quality: Tensor | None = None,
+        cls_target: Tensor | None = None,
+        **kwargs,
+    ):
+        output = super().forward(
+            box,
+            box_target,
+            weight=weight,
+            avg_factor=avg_factor,
+            suffix=suffix,
+            quality=None,
+            cls_target=cls_target,
+            **kwargs,
+        )
+        if quality is None:
+            return output
+        centerness = quality[..., CNS]
+        centerness_target = evaluator_aligned_centerness_target(
+            box,
+            box_target,
+        )
+        output[f"loss_cns{suffix}"] = self.loss_cns(
+            centerness,
+            centerness_target,
+            avg_factor=avg_factor,
+        )
+        yawness = quality[..., YNS].sigmoid()
+        yawness_target = (
+            F.cosine_similarity(
+                box_target[..., [SIN_YAW, COS_YAW]],
+                box[..., [SIN_YAW, COS_YAW]],
+                dim=-1,
+            )
+            > 0
+        ).to(yawness.dtype)
+        output[f"loss_yns{suffix}"] = self.loss_yns(
+            yawness,
+            yawness_target,
+            avg_factor=avg_factor,
+        )
+        return output
 
 
 @MODELS.register_module()
@@ -280,11 +431,31 @@ class ROSARefinementHead(Sparse4DHead):
             stage_query = query
 
         deformable = self.layers[self._rosa_deformable_layer_index]
+        required_metadata = (
+            "lidar2cam",
+            "image_wh",
+            "ocam_intrinsic",
+            "ocam_pol",
+        )
+        missing_metadata = [
+            name for name in required_metadata if name not in metas
+        ]
+        if missing_metadata:
+            raise KeyError(
+                f"ROSA metadata missing: {missing_metadata}"
+            )
+        rosa_metadata = {
+            name: metas[name] for name in required_metadata
+        }
+        if "ocam_lens_fov_deg" in metas:
+            rosa_metadata["ocam_lens_fov_deg"] = metas[
+                "ocam_lens_fov_deg"
+            ]
         result = self.rosa_refiner(
             stage_anchor,
             stage_query,
             live_fpn,
-            metas,
+            rosa_metadata,
             deformable.kps_generator,
         )
         if selected_indices is None:
@@ -391,10 +562,24 @@ class ROSARefinementHead(Sparse4DHead):
             "iteration_candidate_offsets",
             "iteration_candidate_probabilities",
             "iteration_candidate_supported",
+            "iteration_observation_supported",
+            "iteration_radial_proposal",
+            "iteration_radial_gate",
+            "iteration_radial_gate_logit",
             "iteration_radial_safe",
             "iteration_tangent_delta",
+            "iteration_yaw_raw_delta",
+            "iteration_yaw_gate",
+            "iteration_yaw_gate_logit",
+            "iteration_yaw_delta",
+            "iteration_reliability_context",
             "iteration_camera_weight_mean",
             "iteration_camera_geometry_summary",
+            "searched_candidate_probabilities",
+            "searched_candidate_logits",
+            "searched_candidate_supported",
+            "total_radial_delta",
+            "total_tangent_delta",
         ):
             value = getattr(result, name)
             if value is not None:
@@ -469,10 +654,24 @@ class ROSARefinementHead(Sparse4DHead):
             "iteration_candidate_offsets",
             "iteration_candidate_probabilities",
             "iteration_candidate_supported",
+            "iteration_observation_supported",
+            "iteration_radial_proposal",
+            "iteration_radial_gate",
+            "iteration_radial_gate_logit",
             "iteration_radial_safe",
             "iteration_tangent_delta",
+            "iteration_yaw_raw_delta",
+            "iteration_yaw_gate",
+            "iteration_yaw_gate_logit",
+            "iteration_yaw_delta",
+            "iteration_reliability_context",
             "iteration_camera_weight_mean",
             "iteration_camera_geometry_summary",
+            "searched_candidate_probabilities",
+            "searched_candidate_logits",
+            "searched_candidate_supported",
+            "total_radial_delta",
+            "total_tangent_delta",
             "posterior_entropy",
             "posterior_margin",
             "radial_gate",
@@ -532,4 +731,10 @@ MODELS.register_module(name="ClosedLoopROSAHead", module=ROSARefinementHead)
 ClosedLoopROSAHead = ROSARefinementHead
 
 
-__all__ = ["ClosedLoopROSAHead", "ROSARefinementHead"]
+__all__ = [
+    "ClosedLoopROSAHead",
+    "ROSAEvaluatorAlignedSparseBox3DLoss",
+    "ROSAFullFOVDeformableFeatureAggregation",
+    "ROSANormalizedBottomKeyPointsGenerator",
+    "ROSARefinementHead",
+]

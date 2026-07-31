@@ -60,9 +60,6 @@ class SphericalRayFeatureLifting(nn.Module):
             bias=False,
         )
 
-        self.last_basis = None
-        self.last_valid = None
-        self.last_delta_norm = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -170,7 +167,4 @@ class SphericalRayFeatureLifting(nn.Module):
         delta = torch.where(valid[..., None], delta, torch.zeros_like(delta))
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self.last_basis = basis.detach()
-        self.last_valid = valid.detach()
-        self.last_delta_norm = torch.linalg.vector_norm(delta.detach(), dim=-1)
         return delta.to(dtype=original_dtype)

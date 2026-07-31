@@ -29,6 +29,28 @@ def masked_softmax(logits: Tensor, valid: Tensor, dim: int) -> Tensor:
     )
 
 
+def mean_pairwise_camera_cosine(values: Tensor, valid: Tensor) -> Tensor:
+    """Average valid camera-pair cosine without materializing ``C x C``."""
+
+    if values.ndim != 5 or valid.shape != values.shape[:-1]:
+        raise ValueError("camera consistency tensors are misaligned")
+    masked = values.permute(0, 1, 3, 2, 4) * valid.permute(
+        0, 1, 3, 2
+    )[..., None].to(values.dtype)
+    camera_count = valid.sum(dim=2).to(values.dtype)
+    pair_count = camera_count * (camera_count - 1.0) * 0.5
+    summed = masked.sum(dim=3)
+    pair_sum = (
+        summed.square().sum(dim=-1)
+        - masked.square().sum(dim=(-1, -2))
+    ) * 0.5
+    return torch.where(
+        pair_count > 0,
+        pair_sum / pair_count.clamp_min(1.0),
+        torch.zeros_like(pair_sum),
+    )
+
+
 class PointwiseROSA(nn.Module):
     """Fuse camera evidence independently at each object keypoint."""
 
@@ -50,20 +72,29 @@ class PointwiseROSA(nn.Module):
             hidden,
             bias=False,
         )
-        self.value_proj = nn.Linear(dims, dims, bias=False)
+        self.value_proj = (
+            nn.Identity()
+            if config.architecture_profile == "compact"
+            else nn.Linear(dims, dims, bias=False)
+        )
         self.geometry_bias = nn.Sequential(
             nn.Linear(self.geometry_dims, hidden),
             nn.SiLU(),
             nn.Linear(hidden, 1),
         )
         self.point_embedding = nn.Embedding(config.num_keypoints, dims)
-        self.point_query = nn.Linear(dims, dims, bias=False)
-        self.point_key = nn.Linear(dims, dims, bias=False)
-        self.point_output = nn.Sequential(
-            nn.LayerNorm(dims),
-            nn.Linear(dims, dims),
-            nn.SiLU(),
-        )
+        if config.architecture_profile == "compact":
+            self.point_query = None
+            self.point_key = None
+            self.point_output = None
+        else:
+            self.point_query = nn.Linear(dims, dims, bias=False)
+            self.point_key = nn.Linear(dims, dims, bias=False)
+            self.point_output = nn.Sequential(
+                nn.LayerNorm(dims),
+                nn.Linear(dims, dims),
+                nn.SiLU(),
+            )
 
     def reset_parameters(self) -> None:
         self.rfl.reset_parameters()
@@ -113,45 +144,66 @@ class PointwiseROSA(nn.Module):
             device=query.device,
         )
         point_features = point_features + self.point_embedding(point_ids)[None, None]
-        point_logits = (
-            self.point_query(query)[:, :, None, :] * self.point_key(point_features)
-        ).sum(dim=-1)
-        point_logits = point_logits / math.sqrt(self.cfg.embed_dims)
+        if self.cfg.architecture_profile == "compact":
+            point_logits = (
+                F.normalize(query, dim=-1, eps=1e-6)[:, :, None, :]
+                * F.normalize(point_features, dim=-1, eps=1e-6)
+            ).sum(dim=-1)
+        else:
+            point_logits = (
+                self.point_query(query)[:, :, None, :]
+                * self.point_key(point_features)
+            ).sum(dim=-1)
+            point_logits = point_logits / math.sqrt(self.cfg.embed_dims)
         if self.cfg.uniform_point_fusion:
             point_logits = point_logits * 0.0
         point_weights = masked_softmax(point_logits, point_valid, dim=2)
         object_feature = (point_weights[..., None] * point_features).sum(dim=2)
-        object_feature = self.point_output(object_feature)
+        if self.point_output is None:
+            object_feature = F.layer_norm(
+                object_feature,
+                (self.cfg.embed_dims,),
+            )
+        else:
+            object_feature = self.point_output(object_feature)
 
         normalized_values = F.normalize(
             torch.nan_to_num(values.float()),
             dim=-1,
             eps=1e-6,
         )
-        similarity = torch.einsum(
-            "bncpd,bnfpd->bnpcf",
-            normalized_values,
-            normalized_values,
-        )
-        camera_valid = valid.permute(0, 1, 3, 2)
-        pair_valid = camera_valid[..., :, None] & camera_valid[..., None, :]
-        upper_triangle = torch.triu(
-            torch.ones(
-                self.cfg.num_cameras,
-                self.cfg.num_cameras,
-                device=valid.device,
-                dtype=torch.bool,
-            ),
-            diagonal=1,
-        )
-        pair_valid = pair_valid & upper_triangle
-        pair_count = pair_valid.sum(dim=(-1, -2))
-        point_consistency = torch.where(
-            pair_count > 0,
-            (similarity * pair_valid.to(similarity.dtype)).sum(dim=(-1, -2))
-            / pair_count.clamp_min(1).to(similarity.dtype),
-            torch.zeros_like(pair_count, dtype=similarity.dtype),
-        )
+        if self.cfg.architecture_profile == "compact":
+            point_consistency = mean_pairwise_camera_cosine(
+                normalized_values,
+                valid,
+            )
+        else:
+            similarity = torch.einsum(
+                "bncpd,bnfpd->bnpcf",
+                normalized_values,
+                normalized_values,
+            )
+            camera_valid = valid.permute(0, 1, 3, 2)
+            pair_valid = camera_valid[..., :, None] & camera_valid[..., None, :]
+            upper_triangle = torch.triu(
+                torch.ones(
+                    self.cfg.num_cameras,
+                    self.cfg.num_cameras,
+                    device=valid.device,
+                    dtype=torch.bool,
+                ),
+                diagonal=1,
+            )
+            pair_valid = pair_valid & upper_triangle
+            pair_count = pair_valid.sum(dim=(-1, -2))
+            point_consistency = torch.where(
+                pair_count > 0,
+                (
+                    similarity * pair_valid.to(similarity.dtype)
+                ).sum(dim=(-1, -2))
+                / pair_count.clamp_min(1).to(similarity.dtype),
+                torch.zeros_like(pair_count, dtype=similarity.dtype),
+            )
         consistency = torch.where(
             point_valid.any(dim=-1),
             (point_consistency * point_valid.to(point_consistency.dtype)).sum(dim=-1)
@@ -191,4 +243,8 @@ class PointwiseROSA(nn.Module):
         )
 
 
-__all__ = ["PointwiseROSA", "masked_softmax"]
+__all__ = [
+    "PointwiseROSA",
+    "masked_softmax",
+    "mean_pairwise_camera_cosine",
+]

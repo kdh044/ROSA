@@ -7,6 +7,49 @@ import math
 from typing import Mapping
 
 
+_BALANCED_PROFILE = {
+    "hidden_dims": 64,
+    "max_candidate_range_m": 68.0,
+    "yaw_keep_loss_weight": 0.25,
+    "yaw_improvement_loss_weight": 0.50,
+    "center_gate_loss_weight": 0.25,
+    "enable_quality_score": False,
+    "quality_loss_weight": 0.0,
+    "mask_unsupported_updates": True,
+    "train_disabled_branch_aux": False,
+    "center_update_mode": "posterior_gate",
+    "yaw_update_mode": "guarded_shared",
+    "yaw_update_steps": "both",
+    "yaw_gate_mode": "support",
+    "architecture_profile": "compact",
+    "candidate_target_mode": "fixed_sigma",
+    "center_target_mode": "sequential",
+    "center_supervision_mode": "move_or_keep",
+    "projection_contract": "full_fov",
+    "anchor_z_is_bottom": True,
+}
+
+# Users choose one behavior profile.  The individual values remain available
+# only for release reproduction and controlled ablations.
+_PROFILES = {
+    "published": {},
+    "legacy_release": {},
+    "balanced": _BALANCED_PROFILE,
+    "fast": {
+        **_BALANCED_PROFILE,
+        "refine_topk": 50,
+        "num_refinement_steps": 1,
+    },
+    # Backward-compatible aliases for early v2 experiment configs.
+    "compact_v2": _BALANCED_PROFILE,
+    "compact_v2_fast": {
+        **_BALANCED_PROFILE,
+        "refine_topk": 50,
+        "num_refinement_steps": 1,
+    },
+}
+
+
 @dataclass(frozen=True)
 class ROSAConfig:
     """Hyperparameters for adaptive two-pass fisheye refinement."""
@@ -34,11 +77,20 @@ class ROSAConfig:
     max_quality_delta_logit: float = 1.0
     keep_threshold_m: float = 0.50
     candidate_target_sigma_m: float = 0.50
+    yaw_loss_beta_rad: float = 0.10
+    yaw_keep_threshold_rad: float = math.radians(5.0)
+    center_gate_margin_m: float = 0.05
+    yaw_anisotropy_threshold: float = 0.40
+    yaw_anisotropy_temperature: float = 0.05
 
     shape_loss_weight: float = 1.0
+    yaw_loss_weight: float = 1.0
+    yaw_keep_loss_weight: float = 0.0
+    yaw_improvement_loss_weight: float = 0.0
     distribution_nll_weight: float = 0.25
     candidate_loss_weight: float = 0.50
     radial_offset_loss_weight: float = 0.50
+    center_gate_loss_weight: float = 0.0
     center_move_loss_weight: float = 1.0
     center_keep_loss_weight: float = 1.0
     tangent_loss_weight: float = 0.25
@@ -56,7 +108,19 @@ class ROSAConfig:
     force_radial_gate_one: bool = False
     fixed_metric_radial_hypotheses: bool = False
     detach_candidate_geometry: bool = True
+    mask_unsupported_updates: bool = False
+    train_disabled_branch_aux: bool = True
     export_diagnostics: bool = False
+    anchor_z_is_bottom: bool = False
+
+    center_update_mode: str = "legacy_candidate_gate"
+    yaw_update_mode: str = "legacy_shared"
+    yaw_update_steps: str = "both"
+    yaw_gate_mode: str = "none"
+    architecture_profile: str = "legacy"
+    candidate_target_mode: str = "legacy_spacing"
+    center_target_mode: str = "legacy_base"
+    center_supervision_mode: str = "legacy_conflict"
 
     # Published checkpoints used this historical validity rule.
     projection_contract: str = "legacy_front_only"
@@ -69,6 +133,12 @@ class ROSAConfig:
         """Build a config while accepting names from the original runs."""
 
         raw = dict(value or {})
+        raw.pop("_delete_", None)
+        profile = raw.pop("profile", None)
+        if profile is not None:
+            if profile not in _PROFILES:
+                raise ValueError(f"unknown ROSA profile: {profile!r}")
+            raw = {**_PROFILES[profile], **raw}
         aliases = {
             "enable_shape1": "enable_shape_refinement",
             "max_shape2_log_size_delta": "max_second_log_size_delta",
@@ -114,6 +184,41 @@ class ROSAConfig:
             "full_fov",
         ):
             raise ValueError("invalid projection contract")
+        if self.center_update_mode not in (
+            "legacy_candidate_gate",
+            "posterior_gate",
+        ):
+            raise ValueError("invalid center update mode")
+        if self.yaw_update_mode not in (
+            "legacy_shared",
+            "guarded_shared",
+        ):
+            raise ValueError("invalid yaw update mode")
+        if self.yaw_update_steps not in ("off", "first_only", "both"):
+            raise ValueError("invalid yaw update steps")
+        if self.yaw_gate_mode not in (
+            "none",
+            "support",
+            "anisotropy_gap",
+        ):
+            raise ValueError("invalid yaw gate mode")
+        if self.architecture_profile not in ("legacy", "compact"):
+            raise ValueError("invalid architecture profile")
+        if self.candidate_target_mode not in (
+            "legacy_spacing",
+            "fixed_sigma",
+        ):
+            raise ValueError("invalid candidate target mode")
+        if self.center_target_mode not in (
+            "legacy_base",
+            "sequential",
+        ):
+            raise ValueError("invalid center target mode")
+        if self.center_supervision_mode not in (
+            "legacy_conflict",
+            "move_or_keep",
+        ):
+            raise ValueError("invalid center supervision mode")
         if not (
             self.min_log_range_std
             < self.initial_log_range_std
@@ -138,6 +243,9 @@ class ROSAConfig:
             "max_quality_delta_logit",
             "keep_threshold_m",
             "candidate_target_sigma_m",
+            "yaw_loss_beta_rad",
+            "yaw_keep_threshold_rad",
+            "yaw_anisotropy_temperature",
             "distribution_nll_weight",
             "intermediate_step_loss_weight",
         )
@@ -145,6 +253,26 @@ class ROSAConfig:
             number = float(getattr(self, name))
             if not math.isfinite(number) or number <= 0:
                 raise ValueError(f"{name} must be finite and positive")
+
+        nonnegative_fields = (
+            "yaw_loss_weight",
+            "yaw_keep_loss_weight",
+            "yaw_improvement_loss_weight",
+            "center_gate_loss_weight",
+            "center_gate_margin_m",
+            "yaw_anisotropy_threshold",
+            "shape_loss_weight",
+            "candidate_loss_weight",
+            "radial_offset_loss_weight",
+            "center_move_loss_weight",
+            "center_keep_loss_weight",
+            "tangent_loss_weight",
+            "quality_loss_weight",
+        )
+        for name in nonnegative_fields:
+            number = float(getattr(self, name))
+            if not math.isfinite(number) or number < 0:
+                raise ValueError(f"{name} must be finite and non-negative")
 
     # Read-only compatibility properties used by the original MM config.
     @property

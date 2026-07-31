@@ -287,6 +287,7 @@ def decode_frozen_jointscore_rank(
     scores, order = torch.sort(scores, dim=1, descending=True)
     indices = torch.gather(indices, 1, order)
     labels = torch.gather(labels, 1, order)
+    class_origin = torch.gather(class_origin, 1, order)
     output = []
     for batch_index in range(batch_size):
         query_indices = indices[batch_index]
