@@ -8,6 +8,7 @@ import torch.nn.functional as F
 
 from ..attention import masked_softmax
 from ..ops import wrapped_angle_difference
+from .fisheye3dod.constants import OFFICIAL_AP_DISTANCES
 from .sparse4d_scores import (
     ddp_mean_mask_count,
     jointscore_quality_focal_loss,
@@ -16,7 +17,7 @@ from .sparse4d_scores import (
 
 _SIZE = slice(3, 6)
 _YAW = slice(6, 8)
-_BEV_THRESHOLDS = (0.5, 1.0, 2.0, 4.0)
+_BEV_THRESHOLDS = OFFICIAL_AP_DISTANCES
 
 
 def evaluator_aligned_centerness_target(
@@ -38,6 +39,42 @@ def evaluator_aligned_centerness_target(
     return torch.exp(-distance).detach()
 
 
+def evaluator_aligned_quality_target(
+    prediction: Tensor,
+    target: Tensor,
+    matched: Tensor,
+    predicted_class: Tensor,
+    target_class: Tensor,
+) -> Tensor:
+    """Score label-correct boxes by the official strict AP distance tests."""
+
+    expected = prediction.shape[:-1]
+    if (
+        prediction.shape != target.shape
+        or prediction.shape[-1] < 2
+        or not prediction.is_floating_point()
+        or matched.shape != expected
+        or matched.dtype != torch.bool
+        or predicted_class.shape != expected
+        or target_class.shape != expected
+    ):
+        raise ValueError("quality-target tensors must be aligned")
+    distance = torch.linalg.vector_norm(
+        target[..., :2] - prediction[..., :2],
+        dim=-1,
+    )
+    localization = (
+        torch.stack(
+            [distance.lt(threshold) for threshold in _BEV_THRESHOLDS],
+            dim=-1,
+        )
+        .to(dtype=prediction.dtype)
+        .mean(dim=-1)
+    )
+    valid = matched & predicted_class.eq(target_class)
+    return torch.where(valid, localization, torch.zeros_like(localization)).detach()
+
+
 def _radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
     radial = F.normalize(center_xy, dim=-1, eps=1e-6)
     tangent = torch.stack((-radial[..., 1], radial[..., 0]), dim=-1)
@@ -47,6 +84,23 @@ def _radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
 def _selected_mean(value: Tensor, mask: Tensor) -> Tensor:
     count = ddp_mean_mask_count(mask, value.dtype).clamp_min(1)
     return (value * mask.to(dtype=value.dtype)).sum() / count
+
+
+def _yaw_selected_mean(
+    value: Tensor,
+    mask: Tensor,
+    class_weight: Tensor | None,
+) -> Tensor:
+    """Reduce a yaw-only loss without changing its matched-count denominator."""
+
+    if class_weight is None:
+        return _selected_mean(value, mask)
+    if class_weight.shape != mask.shape:
+        raise ValueError("yaw class weights must align with the query mask")
+    count = ddp_mean_mask_count(mask, value.dtype).clamp_min(1)
+    return (
+        value * class_weight.to(dtype=value.dtype) * mask.to(dtype=value.dtype)
+    ).sum() / count
 
 
 def _task_loss(
@@ -72,6 +126,7 @@ def _circular_yaw_loss(
     target: Tensor,
     mask: Tensor,
     beta: float,
+    class_weight: Tensor | None = None,
 ) -> Tensor:
     error = wrapped_angle_difference(
         prediction[..., _YAW],
@@ -83,7 +138,7 @@ def _circular_yaw_loss(
         reduction="none",
         beta=beta,
     )
-    return _selected_mean(per_query, mask)
+    return _yaw_selected_mean(per_query, mask, class_weight)
 
 
 def _sequential_center_targets(
@@ -172,6 +227,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             final_reg = full_final_reg
             safe_target = safe_target_full
             matched_base = matched_full
+            selected_cls_target = cls_target
         else:
             reg_index = selected_indices[..., None].expand(
                 -1, -1, full_baseline_reg.shape[-1]
@@ -182,12 +238,19 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             reg_target = reg_target.gather(1, reg_index)
             reg_weights = reg_weights.gather(1, reg_index)
             matched_base = matched_full.gather(1, selected_indices)
+            selected_cls_target = cls_target.gather(1, selected_indices)
         matched_base = matched_base.detach()
         matched = (matched_base & record["supported"]).detach()
         initial_error = safe_target[..., :2] - baseline_reg[..., :2]
         initial_distance = torch.linalg.vector_norm(initial_error, dim=-1)
         keep = (matched & initial_distance.lt(cfg.keep_threshold_m)).detach()
         move = (matched & ~keep).detach()
+        yaw_class_weight = None
+        if cfg.yaw_class_loss_weights is not None:
+            class_weights = baseline_reg.new_tensor(cfg.yaw_class_loss_weights)
+            yaw_class_weight = class_weights[
+                selected_cls_target.clamp(min=0, max=class_weights.numel() - 1)
+            ].detach()
 
     weighted = (reg_weights * baseline_reg.new_tensor(head.reg_weights)).detach()
     step_bases = record["iteration_base_anchors"][..., : len(head.reg_weights)]
@@ -265,6 +328,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                     safe_target,
                     yaw_mask,
                     cfg.yaw_loss_beta_rad,
+                    yaw_class_weight,
                 )
                 base_yaw_error = wrapped_angle_difference(
                     step_base[..., _YAW],
@@ -282,7 +346,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                     yaw_mask
                     & base_yaw_error.lt(cfg.yaw_keep_threshold_rad)
                 ).detach()
-                yaw_keep_loss = yaw_keep_loss + weight * _selected_mean(
+                yaw_keep_loss = yaw_keep_loss + weight * _yaw_selected_mean(
                     F.smooth_l1_loss(
                         applied_yaw,
                         torch.zeros_like(applied_yaw),
@@ -290,13 +354,15 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                         beta=cfg.yaw_loss_beta_rad,
                     ),
                     yaw_keep,
+                    yaw_class_weight,
                 )
                 yaw_improvement_loss = (
                     yaw_improvement_loss
                     + weight
-                    * _selected_mean(
+                    * _yaw_selected_mean(
                         F.relu(output_yaw_error - base_yaw_error),
                         yaw_mask,
+                        yaw_class_weight,
                     )
                 )
             yaw_loss = yaw_loss + weight * yaw_step_loss
@@ -450,23 +516,34 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             full_final_reg[..., :2] - safe_target_full[..., :2],
             dim=-1,
         )
-        quality_target = (
-            torch.stack(
-                [final_distance.le(threshold) for threshold in _BEV_THRESHOLDS],
-                dim=-1,
+        if cfg.architecture_profile == "legacy":
+            quality_target = (
+                torch.stack(
+                    [
+                        final_distance.le(threshold)
+                        for threshold in _BEV_THRESHOLDS
+                    ],
+                    dim=-1,
+                )
+                .float()
+                .mean(dim=-1)
             )
-            .float()
-            .mean(dim=-1)
-        )
-        quality_valid = matched_full
-        if cfg.architecture_profile != "legacy":
+            quality_target = torch.where(
+                matched_full,
+                quality_target,
+                torch.zeros_like(quality_target),
+            )
+        else:
             frozen_label = record.get("frozen_native_label")
             if frozen_label is None:
                 frozen_label = baseline_cls.detach().argmax(dim=-1)
-            quality_valid = quality_valid & frozen_label.eq(cls_target)
-        quality_target = torch.where(
-            quality_valid, quality_target, torch.zeros_like(quality_target)
-        )
+            quality_target = evaluator_aligned_quality_target(
+                full_final_reg,
+                safe_target_full,
+                matched_full,
+                frozen_label,
+                cls_target,
+            )
     quality = jointscore_quality_focal_loss(
         record["joint_logit"],
         record["effective_jointscore_delta"],
@@ -566,4 +643,8 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
     }
 
 
-__all__ = ["evaluator_aligned_centerness_target", "rosa_losses"]
+__all__ = [
+    "evaluator_aligned_centerness_target",
+    "evaluator_aligned_quality_target",
+    "rosa_losses",
+]

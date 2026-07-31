@@ -48,9 +48,13 @@ RELEASED_DECLARED_MAX_BOXES = 50
 PAIRED_QUERY_BUDGET = 300
 
 DEFAULT_SEED = 3407
-EXPECTED_TRAIN_FRAMES = 10_080
-EXPECTED_VAL_FRAMES = 4_464
-EXPECTED_SCENES = 144
+# Main126 contains 126 physical scenes.  Each scene contributes the released
+# 70/31 train/validation frames, so these totals must stay internally
+# consistent with the official split rather than the earlier 144-scene
+# estimate.
+EXPECTED_TRAIN_FRAMES = 8_820
+EXPECTED_VAL_FRAMES = 3_906
+EXPECTED_SCENES = 126
 EXPECTED_TRAIN_FRAMES_PER_SCENE = 70
 EXPECTED_VAL_FRAMES_PER_SCENE = 31
 

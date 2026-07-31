@@ -88,6 +88,30 @@ def test_checkpoint_contract_rejects_projection_and_topology(tmp_path: Path):
         )
 
 
+def test_checkpoint_contract_rejects_box_coordinate_geometry(tmp_path: Path):
+    checkpoint = tmp_path / "wrong_z_convention.pth"
+    source_config = run_tool._effective_rosa_config(_config("balanced"))
+    source_mapping = {
+        **source_config.__dict__,
+        "anchor_z_is_bottom": True,
+    }
+    _save_checkpoint(
+        checkpoint,
+        has_rosa=True,
+        metadata={
+            "projection_contract": "full_fov",
+            "rosa_config": source_mapping,
+        },
+    )
+
+    with pytest.raises(ValueError, match="box-coordinate geometry"):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _config("balanced"),
+            allow_mismatch=False,
+        )
+
+
 def test_checkpoint_contract_fails_closed_without_metadata(tmp_path: Path):
     checkpoint = tmp_path / "unknown_rosa.pth"
     _save_checkpoint(checkpoint, has_rosa=True)

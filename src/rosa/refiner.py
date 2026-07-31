@@ -1017,8 +1017,13 @@ class ROSARefiner(nn.Module):
         total_radial = (center_delta * base_radial).sum(dim=-1)
         total_tangent = (center_delta * base_tangent).sum(dim=-1)
 
+        quality_feedback = (
+            final.feedback
+            if self.cfg.architecture_profile == "legacy"
+            else final.feedback.detach()
+        )
         quality_raw = (
-            self.quality_head(final.feedback).tanh()
+            self.quality_head(quality_feedback).tanh()
             if self.quality_head is not None
             else torch.zeros_like(final.feedback[..., :1])
         )

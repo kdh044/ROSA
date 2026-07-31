@@ -26,7 +26,7 @@ _BALANCED_PROFILE = {
     "center_target_mode": "sequential",
     "center_supervision_mode": "move_or_keep",
     "projection_contract": "full_fov",
-    "anchor_z_is_bottom": True,
+    "anchor_z_is_bottom": False,
 }
 
 # Users choose one behavior profile.  The individual values remain available
@@ -96,6 +96,9 @@ class ROSAConfig:
     tangent_loss_weight: float = 0.25
     quality_loss_weight: float = 0.0
     intermediate_step_loss_weight: float = 0.50
+    yaw_class_loss_weights: tuple[float, float, float, float, float, float] | None = (
+        None
+    )
 
     enable_shape_refinement: bool = True
     enable_tangent: bool = True
@@ -273,6 +276,30 @@ class ROSAConfig:
             number = float(getattr(self, name))
             if not math.isfinite(number) or number < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
+
+        if self.yaw_class_loss_weights is not None:
+            if (
+                self.architecture_profile != "compact"
+                or self.yaw_update_mode == "legacy_shared"
+            ):
+                raise ValueError(
+                    "yaw_class_loss_weights requires compact wrapped-yaw training"
+                )
+            try:
+                weights = tuple(
+                    float(value) for value in self.yaw_class_loss_weights
+                )
+            except (TypeError, ValueError) as error:
+                raise ValueError(
+                    "yaw_class_loss_weights must contain six finite positive values"
+                ) from error
+            if len(weights) != 6 or any(
+                not math.isfinite(value) or value <= 0 for value in weights
+            ):
+                raise ValueError(
+                    "yaw_class_loss_weights must contain six finite positive values"
+                )
+            object.__setattr__(self, "yaw_class_loss_weights", weights)
 
     # Read-only compatibility properties used by the original MM config.
     @property

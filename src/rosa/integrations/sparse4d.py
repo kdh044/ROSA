@@ -127,8 +127,8 @@ def _normalized_yaw_geometry(anchor: Tensor) -> Tensor:
 
 
 @MODELS.register_module()
-class ROSANormalizedBottomKeyPointsGenerator(SparseBox3DKeyPointsGenerator):
-    """Generate centered keypoints from a unit yaw direction.
+class ROSANormalizedKeyPointsGenerator(SparseBox3DKeyPointsGenerator):
+    """Generate gravity-centred keypoints from a unit yaw direction.
 
     Sparse4D's yaw two-vector is not guaranteed to have unit norm. The raw
     pair therefore scales every non-central keypoint by ``||yaw||``. Only a
@@ -136,7 +136,7 @@ class ROSANormalizedBottomKeyPointsGenerator(SparseBox3DKeyPointsGenerator):
     remain untouched.
     """
 
-    def __init__(self, *args, anchor_z_is_bottom: bool = True, **kwargs) -> None:
+    def __init__(self, *args, anchor_z_is_bottom: bool = False, **kwargs) -> None:
         super().__init__(
             *args,
             anchor_z_is_bottom=anchor_z_is_bottom,
@@ -277,6 +277,7 @@ class ROSARefinementHead(Sparse4DHead):
         if self.embed_dims != config.embed_dims:
             raise ValueError("ROSA width must match Sparse4D embed_dims")
         deformable_indices = find_operation_indices(self.operation_order, "deformable")
+        self._validate_anchor_z_contract(config, deformable_indices)
         refine_indices = find_operation_indices(self.operation_order, "refine")
         self._rosa_deformable_layer_index = deformable_indices[-1]
         self._native_refine_layer_index = refine_indices[_NATIVE_FINAL]
@@ -348,6 +349,33 @@ class ROSARefinementHead(Sparse4DHead):
             raise ValueError("constructor routes must initially select native D5")
         if self.inference_box_source_by_dimension is not None:
             raise ValueError("dimension-wise decoder routing is forbidden")
+
+    def _validate_anchor_z_contract(
+        self,
+        config: ROSAConfig,
+        deformable_indices: list[int],
+    ) -> None:
+        """Keep every image sampler on the detector state's z convention."""
+
+        expected = bool(config.anchor_z_is_bottom)
+        generators = [
+            getattr(self.instance_bank, "anchor_handler", None),
+            *[
+                getattr(self.layers[index], "kps_generator", None)
+                for index in deformable_indices
+            ],
+        ]
+        if any(generator is None for generator in generators):
+            raise ValueError("all native samplers require a keypoint generator")
+        conventions = [
+            bool(getattr(generator, "anchor_z_is_bottom", False))
+            for generator in generators
+        ]
+        if any(convention != expected for convention in conventions):
+            raise ValueError(
+                "instance-bank and all six native samplers must share "
+                "ROSA anchor_z_is_bottom"
+            )
 
     def init_weights(self) -> None:
         Sparse4DHead.init_weights(self)
@@ -725,6 +753,16 @@ class ROSARefinementHead(Sparse4DHead):
         return results
 
 
+@MODELS.register_module()
+class ROSANativeBaselineHead(Sparse4DHead):
+    """Run the corrected native detector contract without a ROSA sidecar."""
+
+    def __init__(self, rosa_cfg: None = None, **kwargs) -> None:
+        if rosa_cfg is not None:
+            raise ValueError("the native baseline requires rosa_cfg=None")
+        super().__init__(**kwargs)
+
+
 # The released configs used this type string.  It resolves to the same direct
 # Sparse4DHead subclass and does not reintroduce the V15/V17 inheritance tree.
 MODELS.register_module(name="ClosedLoopROSAHead", module=ROSARefinementHead)
@@ -735,6 +773,7 @@ __all__ = [
     "ClosedLoopROSAHead",
     "ROSAEvaluatorAlignedSparseBox3DLoss",
     "ROSAFullFOVDeformableFeatureAggregation",
-    "ROSANormalizedBottomKeyPointsGenerator",
+    "ROSANativeBaselineHead",
+    "ROSANormalizedKeyPointsGenerator",
     "ROSARefinementHead",
 ]

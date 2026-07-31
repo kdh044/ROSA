@@ -7,7 +7,10 @@ import torch.nn.functional as F
 from rosa import ROSAConfig
 from rosa.integrations.sparse4d_losses import (
     _candidate_target_distribution,
+    _selected_mean,
+    _yaw_selected_mean,
     evaluator_aligned_centerness_target,
+    evaluator_aligned_quality_target,
     rosa_losses,
 )
 from rosa.integrations.sparse4d_scores import compose_quality_rank
@@ -24,6 +27,30 @@ def test_evaluator_aligned_centerness_target_has_no_box_gradient():
     torch.testing.assert_close(
         score,
         torch.tensor([[1.0, torch.exp(torch.tensor(-5.0))]]),
+    )
+    assert not score.requires_grad
+
+
+def test_quality_target_matches_strict_official_ap_distance_thresholds():
+    prediction = torch.zeros(1, 6, 3)
+    prediction[..., 0] = torch.tensor((0.49, 0.50, 0.75, 1.50, 3.00, 0.25))
+    prediction.requires_grad_()
+    target = torch.zeros_like(prediction)
+    matched = torch.ones(1, 6, dtype=torch.bool)
+    predicted_class = torch.tensor(((0, 0, 0, 0, 0, 1),))
+    target_class = torch.zeros(1, 6, dtype=torch.long)
+
+    score = evaluator_aligned_quality_target(
+        prediction,
+        target,
+        matched,
+        predicted_class,
+        target_class,
+    )
+
+    torch.testing.assert_close(
+        score,
+        torch.tensor(((1.0, 0.75, 0.75, 0.50, 0.25, 0.0),)),
     )
     assert not score.requires_grad
 
@@ -256,3 +283,76 @@ def test_candidate_target_stays_normalized_when_best_hypothesis_is_hidden():
     )
     assert distribution[0, 0, 2] == 0
     assert distribution[0, 0, 1] > distribution[0, 0, 0]
+
+
+def test_yaw_class_weighting_keeps_the_matched_count_denominator():
+    per_query = torch.tensor([[1.0, 2.0, 100.0]])
+    selected = torch.tensor([[True, True, False]])
+    class_weight = torch.tensor([[2.0, 0.5, 99.0]])
+
+    loss = _yaw_selected_mean(per_query, selected, class_weight)
+
+    torch.testing.assert_close(loss, torch.tensor(1.5))
+
+
+def test_disabled_yaw_class_weighting_is_exactly_the_original_reduction():
+    per_query = torch.tensor([[0.7, 1.3, 2.1]], dtype=torch.float64)
+    selected = torch.tensor([[True, False, True]])
+
+    original = _selected_mean(per_query, selected)
+    disabled = _yaw_selected_mean(per_query, selected, None)
+
+    assert torch.equal(disabled, original)
+
+
+def test_yaw_class_weighting_changes_only_the_three_compact_yaw_losses():
+    common = {
+        "profile": "balanced",
+        "embed_dims": 16,
+        "hidden_dims": 8,
+    }
+    _, unweighted, _ = _full_loss(ROSAConfig.from_mapping(common))
+    _, weighted, _ = _full_loss(
+        ROSAConfig.from_mapping(
+            {
+                **common,
+                "yaw_class_loss_weights": (2.0,) * 6,
+            }
+        )
+    )
+    weighted_names = {
+        "loss_cl_shape_yaw_6",
+        "loss_cl_yaw_keep_6",
+        "loss_cl_yaw_no_harm_6",
+    }
+    for name, original in unweighted.items():
+        if not name.startswith("loss_"):
+            continue
+        if name in weighted_names:
+            torch.testing.assert_close(weighted[name], 2 * original)
+        else:
+            assert torch.equal(weighted[name], original), name
+
+
+def test_compact_quality_loss_gradients_are_score_head_only():
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "balanced",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "enable_quality_score": True,
+            "quality_loss_weight": 0.5,
+        }
+    )
+    refiner, losses, _ = _full_loss(config)
+
+    losses["loss_cl_quality_6"].backward()
+
+    nonzero = {
+        name
+        for name, parameter in refiner.named_parameters()
+        if parameter.grad is not None
+        and bool(torch.count_nonzero(parameter.grad).item())
+    }
+    assert nonzero
+    assert all(name.startswith("quality_head.") for name in nonzero)

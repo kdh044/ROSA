@@ -1,0 +1,29 @@
+{
+  "status": "verified",
+  "checked_utc": "2026-07-31T18:24:00Z",
+  "conclusion": "Main126 detector state and anchor z are gravity-center coordinates",
+  "dataset_loader": {
+    "source": "src/rosa/integrations/fisheye3dod/dataset.py",
+    "input_origin": [0.5, 0.5, 0.5],
+    "internal_lidar_box_origin": [0.5, 0.5, 0.0]
+  },
+  "detector_wrapper": {
+    "source": "src/rosa/integrations/fisheye3dod/model.py",
+    "state_assignment": "tensor[..., :3] = boxes.gravity_center"
+  },
+  "raw_train_statistics": {
+    "Car": {"count": 33300, "z_median_m": -1.333395, "height_median_m": 1.534725, "z_minus_half_height_median_m": -2.101692},
+    "Van": {"count": 6382, "z_median_m": -0.964830, "height_median_m": 2.431376, "z_minus_half_height_median_m": -2.104137},
+    "Truck": {"count": 5234, "z_median_m": -0.751973, "height_median_m": 2.467445, "z_minus_half_height_median_m": -2.102200},
+    "Bus": {"count": 1323, "z_median_m": 0.023975, "height_median_m": 4.252848, "z_minus_half_height_median_m": -2.102449},
+    "Pedestrian": {"count": 9493, "z_median_m": -1.041349, "height_median_m": 1.860000, "z_minus_half_height_median_m": -1.961000},
+    "Cyclist": {"count": 6246, "z_median_m": -1.305647, "height_median_m": 1.612354, "z_minus_half_height_median_m": -2.108048}
+  },
+  "anchor_statistics": {
+    "shape": [300, 11],
+    "z_median_m": -1.167490,
+    "decoded_height_median_m": 1.836017,
+    "z_minus_half_height_median_m": -2.085498
+  },
+  "invalidated_experiment": "results/raw_metrics/experiments/v2_e0_invalid_bottom_z_seed3407"
+}

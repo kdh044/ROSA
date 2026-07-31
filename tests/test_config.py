@@ -1,6 +1,12 @@
+from pathlib import Path
+
 import pytest
+from mmengine.config import Config
 
 from rosa import ROSAConfig
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_release_config_accepts_published_option_names():
@@ -39,7 +45,44 @@ def test_balanced_profile_applies_one_auditable_preset():
     assert config.center_target_mode == "sequential"
     assert config.center_supervision_mode == "move_or_keep"
     assert config.yaw_update_mode == "guarded_shared"
-    assert config.anchor_z_is_bottom
+    assert not config.anchor_z_is_bottom
+    assert config.yaw_class_loss_weights is None
+
+
+def test_v2_native_sampling_and_refiner_share_gravity_center_z_contract():
+    resolved = Config.fromfile(ROOT / "configs" / "rosa_r18_main126_v2.py")
+    head = resolved.model.head
+    native_deformables = [
+        operation for operation in head.operation_order if operation == "deformable"
+    ]
+    assert len(native_deformables) == 6
+    assert head.instance_bank.anchor_handler.type == (
+        "ROSANormalizedKeyPointsGenerator"
+    )
+    assert not head.instance_bank.anchor_handler.anchor_z_is_bottom
+    assert head.deformable_model.kps_generator.type == (
+        "ROSANormalizedKeyPointsGenerator"
+    )
+    assert not head.deformable_model.kps_generator.anchor_z_is_bottom
+    assert not ROSAConfig.from_mapping(head.rosa_cfg).anchor_z_is_bottom
+
+
+def test_v2_b0_removes_only_the_rosa_sidecar_contract():
+    resolved = Config.fromfile(
+        ROOT / "configs" / "rosa_r18_main126_v2_b0_native.py"
+    )
+    head = resolved.model.head
+    assert head.type == "ROSANativeBaselineHead"
+    assert head.rosa_cfg is None
+    assert head.instance_bank.anchor_handler.type == (
+        "ROSANormalizedKeyPointsGenerator"
+    )
+    assert not head.instance_bank.anchor_handler.anchor_z_is_bottom
+    assert head.deformable_model.type == (
+        "ROSAFullFOVDeformableFeatureAggregation"
+    )
+    assert not head.deformable_model.kps_generator.anchor_z_is_bottom
+    assert not resolved.experiment_contract.rosa_sidecar
 
 
 def test_fast_profile_only_changes_the_compute_budget():
@@ -106,3 +149,36 @@ def test_all_loss_weights_reject_negative_or_nonfinite(name):
         ROSAConfig(**{name: -1.0})
     with pytest.raises(ValueError, match=name):
         ROSAConfig(**{name: float("inf")})
+
+
+@pytest.mark.parametrize(
+    "weights",
+    (
+        1.0,
+        (1.0,) * 5,
+        (1.0,) * 5 + (0.0,),
+        (1.0,) * 5 + (float("inf"),),
+    ),
+)
+def test_yaw_class_loss_weights_require_six_positive_finite_values(weights):
+    with pytest.raises(ValueError, match="six finite positive"):
+        ROSAConfig.from_mapping(
+            {
+                "profile": "balanced",
+                "yaw_class_loss_weights": weights,
+            }
+        )
+
+
+def test_yaw_class_loss_weights_are_compact_ablation_only():
+    with pytest.raises(ValueError, match="compact wrapped-yaw"):
+        ROSAConfig(yaw_class_loss_weights=(1.0,) * 6)
+
+    weights = (0.765, 1.320, 1.509, 2.041, 1.022, 1.264)
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "balanced",
+            "yaw_class_loss_weights": list(weights),
+        }
+    )
+    assert config.yaw_class_loss_weights == weights

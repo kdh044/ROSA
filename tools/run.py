@@ -31,6 +31,9 @@ _ROSA_TOPOLOGY_FIELDS = (
     "num_levels",
     "enable_quality_score",
 )
+_ROSA_GEOMETRY_FIELDS = (
+    "anchor_z_is_bottom",
+)
 
 
 class _CheckpointContractHook(Hook):
@@ -140,7 +143,7 @@ def _checkpoint_contract_metadata(config: Config) -> dict | None:
     if effective is None:
         return None
     return {
-        "rosa_contract_version": 1,
+        "rosa_contract_version": 2,
         "projection_contract": effective.projection_contract,
         "refinement_profile": _rosa_profile(config),
         "rosa_config": asdict(effective),
@@ -171,6 +174,10 @@ def _state_dict_has_rosa(state_dict: Mapping | None) -> bool | None:
 
 def _topology_signature(config) -> tuple:
     return tuple(getattr(config, name) for name in _ROSA_TOPOLOGY_FIELDS)
+
+
+def _geometry_signature(config) -> tuple:
+    return tuple(getattr(config, name) for name in _ROSA_GEOMETRY_FIELDS)
 
 
 def _validate_checkpoint_contract(
@@ -236,6 +243,12 @@ def _validate_checkpoint_contract(
                 mismatches.append(
                     "ROSA learned topology differs from the checkpoint"
                 )
+            if _geometry_signature(source_effective) != _geometry_signature(
+                effective
+            ):
+                mismatches.append(
+                    "ROSA box-coordinate geometry differs from the checkpoint"
+                )
     elif (
         target_has_rosa
         and metadata.get("architecture") == _KNOWN_RELEASE_ARCHITECTURE
@@ -278,8 +291,19 @@ def train(args: argparse.Namespace, config: Config) -> None:
         config.optim_wrapper.type = "AmpOptimWrapper"
         config.optim_wrapper.setdefault("loss_scale", "dynamic")
     runner = Runner.from_cfg(config)
-    metadata = _checkpoint_contract_metadata(config)
-    if metadata is not None:
+    provenance = None
+    if getattr(runner, "rank", 0) == 0:
+        from rosa.provenance import capture_external_provenance
+
+        provenance = capture_external_provenance(
+            Path(__file__).resolve().parents[1],
+            runner.work_dir,
+        )
+    metadata = _checkpoint_contract_metadata(config) or {}
+    if provenance is not None:
+        metadata["external_provenance"] = provenance
+        metadata["source_revision"] = provenance["source_revision"]
+    if metadata:
         runner.register_hook(
             _CheckpointContractHook(metadata),
             priority="VERY_LOW",

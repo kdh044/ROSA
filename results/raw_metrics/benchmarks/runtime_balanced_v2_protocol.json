@@ -1,0 +1,22 @@
+{
+  "status": "preliminary_latency_only",
+  "source_revision": "062d236",
+  "external_provenance": null,
+  "weights": "random_initialization",
+  "accuracy_admissible": false,
+  "config": "/home/airlab/user/kdh/ROSA/configs/rosa_r18_main126_v2.py",
+  "profile": "balanced",
+  "checkpoint": null,
+  "warmup_iterations": 20,
+  "measured_iterations": 100,
+  "samples": 400,
+  "mean_batch_size": 4.0,
+  "mean_iteration_ms": 105.34762949158903,
+  "median_iteration_ms": 105.64680100651458,
+  "p95_iteration_ms": 113.00671100616455,
+  "mean_latency_per_sample_ms": 26.336907372897258,
+  "samples_per_second": 37.96953020494268,
+  "peak_cuda_memory_mib": 2734.80615234375,
+  "parameter_count": 29787659,
+  "trainable_parameter_count": 29710730
+}

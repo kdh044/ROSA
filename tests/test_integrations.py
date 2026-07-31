@@ -1,7 +1,10 @@
 from __future__ import annotations
 
-import importlib
+import os
+from pathlib import Path
+import subprocess
 import sys
+import textwrap
 
 import pytest
 import torch
@@ -16,14 +19,82 @@ from rosa.integrations.sparse4d_runtime import (
 )
 from rosa.integrations.sparse4d_scores import (
     compose_quality_rank,
+    decode_frozen_jointscore_rank,
     stable_joint_probability,
 )
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_integration_package_does_not_eagerly_import_sparse4d():
-    package = importlib.import_module("rosa.integrations")
-    assert package.__name__ == "rosa.integrations"
-    assert "rosa.integrations.sparse4d" not in sys.modules
+    code = textwrap.dedent(
+        """
+        import sys
+        import rosa.integrations
+
+        assert rosa.integrations.__name__ == "rosa.integrations"
+        assert "rosa.integrations.sparse4d" not in sys.modules
+        """
+    )
+    environment = os.environ.copy()
+    pythonpath = [str(ROOT / "src")]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_gravity_center_keypoints_are_symmetric_about_anchor_z():
+    host = ROOT / "external" / "detector_host"
+    if not host.is_dir():
+        pytest.skip("optional Sparse4D detector host is not available")
+    code = textwrap.dedent(
+        """
+        import torch
+        from rosa.integrations.sparse4d import ROSANormalizedKeyPointsGenerator
+
+        generator = ROSANormalizedKeyPointsGenerator(
+            embed_dims=16,
+            num_learnable_pts=0,
+            fix_scale=((0.0, 0.0, 0.0),
+                       (0.0, 0.0, 0.45),
+                       (0.0, 0.0, -0.45)),
+            anchor_z_is_bottom=False,
+        )
+        anchor = torch.zeros(1, 1, 11)
+        anchor[..., :3] = torch.tensor((3.0, -2.0, -1.3))
+        anchor[..., 3:6] = torch.log(torch.tensor((2.0, 4.0, 1.6)))
+        anchor[..., 7] = 1.0
+        points = generator(anchor)
+        torch.testing.assert_close(points[..., 0, :], anchor[..., :3])
+        upper = points[..., 1, 2] - anchor[..., 2]
+        lower = points[..., 2, 2] - anchor[..., 2]
+        torch.testing.assert_close(upper, -lower)
+        """
+    )
+    environment = os.environ.copy()
+    pythonpath = [str(ROOT / "src"), str(host)]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_released_config_aliases_keep_legacy_projection_default():
@@ -147,3 +218,92 @@ def test_zero_quality_delta_is_exact_native_joint_score():
         rank["effective_delta"],
     ).sum().backward()
     assert delta.grad is not None
+
+
+class _IdentityBoxDecoder:
+    selection_score_mode = "legacy"
+    sorted = True
+    num_output = 3
+    score_threshold = None
+
+    @staticmethod
+    def decode_box(boxes):
+        return boxes
+
+
+def test_quality_residual_changes_only_query_ranking_at_inference():
+    classification = torch.tensor(
+        [[[2.0, -1.0], [-1.0, 1.5], [1.0, -2.0]]]
+    )
+    native_quality = torch.zeros(1, 3, 1)
+    boxes = torch.arange(33, dtype=torch.float32).reshape(1, 3, 11)
+    instance_id = torch.tensor(((10, 20, 30),))
+    supported = torch.ones(1, 3, dtype=torch.bool)
+    classification_before = classification.clone()
+    quality_before = native_quality.clone()
+
+    native = compose_quality_rank(
+        classification,
+        native_quality,
+        torch.zeros(1, 3, 1),
+        supported,
+        centerness_index=0,
+    )
+    reranked = compose_quality_rank(
+        classification,
+        native_quality,
+        torch.tensor([[[0.0], [1.0], [0.0]]]),
+        supported,
+        centerness_index=0,
+    )
+    decoder = _IdentityBoxDecoder()
+    native_result = decode_frozen_jointscore_rank(
+        decoder,
+        [classification],
+        [boxes],
+        native["frozen_label"],
+        native["native_selected_probability"],
+        native["emitted_joint_score"],
+        instance_id=instance_id,
+        output_idx=0,
+    )[0]
+    reranked_result = decode_frozen_jointscore_rank(
+        decoder,
+        [classification],
+        [boxes],
+        reranked["frozen_label"],
+        reranked["native_selected_probability"],
+        reranked["emitted_joint_score"],
+        instance_id=instance_id,
+        output_idx=0,
+    )[0]
+
+    assert torch.equal(classification, classification_before)
+    assert torch.equal(native_quality, quality_before)
+    assert not torch.equal(
+        native_result["query_indices"],
+        reranked_result["query_indices"],
+    )
+    for query_index in range(3):
+        native_position = (
+            native_result["query_indices"] == query_index
+        ).nonzero(as_tuple=True)[0]
+        reranked_position = (
+            reranked_result["query_indices"] == query_index
+        ).nonzero(as_tuple=True)[0]
+        assert torch.equal(
+            native_result["boxes_3d"][native_position],
+            reranked_result["boxes_3d"][reranked_position],
+        )
+        assert torch.equal(
+            native_result["labels_3d"][native_position],
+            reranked_result["labels_3d"][reranked_position],
+        )
+        assert torch.equal(
+            native_result["cls_scores"][native_position],
+            reranked_result["cls_scores"][reranked_position],
+        )
+        assert torch.equal(
+            native_result["instance_ids"][native_position],
+            reranked_result["instance_ids"][reranked_position],
+        )

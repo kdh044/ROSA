@@ -1,0 +1,93 @@
+{
+  "status": "verified",
+  "checked_utc": "2026-07-31T09:43:05Z",
+  "protocol": "Fisheye3DOD Main126",
+  "coordinate_contract": "gravity_center",
+  "class_order": [
+    "Car",
+    "Van",
+    "Truck",
+    "Bus",
+    "Pedestrian",
+    "Cyclist"
+  ],
+  "train": {
+    "annotation_sha256": "48219ed88de7c7e6f8c2af4d251573bf93d0e69fedf835696de1680076c32a9c",
+    "frames": 8820,
+    "scenes": 126,
+    "frames_per_scene": 70,
+    "unique_tokens": 8820,
+    "camera_images": 35280,
+    "unique_camera_images": 35280,
+    "raw_gt": {
+      "Car": 33300,
+      "Van": 6382,
+      "Truck": 5234,
+      "Bus": 1323,
+      "Pedestrian": 9493,
+      "Cyclist": 6246,
+      "total": 61978
+    },
+    "official_range_gt": {
+      "Car": 27433,
+      "Van": 5168,
+      "Truck": 3952,
+      "Bus": 1051,
+      "Pedestrian": 8627,
+      "Cyclist": 5639,
+      "total": 51870
+    }
+  },
+  "validation": {
+    "annotation_sha256": "efafe89c6dc34d116f0ce01fa818505a6387248d9a3ca6dcac035418a664da6f",
+    "frames": 3906,
+    "scenes": 126,
+    "frames_per_scene": 31,
+    "unique_tokens": 3906,
+    "camera_images": 15624,
+    "unique_camera_images": 15624,
+    "raw_gt": {
+      "Car": 14566,
+      "Van": 2438,
+      "Truck": 2393,
+      "Bus": 608,
+      "Pedestrian": 4027,
+      "Cyclist": 3040,
+      "total": 27072
+    },
+    "official_range_gt": {
+      "Car": 11818,
+      "Van": 2007,
+      "Truck": 1835,
+      "Bus": 433,
+      "Pedestrian": 3692,
+      "Cyclist": 2711,
+      "total": 22496
+    }
+  },
+  "cross_split": {
+    "scene_overlap": 126,
+    "scene_union": 126,
+    "camera_image_overlap": 0,
+    "interpretation": "The released split is frame-disjoint but not scene-disjoint."
+  },
+  "anchor_asset": {
+    "sha256": "2a08ac6a28b6eb519e59e9d9c16bae009184785f2b8745cd857576a28496b812",
+    "shape": [
+      300,
+      11
+    ]
+  },
+  "range_filter": {
+    "distance": "sqrt(x^2 + y^2)",
+    "comparison": "strict_less_than",
+    "meters": {
+      "Car": 48,
+      "Van": 48,
+      "Truck": 48,
+      "Bus": 48,
+      "Pedestrian": 36,
+      "Cyclist": 42
+    }
+  }
+}

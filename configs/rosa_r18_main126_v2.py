@@ -17,15 +17,15 @@ model = dict(
         ),
         instance_bank=dict(
             anchor_handler=dict(
-                type="ROSANormalizedBottomKeyPointsGenerator",
-                anchor_z_is_bottom=True,
+                type="ROSANormalizedKeyPointsGenerator",
+                anchor_z_is_bottom=False,
             ),
         ),
         deformable_model=dict(
             type="ROSAFullFOVDeformableFeatureAggregation",
             kps_generator=dict(
-                type="ROSANormalizedBottomKeyPointsGenerator",
-                anchor_z_is_bottom=True,
+                type="ROSANormalizedKeyPointsGenerator",
+                anchor_z_is_bottom=False,
             ),
         ),
         loss_reg=dict(type="ROSAEvaluatorAlignedSparseBox3DLoss"),
@@ -78,7 +78,7 @@ experiment_contract = dict(
     projection_contract="full_fov",
     native_projection_contract="full_fov",
     normalized_sampling_yaw=True,
-    anchor_z_is_bottom=True,
+    anchor_z_convention="gravity_center",
     centerness_target="detached_evaluator_xy",
     train_gt_range="official_class_radial_strict",
 )

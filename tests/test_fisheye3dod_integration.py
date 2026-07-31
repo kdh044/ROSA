@@ -9,6 +9,13 @@ from rosa.integrations.fisheye3dod.calibration import (
     convert_ocamcamera,
     project_rosa_compatible_numpy,
 )
+from rosa.integrations.fisheye3dod.constants import (
+    EXPECTED_SCENES,
+    EXPECTED_TRAIN_FRAMES,
+    EXPECTED_TRAIN_FRAMES_PER_SCENE,
+    EXPECTED_VAL_FRAMES,
+    EXPECTED_VAL_FRAMES_PER_SCENE,
+)
 from rosa.integrations.fisheye3dod.dataset import (
     Fisheye3DODEvaluatorRangeFilter,
 )
@@ -83,4 +90,29 @@ def test_evaluator_range_filter_matches_strict_class_radial_contract():
     torch.testing.assert_close(
         filtered["gt_bboxes_3d"].tensor[:, :3],
         raw[[0, 3, 5], :3],
+    )
+
+
+def test_main126_raw_z_is_restored_as_gravity_center():
+    raw = torch.tensor(
+        [[4.0, -2.0, -1.3, 2.0, 4.0, 1.6, 0.0]],
+    )
+    boxes = LiDARInstance3DBoxes(
+        raw,
+        origin=(0.5, 0.5, 0.5),
+    )
+
+    # MMDetection3D stores LiDAR boxes at bottom center internally, while the
+    # released Main126 pickle declares its input at the gravity center.
+    torch.testing.assert_close(boxes.tensor[:, 2], raw[:, 2] - raw[:, 5] * 0.5)
+    torch.testing.assert_close(boxes.gravity_center, raw[:, :3])
+
+
+def test_main126_split_totals_match_the_released_scene_contract():
+    assert EXPECTED_SCENES == 126
+    assert EXPECTED_TRAIN_FRAMES == (
+        EXPECTED_SCENES * EXPECTED_TRAIN_FRAMES_PER_SCENE
+    )
+    assert EXPECTED_VAL_FRAMES == (
+        EXPECTED_SCENES * EXPECTED_VAL_FRAMES_PER_SCENE
     )
