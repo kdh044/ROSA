@@ -56,6 +56,7 @@ custom_imports = dict(
     imports=[
         "projects.mmdet3d_plugin",
         "rosa.integrations.sparse4d",
+        "rosa.integrations.optim",
         "rosa.integrations.fisheye3dod.dataset",
         "rosa.integrations.fisheye3dod.model",
         "rosa.integrations.fisheye3dod.metric",

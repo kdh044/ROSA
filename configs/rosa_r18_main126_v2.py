@@ -32,6 +32,23 @@ model = dict(
     )
 )
 
+optim_wrapper = dict(
+    _delete_=True,
+    type="ROSAPairedClipOptimWrapper",
+    optimizer=dict(type="AdamW", lr=2e-4, weight_decay=0.001),
+    paramwise_cfg=dict(
+        custom_keys={
+            "img_backbone": dict(lr_mult=0.5),
+            "head.rosa_refiner": dict(rosa_sidecar=True),
+        }
+    ),
+    clip_grad=dict(
+        max_norm=25,
+        norm_type=2,
+        error_if_nonfinite=True,
+    ),
+)
+
 train_dataloader = dict(
     dataset=dict(
         pipeline=[
