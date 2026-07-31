@@ -44,6 +44,7 @@ from ..refiner import ROSAConfig, ROSARefiner
 from .sparse4d_losses import (
     evaluator_aligned_centerness_target,
     rosa_losses,
+    validate_centerness_target_mode,
 )
 from .sparse4d_runtime import (
     SingleCallCapture,
@@ -188,6 +189,17 @@ class ROSAFullFOVDeformableFeatureAggregation(DeformableFeatureAggregation):
 class ROSAEvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
     """Sparse4D box loss with a detached BEV-centerness target."""
 
+    def __init__(
+        self,
+        *args,
+        centerness_target_mode: str = "exp_bev",
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self.centerness_target_mode = validate_centerness_target_mode(
+            centerness_target_mode
+        )
+
     def forward(
         self,
         box: Tensor,
@@ -215,6 +227,7 @@ class ROSAEvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
         centerness_target = evaluator_aligned_centerness_target(
             box,
             box_target,
+            mode=self.centerness_target_mode,
         )
         output[f"loss_cns{suffix}"] = self.loss_cns(
             centerness,

@@ -18,11 +18,26 @@ from .sparse4d_scores import (
 _SIZE = slice(3, 6)
 _YAW = slice(6, 8)
 _BEV_THRESHOLDS = OFFICIAL_AP_DISTANCES
+_CENTERNESS_TARGET_MODES = frozenset(("exp_bev", "strict_ap_fraction"))
+
+
+def validate_centerness_target_mode(mode: str) -> str:
+    """Validate the opt-in native centerness supervision contract."""
+
+    mode = str(mode)
+    if mode not in _CENTERNESS_TARGET_MODES:
+        raise ValueError(
+            "centerness_target_mode must be one of "
+            f"{sorted(_CENTERNESS_TARGET_MODES)}, got {mode!r}"
+        )
+    return mode
 
 
 def evaluator_aligned_centerness_target(
     prediction: Tensor,
     target: Tensor,
+    *,
+    mode: str = "exp_bev",
 ) -> Tensor:
     """Return a detached score target based on the evaluator's BEV distance."""
 
@@ -36,7 +51,18 @@ def evaluator_aligned_centerness_target(
         target[..., :2] - prediction[..., :2],
         dim=-1,
     )
-    return torch.exp(-distance).detach()
+    mode = validate_centerness_target_mode(mode)
+    if mode == "exp_bev":
+        return torch.exp(-distance).detach()
+    return (
+        torch.stack(
+            [distance.lt(threshold) for threshold in _BEV_THRESHOLDS],
+            dim=-1,
+        )
+        .to(dtype=prediction.dtype)
+        .mean(dim=-1)
+        .detach()
+    )
 
 
 def evaluator_aligned_quality_target(
@@ -647,4 +673,5 @@ __all__ = [
     "evaluator_aligned_centerness_target",
     "evaluator_aligned_quality_target",
     "rosa_losses",
+    "validate_centerness_target_mode",
 ]
