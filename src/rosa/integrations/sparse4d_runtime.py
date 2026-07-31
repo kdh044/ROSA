@@ -132,7 +132,21 @@ def restore_fpn(feature_maps) -> list[Tensor]:
                 raise RuntimeError(
                     f"camera FPN shapes disagree at level {level}: " f"{sorted(shapes)}"
                 )
-            restored.append(torch.cat([group[level] for group in camera_groups], dim=1))
+            # Equal camera shapes are packed as one group by Sparse4D.  Its
+            # inverse formatter already returns the required [B,C,D,H,W]
+            # tensor as a strided view of the packed feature storage.  Calling
+            # ``cat`` on that single tensor would materialize every dense FPN
+            # level again solely to make it contiguous.  Both ROSA samplers
+            # accept the inverse formatter's strides, so retain the view and
+            # reserve concatenation for the heterogeneous multi-group case.
+            restored.append(
+                camera_groups[0][level]
+                if len(camera_groups) == 1
+                else torch.cat(
+                    [group[level] for group in camera_groups],
+                    dim=1,
+                )
+            )
         return restored
     raise TypeError("unsupported Sparse4D FPN representation")
 

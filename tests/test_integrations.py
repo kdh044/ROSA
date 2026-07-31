@@ -236,6 +236,100 @@ def test_fpn_detach_accepts_framework_neutral_level_tensors():
     assert all(not value.requires_grad and value.grad_fn is None for value in restored)
 
 
+def test_packed_fpn_restore_is_zero_copy_and_sampler_equivalent():
+    host = ROOT / "external" / "detector_host"
+    if not host.is_dir():
+        pytest.skip("optional Sparse4D detector host is not available")
+    code = textwrap.dedent(
+        """
+        import torch
+
+        from projects.mmdet3d_plugin.ops import feature_maps_format
+        from rosa.integrations.sparse4d_runtime import detached_fpn, restore_fpn
+        from rosa.sampling import (
+            DeterministicBilinearSampler,
+            FusedBilinearSampler,
+        )
+
+        torch.manual_seed(19)
+        batch, cameras, channels = 2, 4, 7
+        levels = [
+            torch.randn(batch, cameras, channels, height, width)
+            for height, width in ((9, 11), (5, 7), (3, 4), (2, 2))
+        ]
+        packed = feature_maps_format(levels)
+        restored = restore_fpn(packed)
+        detached = detached_fpn(packed)
+        packed_pointer = packed[0].untyped_storage().data_ptr()
+
+        assert len(restored) == len(levels)
+        for source, view, detached_view in zip(levels, restored, detached):
+            assert torch.equal(view, source)
+            assert view.untyped_storage().data_ptr() == packed_pointer
+            assert detached_view.untyped_storage().data_ptr() == packed_pointer
+            assert not detached_view.requires_grad
+            assert detached_view.grad_fn is None
+            flattened = view.reshape(
+                batch * cameras,
+                channels,
+                *view.shape[-2:],
+            )
+            assert flattened.untyped_storage().data_ptr() == packed_pointer
+
+        uv = torch.rand(batch, 6, cameras, 1, 5, 2) * 1.4 - 0.2
+        uv[0, 0, 0, 0, 0] = torch.tensor((float("nan"), float("inf")))
+        for sampler in (
+            FusedBilinearSampler(),
+            DeterministicBilinearSampler(),
+        ):
+            for view in restored:
+                contiguous = view.contiguous()
+                expected = sampler(contiguous, uv)
+                actual = sampler(view, uv)
+                assert torch.equal(actual, expected)
+
+        # The production boundary detaches packed FPN features.  Also prove
+        # that the deterministic fallback preserves the semantic feature
+        # gradient if a future caller intentionally keeps that boundary live.
+        sampler = DeterministicBilinearSampler()
+        for level_index, restored_level in enumerate(restored):
+            contiguous = restored_level.detach().clone().requires_grad_(True)
+            packed_values = packed[0].detach().clone().requires_grad_(True)
+            packed_level = restore_fpn(
+                (packed_values, packed[1], packed[2])
+            )[level_index]
+            weight = torch.randn(
+                batch,
+                6,
+                cameras,
+                1,
+                5,
+                channels,
+            )
+            (sampler(contiguous, uv) * weight).sum().backward()
+            (sampler(packed_level, uv) * weight).sum().backward()
+            packed_gradient = restore_fpn(
+                (packed_values.grad, packed[1], packed[2])
+            )[level_index]
+            assert torch.equal(packed_gradient, contiguous.grad)
+        """
+    )
+    environment = os.environ.copy()
+    pythonpath = [str(ROOT / "src"), str(host)]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_legacy_checkpoint_prefix_remaps_without_overwriting_modern_key():
     old_weight = torch.tensor([1.0])
     modern_weight = torch.tensor([2.0])
