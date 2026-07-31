@@ -4,11 +4,13 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 
 pytest.importorskip("mmengine")
 from mmengine.config import Config
+from mmengine.logging.history_buffer import HistoryBuffer
 
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -57,6 +59,36 @@ def test_checkpoint_contract_accepts_matching_release(tmp_path: Path):
             "architecture": "ROSA R18 Main126",
             "projection_contract": "legacy_front_only",
         },
+    )
+
+    run_tool._validate_checkpoint_contract(
+        checkpoint,
+        _config("published"),
+        allow_mismatch=False,
+    )
+
+
+def test_checkpoint_contract_reads_mmengine_history_without_unsafe_pickle(
+    tmp_path: Path,
+):
+    checkpoint = tmp_path / "mmengine_checkpoint.pth"
+    torch.save(
+        {
+            "state_dict": {
+                "head.canonical_sixth_block.rosa.weight": torch.ones(1)
+            },
+            "meta": {
+                "architecture": "ROSA R18 Main126",
+                "projection_contract": "legacy_front_only",
+            },
+            "message_hub": {
+                "loss": HistoryBuffer(
+                    log_history=[np.float64(1.25)],
+                    count_history=[np.int64(1)],
+                )
+            },
+        },
+        checkpoint,
     )
 
     run_tool._validate_checkpoint_contract(

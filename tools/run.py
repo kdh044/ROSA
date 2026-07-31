@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import builtins
 from collections.abc import Mapping
 from dataclasses import asdict
 import json
@@ -13,9 +14,11 @@ import statistics
 import time
 import warnings
 
+import numpy as np
 import torch
 from mmengine.config import Config, DictAction
 from mmengine.hooks import Hook
+from mmengine.logging.history_buffer import HistoryBuffer
 from mmengine.model import is_model_wrapper
 from mmengine.runner import Runner
 
@@ -172,6 +175,53 @@ def _state_dict_has_rosa(state_dict: Mapping | None) -> bool | None:
     )
 
 
+def _load_checkpoint_without_executing_code(checkpoint_path: Path):
+    """Load MMEngine checkpoints with a narrow weights-only allowlist."""
+
+    try:
+        from numpy._core.multiarray import _reconstruct, scalar
+    except ImportError:  # pragma: no cover - NumPy 1.x compatibility
+        from numpy.core.multiarray import _reconstruct, scalar
+
+    dtype_specs = (
+        "bool",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "float16",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+        "datetime64",
+        "timedelta64",
+        "object",
+        "str",
+        "bytes",
+    )
+    dtype_classes = {type(np.dtype(specification)) for specification in dtype_specs}
+    safe_globals = [
+        HistoryBuffer,
+        np.ndarray,
+        np.dtype,
+        _reconstruct,
+        scalar,
+        builtins.getattr,
+        *dtype_classes,
+    ]
+    with torch.serialization.safe_globals(safe_globals):
+        return torch.load(
+            checkpoint_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+
+
 def _topology_signature(config) -> tuple:
     return tuple(getattr(config, name) for name in _ROSA_TOPOLOGY_FIELDS)
 
@@ -188,11 +238,7 @@ def _validate_checkpoint_contract(
 ) -> None:
     """Reject silent evaluation under a different projection/topology."""
 
-    checkpoint = torch.load(
-        checkpoint_path,
-        map_location="cpu",
-        weights_only=True,
-    )
+    checkpoint = _load_checkpoint_without_executing_code(checkpoint_path)
     if not isinstance(checkpoint, Mapping):
         return
     metadata = checkpoint.get("meta")
