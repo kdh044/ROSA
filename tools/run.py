@@ -363,6 +363,11 @@ def evaluate(args: argparse.Namespace, config: Config) -> None:
         config,
         allow_mismatch=args.allow_checkpoint_contract_mismatch,
     )
+    # The contract check above has already parsed the checkpoint with a narrow
+    # weights-only allowlist. MMEngine still calls torch.load without an
+    # explicit weights_only argument, whose PyTorch 2.6+ default cannot restore
+    # MMEngine's HistoryBuffer state. Permit that second, trusted local load.
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
     config.load_from = str(args.checkpoint.resolve())
     config.resume = False
     if args.dump:

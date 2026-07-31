@@ -224,3 +224,59 @@ def test_fast_compile_supports_alias_and_is_idempotent():
 def test_non_fast_profile_is_not_compiled():
     runner = SimpleNamespace(model=SimpleNamespace())
     assert not run_tool._compile_fast_inference(runner, _config("balanced"))
+
+
+def test_evaluate_enables_trusted_mmengine_checkpoint_load(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    checkpoint = tmp_path / "checkpoint.pth"
+    checkpoint.touch()
+    config = Config(
+        {
+            "test_evaluator": {"type": "ToyMetric"},
+            "model": {"head": {"type": "Sparse4DHead"}},
+        }
+    )
+    args = SimpleNamespace(
+        checkpoint=checkpoint,
+        allow_checkpoint_contract_mismatch=False,
+        dump=None,
+    )
+    calls = []
+
+    class FakeRunner:
+        @classmethod
+        def from_cfg(cls, received_config):
+            assert (
+                run_tool.os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] == "1"
+            )
+            calls.append(("build", received_config.load_from))
+            return cls()
+
+        def load_or_resume(self):
+            calls.append(("load", None))
+
+        def test(self):
+            calls.append(("test", None))
+
+    monkeypatch.delenv("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", raising=False)
+    monkeypatch.setattr(
+        run_tool,
+        "_validate_checkpoint_contract",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(run_tool, "Runner", FakeRunner)
+    monkeypatch.setattr(
+        run_tool,
+        "_compile_fast_inference",
+        lambda *args, **kwargs: False,
+    )
+
+    run_tool.evaluate(args, config)
+
+    assert calls == [
+        ("build", str(checkpoint.resolve())),
+        ("load", None),
+        ("test", None),
+    ]
