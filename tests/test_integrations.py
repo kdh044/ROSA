@@ -97,6 +97,61 @@ def test_gravity_center_keypoints_are_symmetric_about_anchor_z():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_compact_sidecar_preserves_paired_native_initialization_and_rng():
+    host = ROOT / "external" / "detector_host"
+    if not host.is_dir():
+        pytest.skip("optional Sparse4D detector host is not available")
+    code = textwrap.dedent(
+        """
+        import random
+        import numpy as np
+        import torch
+        from mmengine.config import Config
+        from mmengine.utils import import_modules_from_strings
+        from mmdet3d.registry import MODELS
+        from mmdet3d.utils import register_all_modules
+
+        register_all_modules(init_default_scope=True)
+
+        def build(config_name):
+            random.seed(3407)
+            np.random.seed(3407)
+            torch.manual_seed(3407)
+            config = Config.fromfile("configs/" + config_name)
+            import_modules_from_strings(**config.custom_imports)
+            model = MODELS.build(config.model)
+            model.init_weights()
+            return model, torch.get_rng_state().clone()
+
+        baseline, baseline_rng = build("rosa_r18_main126_v2_b0_native.py")
+        rosa, rosa_rng = build("rosa_r18_main126_v2.py")
+        baseline_state = baseline.state_dict()
+        rosa_state = rosa.state_dict()
+        common = set(baseline_state).intersection(rosa_state)
+        assert common
+        assert all(
+            torch.equal(baseline_state[name], rosa_state[name])
+            for name in common
+        )
+        torch.testing.assert_close(baseline_rng, rosa_rng, rtol=0, atol=0)
+        """
+    )
+    environment = os.environ.copy()
+    pythonpath = [str(ROOT / "src"), str(host)]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_released_config_aliases_keep_legacy_projection_default():
     config = ROSAConfig.from_mapping(
         {

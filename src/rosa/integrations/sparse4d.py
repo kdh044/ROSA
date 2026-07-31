@@ -306,7 +306,19 @@ class ROSARefinementHead(Sparse4DHead):
             raise ValueError("legacy host config projection disagrees with Sparse4D")
 
         self.rosa_cfg = config
-        self.rosa_refiner = ROSARefiner(config, projection_type=projection_type)
+        if config.architecture_profile == "compact":
+            # A sidecar must not advance the native detector's construction
+            # RNG stream. This keeps paired B0/ROSA initialization exact.
+            with torch.random.fork_rng(devices=[]):
+                self.rosa_refiner = ROSARefiner(
+                    config,
+                    projection_type=projection_type,
+                )
+        else:
+            self.rosa_refiner = ROSARefiner(
+                config,
+                projection_type=projection_type,
+            )
         self.inference_output_decoder_index = _ROSA_OUTPUT
         self.inference_classification_decoder_index = _ROSA_OUTPUT
         self.inference_quality_decoder_index = _ROSA_OUTPUT
@@ -379,7 +391,13 @@ class ROSARefinementHead(Sparse4DHead):
 
     def init_weights(self) -> None:
         Sparse4DHead.init_weights(self)
-        self.rosa_refiner.reset_parameters()
+        if self.rosa_cfg.architecture_profile == "compact":
+            # Refiner initialization is reproducible while leaving the native
+            # dropout RNG stream bitwise paired with the sidecar-free B0 arm.
+            with torch.random.fork_rng(devices=[]):
+                self.rosa_refiner.reset_parameters()
+        else:
+            self.rosa_refiner.reset_parameters()
 
     def _load_from_state_dict(
         self,
