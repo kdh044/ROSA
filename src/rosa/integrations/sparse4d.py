@@ -794,6 +794,78 @@ class ROSANativeBaselineHead(Sparse4DHead):
         super().__init__(**kwargs)
 
 
+@MODELS.register_module()
+class ROSAOfficialResidualNativeBaselineHead(ROSANativeBaselineHead):
+    """Restore Sparse4D's released residual around query self-attention.
+
+    The detector host ports MMCV's ``MultiheadAttention`` wrapper to
+    ``torch.nn.MultiheadAttention``.  The inner PyTorch module returns only
+    the attention branch, whereas the released MMCV wrapper returns
+    ``identity + dropout(attention)``.  This override restores that stateless
+    wrapper operation without changing the host dependency or adding a module,
+    parameter, buffer, or user-facing numeric setting.
+    """
+
+    def graph_model(
+        self,
+        index,
+        query,
+        key=None,
+        value=None,
+        query_pos=None,
+        key_pos=None,
+        **kwargs,
+    ):
+        if self.decouple_attn:
+            query = torch.cat([query, query_pos], dim=-1)
+            if key is not None:
+                key = torch.cat([key, key_pos], dim=-1)
+            query_pos, key_pos = None, None
+        if value is not None:
+            value = self.fc_before(value)
+
+        layer = self.layers[index]
+        if not isinstance(layer, torch.nn.MultiheadAttention):
+            raise TypeError(
+                "official Sparse4D residual canary requires the audited "
+                "torch.nn.MultiheadAttention host port"
+            )
+        if not layer.batch_first:
+            raise RuntimeError(
+                "official Sparse4D residual canary requires batch_first=True"
+            )
+        if query_pos is not None or key_pos is not None:
+            raise RuntimeError(
+                "the non-decoupled positional-attention path is outside the "
+                "Main126 C32 contract"
+            )
+
+        if key is None:
+            key = query
+        if value is None:
+            value = key
+        allowed = {"attn_mask", "key_padding_mask"}
+        unexpected = sorted(set(kwargs).difference(allowed))
+        if unexpected:
+            raise TypeError(f"unsupported attention arguments: {unexpected}")
+        attention, _ = layer(
+            query,
+            key,
+            value,
+            attn_mask=kwargs.get("attn_mask"),
+            key_padding_mask=kwargs.get("key_padding_mask"),
+        )
+        # MMCV's deprecated ``dropout`` argument configures both the inner
+        # attention-probability dropout and this residual-branch dropout.
+        # Reuse the already-fixed host value; do not introduce another knob.
+        attention = F.dropout(
+            attention,
+            p=float(layer.dropout),
+            training=self.training,
+        )
+        return self.fc_after(query + attention)
+
+
 # The released configs used this type string.  It resolves to the same direct
 # Sparse4DHead subclass and does not reintroduce the V15/V17 inheritance tree.
 MODELS.register_module(name="ClosedLoopROSAHead", module=ROSARefinementHead)
@@ -805,6 +877,7 @@ __all__ = [
     "ROSAEvaluatorAlignedSparseBox3DLoss",
     "ROSAFullFOVDeformableFeatureAggregation",
     "ROSANativeBaselineHead",
+    "ROSAOfficialResidualNativeBaselineHead",
     "ROSANormalizedKeyPointsGenerator",
     "ROSARefinementHead",
 ]
