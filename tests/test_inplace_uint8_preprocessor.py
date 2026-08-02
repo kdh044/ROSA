@@ -64,16 +64,29 @@ def test_inplace_uint8_processing_fails_closed_outside_owned_ingress():
             torch.zeros(4, 3, 32, 32, dtype=torch.uint8)
         )
 
-    no_conversion = Fisheye3DODSingleFrameInplaceDataPreprocessor(
+    parent_no_conversion = Fisheye3DODSingleFrameDataPreprocessor(
         mean=(123.675, 116.28, 103.53),
         std=(58.395, 57.12, 57.375),
         bgr_to_rgb=False,
         pad_size_divisor=32,
     )
-    with pytest.raises(ValueError, match="BGR-to-RGB"):
-        no_conversion._process_img(
-            torch.zeros(1, 4, 3, 32, 32, dtype=torch.uint8)
-        )
+    candidate_no_conversion = Fisheye3DODSingleFrameInplaceDataPreprocessor(
+        mean=(123.675, 116.28, 103.53),
+        std=(58.395, 57.12, 57.375),
+        bgr_to_rgb=False,
+        pad_size_divisor=32,
+    )
+    rgb = torch.randint(
+        0,
+        256,
+        (1, 4, 3, 32, 32),
+        dtype=torch.uint8,
+        generator=torch.Generator().manual_seed(3407),
+    )
+    assert torch.equal(
+        candidate_no_conversion._process_img(rgb),
+        parent_no_conversion._process_img(rgb),
+    )
 
 
 def test_inplace_uint8_full_prediction_preprocessor_is_cpu_raw_bit_equal():

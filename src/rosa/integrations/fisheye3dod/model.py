@@ -79,11 +79,11 @@ class Fisheye3DODSingleFrameInplaceDataPreprocessor(
 ):
     """Normalize compact uint8 prediction images without a FP32 temporary.
 
-    This deployment-only path is sealed to the released BGR uint8 ingress.
-    Channel selection and ``float()`` therefore create fresh storage before
-    the in-place normalization; caller-owned input tensors are never mutated.
-    Training retains its separately validated preprocessor contract instead of
-    silently taking this runtime-only path.
+    This deployment-only path is sealed to released uint8 ingress.  Either a
+    fixed BGR-to-RGB flip or ``float()`` creates fresh storage before the
+    in-place normalization, so caller-owned input tensors are never mutated.
+    Training retains its separately validated preprocessor contract instead
+    of silently taking this runtime-only path.
     """
 
     def forward(self, data, training: bool = False):
@@ -107,17 +107,13 @@ class Fisheye3DODSingleFrameInplaceDataPreprocessor(
             raise ValueError(
                 "in-place uint8 preprocessing requires [B,camera,3,H,W] input"
             )
-        if not self._channel_conversion:
-            raise ValueError(
-                "in-place uint8 preprocessing requires fixed BGR-to-RGB conversion"
-            )
-
-        # Flipping the fixed three-channel axis allocates fresh uint8 storage
-        # without building an advanced-index kernel; float then allocates the
-        # model's FP32 input.  Normalizing that owned tensor in place removes
-        # the otherwise live input and subtraction temporaries while the
-        # division output is allocated.
-        img = img.flip(dims=(-3,)).float()
+        # For BGR ingress, flip allocates fresh uint8 storage without an
+        # advanced-index kernel.  For already-packed RGB, float itself owns
+        # fresh storage.  In both cases in-place normalization cannot mutate
+        # the caller's uint8 tensor.
+        if self._channel_conversion:
+            img = img.flip(dims=(-3,))
+        img = img.float()
         if self._enable_normalize:
             shape = [1] * (img.dim() - 3) + list(self.mean.shape)
             mean = self.mean.view(shape)
