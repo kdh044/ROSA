@@ -206,12 +206,8 @@ def _observation_reliability_context(
     anisotropy = geometry[..., 4]
     positive_inf = torch.full_like(anisotropy, float("inf"))
     negative_inf = torch.full_like(anisotropy, float("-inf"))
-    anisotropy_min = torch.where(
-        camera_valid, anisotropy, positive_inf
-    ).amin(dim=-1)
-    anisotropy_max = torch.where(
-        camera_valid, anisotropy, negative_inf
-    ).amax(dim=-1)
+    anisotropy_min = torch.where(camera_valid, anisotropy, positive_inf).amin(dim=-1)
+    anisotropy_max = torch.where(camera_valid, anisotropy, negative_inf).amax(dim=-1)
     anisotropy_gap = torch.where(
         valid_count > 1,
         anisotropy_max - anisotropy_min,
@@ -270,9 +266,9 @@ def _candidate_confidence(
     count = int(probabilities.shape[-1])
     if legacy:
         safe_probability = probabilities.clamp_min(1e-8)
-        entropy = -(
-            safe_probability * safe_probability.log()
-        ).sum(dim=-1) / math.log(count)
+        entropy = -(safe_probability * safe_probability.log()).sum(dim=-1) / math.log(
+            count
+        )
         center_probability = probabilities[..., count // 2]
         margin = probabilities.max(dim=-1).values - center_probability
         return entropy, margin
@@ -288,8 +284,7 @@ def _candidate_confidence(
     ).sum(dim=-1)
     entropy = torch.where(
         support_count > 1,
-        raw_entropy
-        / support_count.clamp_min(2).to(raw_entropy.dtype).log(),
+        raw_entropy / support_count.clamp_min(2).to(raw_entropy.dtype).log(),
         torch.zeros_like(raw_entropy),
     )
     supported_probability = torch.where(
@@ -340,10 +335,8 @@ class ROSARefiner(nn.Module):
             nn.Linear(hidden, dims),
             nn.SiLU(),
         )
-        make_head = (
-            lambda input_dims, output_dims: _make_compact_head(
-                input_dims, output_dims
-            )
+        make_head = lambda input_dims, output_dims: (
+            _make_compact_head(input_dims, output_dims)
             if config.architecture_profile == "compact"
             else _make_head(input_dims, hidden, output_dims)
         )
@@ -361,10 +354,7 @@ class ROSARefiner(nn.Module):
         self.center_gate_head = make_head(feedback_dims, 1)
         self.quality_head = (
             make_head(feedback_dims, 1)
-            if (
-                config.architecture_profile == "legacy"
-                or config.enable_quality_score
-            )
+            if (config.architecture_profile == "legacy" or config.enable_quality_score)
             else None
         )
         self.reset_parameters()
@@ -377,13 +367,13 @@ class ROSARefiner(nn.Module):
         released_heads = tuple(
             head
             for head in (
-            self.refinement_trunk,
-            self.shared_shape_head,
-            self.shared_tangent_head,
-            self.range_distribution_head,
-            self.candidate_head,
-            self.center_gate_head,
-            self.quality_head,
+                self.refinement_trunk,
+                self.shared_shape_head,
+                self.shared_tangent_head,
+                self.range_distribution_head,
+                self.candidate_head,
+                self.center_gate_head,
+                self.quality_head,
             )
             if head is not None
         )
@@ -447,9 +437,7 @@ class ROSARefiner(nn.Module):
             # Preserve the historical Tensor relation seen by local/global
             # hooks.  Ordinary hook-free execution uses the compact owned
             # ray/valid carrier and avoids two large 19-channel copies.
-            compact_relation=(
-                released_relation_surface and not relation_hooks_active
-            ),
+            compact_relation=(released_relation_surface and not relation_hooks_active),
         )
         private_prepared_inference = bool(
             observation_usage != "full"
@@ -557,9 +545,7 @@ class ROSARefiner(nn.Module):
         """Decode a posterior correction with an exact zero uniform prior."""
 
         if step > 0:
-            proposal_range = (
-                current_range * distribution_mean.exp()
-            ).clamp(
+            proposal_range = (current_range * distribution_mean.exp()).clamp(
                 min=self.cfg.min_candidate_range_m,
                 max=self.cfg.max_candidate_range_m,
             )
@@ -578,16 +564,9 @@ class ROSARefiner(nn.Module):
         if fixed_metric:
             return (posterior_residual * candidates.offsets).sum(dim=-1)
 
-        expected_sigma = (
-            posterior_residual
-            * sigma_points[None, None, :]
-        ).sum(dim=-1)
-        posterior_log_ratio = (
-            distribution_mean + distribution_std * expected_sigma
-        )
-        proposal_range = (
-            current_range * posterior_log_ratio.exp()
-        ).clamp(
+        expected_sigma = (posterior_residual * sigma_points[None, None, :]).sum(dim=-1)
+        posterior_log_ratio = distribution_mean + distribution_std * expected_sigma
+        proposal_range = (current_range * posterior_log_ratio.exp()).clamp(
             min=self.cfg.min_candidate_range_m,
             max=self.cfg.max_candidate_range_m,
         )
@@ -631,9 +610,7 @@ class ROSARefiner(nn.Module):
                     observation_usage,
                 )
                 candidate_features.append(observation.object_feature)
-                candidate_consistency.append(
-                    observation.cross_camera_consistency
-                )
+                candidate_consistency.append(observation.cross_camera_consistency)
                 candidate_supported.append(observation.supported)
 
             candidates = torch.stack(candidate_features, dim=2)
@@ -651,14 +628,11 @@ class ROSARefiner(nn.Module):
                     queries * candidate_count,
                     box_dims,
                 ),
-                (
-                    radial[:, :, None, :]
-                    * offsets[..., None]
-                ).reshape(batch, queries * candidate_count, 2),
+                (radial[:, :, None, :] * offsets[..., None]).reshape(
+                    batch, queries * candidate_count, 2
+                ),
             )
-            expanded_query = query[:, :, None, :].expand(
-                -1, -1, candidate_count, -1
-            )
+            expanded_query = query[:, :, None, :].expand(-1, -1, candidate_count, -1)
             geometry_anchor = (
                 candidate_anchor.detach()
                 if self.cfg.detach_candidate_geometry
@@ -790,9 +764,7 @@ class ROSARefiner(nn.Module):
         config = self.cfg
         geometry_base = current.detach()
         composition_base = (
-            current
-            if config.architecture_profile == "legacy"
-            else geometry_base
+            current if config.architecture_profile == "legacy" else geometry_base
         )
         lean_observation = bool(
             not materialize_diagnostics
@@ -868,9 +840,7 @@ class ROSARefiner(nn.Module):
         # Corrected profiles optimize each pass from a detached box. Published
         # training intentionally retains its historical step-2 gradient path.
         tangent_base = (
-            current
-            if config.architecture_profile == "legacy"
-            else geometry_base
+            current if config.architecture_profile == "legacy" else geometry_base
         )
         _, tangent = _radial_basis(tangent_base[..., :2])
         tangent_raw = self.shared_tangent_head(shared).squeeze(-1)
@@ -965,9 +935,7 @@ class ROSARefiner(nn.Module):
         if config.center_update_mode == "legacy_candidate_gate":
             radial_proposal = candidates.radial_delta
             radial_gate_logit = self.center_gate_head(feedback).squeeze(-1)
-            radial_gate = (
-                2.0 * torch.sigmoid(radial_gate_logit) - 1.0
-            ).clamp(0.0, 1.0)
+            radial_gate = (2.0 * torch.sigmoid(radial_gate_logit) - 1.0).clamp(0.0, 1.0)
         else:
             radial_proposal = self._posterior_radial_proposal(
                 candidates,
@@ -975,9 +943,7 @@ class ROSARefiner(nn.Module):
                 distribution_mean,
                 distribution_std,
                 sigma_points,
-                fixed_metric=(
-                    step == 0 and config.fixed_metric_radial_hypotheses
-                ),
+                fixed_metric=(step == 0 and config.fixed_metric_radial_hypotheses),
                 step=step,
             )
             radial_gate_logit = self.center_gate_head(feedback).squeeze(-1)
@@ -1016,19 +982,12 @@ class ROSARefiner(nn.Module):
             if config.yaw_gate_mode == "none":
                 yaw_gate = torch.ones_like(yaw_raw_delta)
             elif config.yaw_gate_mode == "support":
-                yaw_gate = observation.supported[..., None].to(
-                    yaw_raw_delta.dtype
-                )
+                yaw_gate = observation.supported[..., None].to(yaw_raw_delta.dtype)
             else:
                 anisotropy_gap = reliability_context[..., 3:4]
-                camera_count = (
-                    reliability_context[..., 1:2] * config.num_cameras
-                )
+                camera_count = reliability_context[..., 1:2] * config.num_cameras
                 overlap_gate = torch.sigmoid(
-                    (
-                        config.yaw_anisotropy_threshold
-                        - anisotropy_gap
-                    )
+                    (config.yaw_anisotropy_threshold - anisotropy_gap)
                     / config.yaw_anisotropy_temperature
                 )
                 yaw_gate = torch.where(
@@ -1044,15 +1003,11 @@ class ROSARefiner(nn.Module):
                 yaw_raw_delta = torch.where(
                     support, yaw_raw_delta, torch.zeros_like(yaw_raw_delta)
                 )
-                yaw_gate = torch.where(
-                    support, yaw_gate, torch.zeros_like(yaw_gate)
-                )
+                yaw_gate = torch.where(support, yaw_gate, torch.zeros_like(yaw_gate))
             yaw_delta = yaw_gate * yaw_raw_delta
             shape_anchor = _compose_yaw(shape_anchor, yaw_delta)
         updated = (
-            center_anchor
-            if legacy_yaw
-            else _compose_yaw(center_anchor, yaw_delta)
+            center_anchor if legacy_yaw else _compose_yaw(center_anchor, yaw_delta)
         )
         return _RefinementStep(
             base_anchor=geometry_base,
@@ -1162,8 +1117,7 @@ class ROSARefiner(nn.Module):
                 quality_delta = self.cfg.max_quality_delta_logit * quality_raw
                 if self.cfg.architecture_profile == "legacy":
                     quality_delta = (
-                        quality_delta
-                        * final.radial_gate.detach()[..., None]
+                        quality_delta * final.radial_gate.detach()[..., None]
                     )
             else:
                 quality_delta = quality_raw * 0.0
@@ -1211,12 +1165,8 @@ class ROSARefiner(nn.Module):
             distribution_mean=final.distribution_mean,
             distribution_std=final.distribution_std,
             candidate_offsets=final.candidates.offsets,
-            iteration_base_anchors=diagnostic_stack(
-                step.base_anchor for step in steps
-            ),
-            iteration_anchors=diagnostic_stack(
-                step.anchor for step in steps
-            ),
+            iteration_base_anchors=diagnostic_stack(step.base_anchor for step in steps),
+            iteration_anchors=diagnostic_stack(step.anchor for step in steps),
             iteration_distribution_mean=diagnostic_stack(
                 step.distribution_mean for step in steps
             ),
@@ -1238,24 +1188,18 @@ class ROSARefiner(nn.Module):
             iteration_radial_proposal=diagnostic_stack(
                 step.radial_proposal for step in steps
             ),
-            iteration_radial_gate=diagnostic_stack(
-                step.radial_gate for step in steps
-            ),
+            iteration_radial_gate=diagnostic_stack(step.radial_gate for step in steps),
             iteration_radial_gate_logit=diagnostic_stack(
                 step.radial_gate_logit for step in steps
             ),
-            iteration_radial_safe=diagnostic_stack(
-                step.radial_safe for step in steps
-            ),
+            iteration_radial_safe=diagnostic_stack(step.radial_safe for step in steps),
             iteration_tangent_delta=diagnostic_stack(
                 step.tangent_delta for step in steps
             ),
             iteration_yaw_raw_delta=diagnostic_stack(
                 step.yaw_raw_delta for step in steps
             ),
-            iteration_yaw_gate=diagnostic_stack(
-                step.yaw_gate for step in steps
-            ),
+            iteration_yaw_gate=diagnostic_stack(step.yaw_gate for step in steps),
             iteration_yaw_gate_logit=diagnostic_stack(
                 step.yaw_gate_logit for step in steps
             ),
@@ -1266,12 +1210,10 @@ class ROSARefiner(nn.Module):
                 step.reliability_context for step in steps
             ),
             iteration_camera_weight_mean=diagnostic_stack(
-                step.observation.camera_weight_mean.detach()
-                for step in steps
+                step.observation.camera_weight_mean.detach() for step in steps
             ),
             iteration_camera_geometry_summary=diagnostic_stack(
-                step.observation.camera_geometry_summary.detach()
-                for step in steps
+                step.observation.camera_geometry_summary.detach() for step in steps
             ),
         )
 
