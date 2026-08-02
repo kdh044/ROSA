@@ -10,8 +10,10 @@ import torch.nn.functional as F
 from torch.utils import _python_dispatch
 
 from . import geometry as _geometry
+from . import rfl as _rfl
 from .geometry import (
     _ocam_project_points_with_raw_camera_xyz,
+    _ocam_project_points_with_raw_camera_xyz_and_valid,
     ocam_full_fov_boundary,
     ocam_project_points,
     ocam_projection_scales,
@@ -36,12 +38,26 @@ def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
 _RELEASED_OBSERVATION_CAMERA_XYZ = _camera_xyz
 _RELEASED_OCAM_PROJECT_POINTS = ocam_project_points
 _RELEASED_OCAM_PROJECT_WITH_XYZ = _ocam_project_points_with_raw_camera_xyz
+_RELEASED_OCAM_PROJECT_WITH_XYZ_AND_VALID = (
+    _ocam_project_points_with_raw_camera_xyz_and_valid
+)
+_RELEASED_GEOMETRY_PROJECT_WITH_XYZ_AND_VALID = (
+    _geometry._ocam_project_points_with_raw_camera_xyz_and_valid
+)
 _RELEASED_GEOMETRY_CAMERA_XYZ = _geometry._camera_xyz
 _RELEASED_OCAM_PROJECT_IMPL = _geometry._ocam_project_points_impl
 _RELEASED_SANITIZE_CAMERA_XYZ = _geometry._sanitize_camera_xyz
 _RELEASED_SANITIZE_CAMERA_XYZ_REUSE = (
     _geometry._sanitize_camera_xyz_inference_storage_reuse
 )
+_RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
+_RELEASED_ALIAS_CHECK = getattr(torch._C, "_is_alias_of", None)
+_RELEASED_TORCH_ISFINITE = torch.isfinite
+_RELEASED_TORCH_NAN_TO_NUM = torch.nan_to_num
+_RELEASED_TORCH_WHERE = torch.where
+_RELEASED_TORCH_ZEROS_LIKE = torch.zeros_like
+_RELEASED_TORCH_FULL_LIKE = torch.full_like
+_RELEASED_TENSOR_MASKED_FILL_INPLACE = torch.Tensor.masked_fill_
 _RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
 _RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
@@ -131,6 +147,96 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
     return bool(all(all(name is None for name in value.names) for value in tensors))
 
 
+def _can_reuse_projection_validity(keypoints: Tensor, metadata: dict) -> bool:
+    """Recognize the released homogeneous FP32 eager observation boundary."""
+
+    if type(metadata) is not dict:
+        return False
+    tensors = (
+        keypoints,
+        metadata.get("lidar2cam"),
+        metadata.get("image_wh"),
+        metadata.get("ocam_intrinsic"),
+        metadata.get("ocam_pol"),
+    )
+    return bool(
+        _ocam_project_points_with_raw_camera_xyz_and_valid
+        is _RELEASED_OCAM_PROJECT_WITH_XYZ_AND_VALID
+        and _geometry._ocam_project_points_with_raw_camera_xyz_and_valid
+        is _RELEASED_GEOMETRY_PROJECT_WITH_XYZ_AND_VALID
+        and _geometry._ocam_project_points_impl is _RELEASED_OCAM_PROJECT_IMPL
+        and _is_owned_projection_with_validity is _RELEASED_OWNED_PROJECTION_CHECK
+        and _rfl._plain_eager_no_grad_execution is _RELEASED_PLAIN_EAGER_NO_GRAD
+        and torch.isfinite is _RELEASED_TORCH_ISFINITE
+        and torch.nan_to_num is _RELEASED_TORCH_NAN_TO_NUM
+        and torch.where is _RELEASED_TORCH_WHERE
+        and torch.zeros_like is _RELEASED_TORCH_ZEROS_LIKE
+        and torch.full_like is _RELEASED_TORCH_FULL_LIKE
+        and torch.Tensor.masked_fill_ is _RELEASED_TENSOR_MASKED_FILL_INPLACE
+        and _rfl._plain_eager_no_grad_execution()
+        and _can_reuse_camera_transform(keypoints, metadata)
+        and all(type(value) is torch.Tensor for value in tensors)
+        and all(value.dtype is torch.float32 for value in tensors)
+        and all(value.device == keypoints.device for value in tensors)
+        and all(value.layout == torch.strided for value in tensors)
+        and all(not value.is_quantized for value in tensors)
+        and all(not value.requires_grad for value in tensors)
+        and all(value.is_contiguous() for value in tensors)
+        and all(all(name is None for name in value.names) for value in tensors)
+        and keypoints.device.type in ("cpu", "cuda")
+    )
+
+
+def _is_owned_projection_with_validity(
+    projected: Tensor,
+    valid: Tensor,
+    *,
+    protected: tuple[Tensor, ...],
+) -> bool:
+    """Validate the private projection outputs before consuming UV storage."""
+
+    alias_check = getattr(torch._C, "_is_alias_of", None)
+    if (
+        alias_check is not _RELEASED_ALIAS_CHECK
+        or type(projected) is not torch.Tensor
+        or type(valid) is not torch.Tensor
+        or projected.shape != valid.shape + (2,)
+        or projected.dtype is not torch.float32
+        or valid.dtype is not torch.bool
+        or projected.device != valid.device
+        or projected.layout != torch.strided
+        or valid.layout != torch.strided
+        or projected.is_quantized
+        or valid.is_quantized
+        or projected.requires_grad
+        or valid.requires_grad
+        or projected._base is not None
+        or valid._base is not None
+        or not projected.is_contiguous()
+        or not valid.is_contiguous()
+        or projected.storage_offset() != 0
+        or valid.storage_offset() != 0
+        or any(name is not None for name in projected.names)
+        or any(name is not None for name in valid.names)
+        or any(type(value) is not torch.Tensor for value in protected)
+    ):
+        return False
+    try:
+        return bool(
+            not alias_check(projected, valid)
+            and not any(
+                alias_check(output, value)
+                for output in (projected, valid)
+                for value in protected
+            )
+        )
+    except Exception:
+        return False
+
+
+_RELEASED_OWNED_PROJECTION_CHECK = _is_owned_projection_with_validity
+
+
 def project_and_describe(
     keypoints: Tensor,
     anchor: Tensor,
@@ -158,7 +264,30 @@ def project_and_describe(
     reuse_projection_storage = bool(
         not torch.is_grad_enabled() and not torch._dynamo.is_compiling()
     )
-    if _can_reuse_camera_transform(keypoints, metadata):
+    reuse_projection_validity = _can_reuse_projection_validity(keypoints, metadata)
+    if reuse_projection_validity:
+        projected, camera_xyz, projection_valid = (
+            _ocam_project_points_with_raw_camera_xyz_and_valid(
+                keypoints,
+                metadata,
+                metadata["image_wh"],
+                contract=projection_contract,
+                inference_storage_reuse=True,
+            )
+        )
+        reuse_projection_validity = _is_owned_projection_with_validity(
+            projected,
+            projection_valid,
+            protected=(
+                keypoints,
+                camera_xyz,
+                metadata["lidar2cam"],
+                metadata["image_wh"],
+                metadata["ocam_intrinsic"],
+                metadata["ocam_pol"],
+            ),
+        )
+    elif _can_reuse_camera_transform(keypoints, metadata):
         projected, camera_xyz = _ocam_project_points_with_raw_camera_xyz(
             keypoints,
             metadata,
@@ -166,6 +295,7 @@ def project_and_describe(
             contract=projection_contract,
             inference_storage_reuse=reuse_projection_storage,
         )
+        projection_valid = None
     else:
         projected = ocam_project_points(
             keypoints,
@@ -175,18 +305,25 @@ def project_and_describe(
             inference_storage_reuse=reuse_projection_storage,
         )
         camera_xyz = None
-    valid = (
-        torch.isfinite(projected).all(dim=-1)
-        & projected[..., 0].ge(0)
-        & projected[..., 0].le(1)
-        & projected[..., 1].ge(0)
-        & projected[..., 1].le(1)
-    )
-    safe_uv = torch.where(
-        valid[..., None],
-        torch.nan_to_num(projected),
-        torch.zeros_like(projected),
-    )
+        projection_valid = None
+    if reuse_projection_validity:
+        assert projection_valid is not None
+        valid = projection_valid
+        projected.masked_fill_(~valid[..., None], 0.0)
+        safe_uv = projected
+    else:
+        valid = (
+            torch.isfinite(projected).all(dim=-1)
+            & projected[..., 0].ge(0)
+            & projected[..., 0].le(1)
+            & projected[..., 1].ge(0)
+            & projected[..., 1].le(1)
+        )
+        safe_uv = torch.where(
+            valid[..., None],
+            torch.nan_to_num(projected),
+            torch.zeros_like(projected),
+        )
     if camera_xyz is None:
         camera_xyz = _camera_xyz(keypoints, metadata["lidar2cam"])
     ray = F.normalize(
@@ -218,18 +355,30 @@ def project_and_describe(
             ),
         )
 
-    positive_inf = torch.full_like(safe_uv, float("inf"))
-    negative_inf = torch.full_like(safe_uv, float("-inf"))
-    minimum_uv = torch.where(
-        valid[..., None],
-        safe_uv,
-        positive_inf,
-    ).amin(dim=3)
-    maximum_uv = torch.where(
-        valid[..., None],
-        safe_uv,
-        negative_inf,
-    ).amax(dim=3)
+    if reuse_projection_validity:
+        minimum_uv = torch.where(
+            valid[..., None],
+            safe_uv,
+            float("inf"),
+        ).amin(dim=3)
+        maximum_uv = torch.where(
+            valid[..., None],
+            safe_uv,
+            float("-inf"),
+        ).amax(dim=3)
+    else:
+        positive_inf = torch.full_like(safe_uv, float("inf"))
+        negative_inf = torch.full_like(safe_uv, float("-inf"))
+        minimum_uv = torch.where(
+            valid[..., None],
+            safe_uv,
+            positive_inf,
+        ).amin(dim=3)
+        maximum_uv = torch.where(
+            valid[..., None],
+            safe_uv,
+            negative_inf,
+        ).amax(dim=3)
     footprint = (maximum_uv - minimum_uv).clamp_min(0.0) * metadata["image_wh"][
         :, :, None, :
     ]

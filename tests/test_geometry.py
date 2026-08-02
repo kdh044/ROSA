@@ -187,6 +187,222 @@ def test_single_transform_candidate_preserves_projection_and_raw_xyz(
     assert raw_camera_xyz._base is None
 
 
+def test_projection_validity_carrier_preserves_parent_abi_and_raw_mask():
+    metas = _metas()
+    points = torch.tensor(
+        (
+            (0.0, -0.0, -1.0),
+            (0.5, -0.25, -2.0),
+            (float("nan"), 0.0, -1.0),
+            (float("inf"), float("-inf"), 0.0),
+            (9999.0, 0.0, -1.0),
+            (10000.0, 0.0, -1.0),
+        )
+    ).reshape(1, 1, 6, 3)
+
+    with torch.no_grad():
+        parent = _ocam_project_points_with_raw_camera_xyz(
+            points,
+            metas,
+            metas["image_wh"],
+            contract="full_fov",
+            inference_storage_reuse=True,
+        )
+        projected, raw_camera_xyz, valid = (
+            observation_module._ocam_project_points_with_raw_camera_xyz_and_valid(
+                points,
+                metas,
+                metas["image_wh"],
+                contract="full_fov",
+                inference_storage_reuse=True,
+            )
+        )
+
+    assert type(parent) is tuple and len(parent) == 2
+    assert _raw_equal(projected, parent[0])
+    assert _raw_equal(raw_camera_xyz, parent[1])
+    expected_valid = (
+        torch.isfinite(projected).all(dim=-1)
+        & projected[..., 0].ge(0)
+        & projected[..., 0].le(1)
+        & projected[..., 1].ge(0)
+        & projected[..., 1].le(1)
+    )
+    assert torch.equal(valid, expected_valid)
+
+
+def test_projection_validity_reuse_is_sealed_to_plain_fp32_eager():
+    metas = _metas()
+    keypoints = torch.zeros(1, 1, 1, 3)
+
+    assert not observation_module._can_reuse_projection_validity(keypoints, metas)
+    with torch.no_grad():
+        assert observation_module._can_reuse_projection_validity(keypoints, metas)
+        assert not observation_module._can_reuse_projection_validity(
+            keypoints.double(),
+            {
+                name: value.double() if torch.is_tensor(value) else value
+                for name, value in metas.items()
+            },
+        )
+        noncontiguous = torch.zeros(1, 1, 1, 6)[..., ::2]
+        assert not noncontiguous.is_contiguous()
+        assert not observation_module._can_reuse_projection_validity(
+            noncontiguous,
+            metas,
+        )
+        custom_mapping = type("CustomMetadata", (dict,), {})(metas)
+        assert not observation_module._can_reuse_projection_validity(
+            keypoints,
+            custom_mapping,
+        )
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        assert not observation_module._can_reuse_projection_validity(
+            keypoints,
+            metas,
+        )
+
+
+@pytest.mark.parametrize(
+    ("owner_name", "helper_name"),
+    (
+        ("observation", "_ocam_project_points_with_raw_camera_xyz_and_valid"),
+        ("geometry", "_ocam_project_points_with_raw_camera_xyz_and_valid"),
+        ("observation", "_is_owned_projection_with_validity"),
+    ),
+)
+def test_projection_validity_reuse_falls_back_before_overridden_helpers(
+    owner_name,
+    helper_name,
+    monkeypatch,
+):
+    metas = _metas()
+    keypoints = torch.tensor([[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]])
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            False,
+        )
+        with torch.no_grad():
+            expected = project_and_describe(
+                keypoints,
+                anchor,
+                metas,
+                "full_fov",
+                compact_relation=True,
+            )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden private projection helper executed")
+
+    owner = (
+        observation_module
+        if owner_name == "observation"
+        else observation_module._geometry
+    )
+    monkeypatch.setattr(owner, helper_name, must_not_run)
+    with torch.no_grad():
+        assert not observation_module._can_reuse_projection_validity(
+            keypoints,
+            metas,
+        )
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+            compact_relation=True,
+        )
+    _assert_observation_raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("owner", "helper_name"),
+    (
+        (torch, "isfinite"),
+        (torch, "nan_to_num"),
+        (torch, "where"),
+        (torch, "zeros_like"),
+        (torch, "full_like"),
+        (torch.Tensor, "masked_fill_"),
+    ),
+)
+def test_projection_validity_reuse_preserves_overridden_primitive_helpers(
+    owner,
+    helper_name,
+    monkeypatch,
+):
+    metas = _metas()
+    keypoints = torch.tensor([[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]])
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+    with torch.no_grad():
+        expected = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+            compact_relation=True,
+        )
+
+    released = getattr(owner, helper_name)
+    calls = []
+
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return released(*args, **kwargs)
+
+    monkeypatch.setattr(owner, helper_name, observed)
+    with torch.no_grad():
+        assert not observation_module._can_reuse_projection_validity(
+            keypoints,
+            metas,
+        )
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+            compact_relation=True,
+        )
+    assert calls
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_projection_validity_ownership_rejects_output_and_protected_aliases():
+    storage = torch.empty(8, dtype=torch.uint8)
+    projected = torch.empty(0, dtype=torch.float32).set_(
+        storage.untyped_storage(),
+        0,
+        (1, 1, 1, 1, 2),
+        (2, 2, 2, 2, 1),
+    )
+    valid = torch.empty(0, dtype=torch.bool).set_(
+        storage.untyped_storage(),
+        0,
+        (1, 1, 1, 1),
+        (1, 1, 1, 1),
+    )
+    protected = torch.empty(1)
+    assert projected._base is None and valid._base is None
+    assert not observation_module._is_owned_projection_with_validity(
+        projected,
+        valid,
+        protected=(protected,),
+    )
+
+    independent_projected = torch.empty(1, 1, 1, 1, 2)
+    independent_valid = torch.empty(1, 1, 1, 1, dtype=torch.bool)
+    assert not observation_module._is_owned_projection_with_validity(
+        independent_projected,
+        independent_valid,
+        protected=(independent_valid,),
+    )
+
+
 @pytest.mark.parametrize(
     "dtype",
     (torch.float16, torch.bfloat16, torch.float32, torch.float64),

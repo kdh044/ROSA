@@ -239,7 +239,7 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
         )._sample_multiscale_prepared_stacked.__code__,
         "owned_rfl_delta": rfl_module._mask_cast_and_add_owned_delta.__code__,
         "single_ocam_transform": (
-            observation_module._ocam_project_points_with_raw_camera_xyz.__code__
+            observation_module._ocam_project_points_with_raw_camera_xyz_and_valid.__code__
         ),
         "owned_pointwise_consistency": (
             attention_module._mean_pairwise_camera_cosine_owned_inference.__code__

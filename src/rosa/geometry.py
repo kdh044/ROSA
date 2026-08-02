@@ -187,7 +187,8 @@ def _ocam_project_points_impl(
     camera_transform: str = "homogeneous_4x4",
     inference_storage_reuse: bool = False,
     preserve_raw_camera_xyz: bool = False,
-) -> tuple[Tensor, Tensor | None]:
+    return_valid: bool = False,
+) -> tuple[Tensor, Tensor | None] | tuple[Tensor, Tensor | None, Tensor]:
     """Internal projection core with optional exact-strided raw XYZ capture.
 
     ``legacy_front_only`` exactly preserves the projection validity used to
@@ -203,6 +204,8 @@ def _ocam_project_points_impl(
         raise TypeError("inference_storage_reuse must be a bool")
     if not isinstance(preserve_raw_camera_xyz, bool):
         raise TypeError("preserve_raw_camera_xyz must be a bool")
+    if not isinstance(return_valid, bool):
+        raise TypeError("return_valid must be a bool")
     if inference_storage_reuse and torch.is_grad_enabled():
         raise RuntimeError(
             "OCam inference storage reuse requires torch.no_grad() or "
@@ -364,6 +367,8 @@ def _ocam_project_points_impl(
             sentinel,
             out=projected[..., 1],
         )
+        if return_valid:
+            return projected, raw_camera_xyz, valid
         return projected, raw_camera_xyz
     normalized_u = pixel_u / width.clamp_min(1)
     normalized_v = pixel_v / height.clamp_min(1)
@@ -374,6 +379,8 @@ def _ocam_project_points_impl(
         ),
         dim=-1,
     )
+    if return_valid:
+        return projected, raw_camera_xyz, valid
     return projected, raw_camera_xyz
 
 
@@ -423,6 +430,32 @@ def _ocam_project_points_with_raw_camera_xyz(
     if raw_camera_xyz is None:  # pragma: no cover - internal invariant
         raise RuntimeError("raw OCam camera coordinates were not preserved")
     return projected, raw_camera_xyz
+
+
+def _ocam_project_points_with_raw_camera_xyz_and_valid(
+    points: Tensor,
+    metas: dict,
+    image_wh: Tensor,
+    *,
+    contract: str = "legacy_front_only",
+    camera_transform: str = "homogeneous_4x4",
+    inference_storage_reuse: bool = False,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Private eager projection carrier with its already-computed validity."""
+
+    projected, raw_camera_xyz, valid = _ocam_project_points_impl(
+        points,
+        metas,
+        image_wh,
+        contract=contract,
+        camera_transform=camera_transform,
+        inference_storage_reuse=inference_storage_reuse,
+        preserve_raw_camera_xyz=True,
+        return_valid=True,
+    )
+    if raw_camera_xyz is None:  # pragma: no cover - internal invariant
+        raise RuntimeError("raw OCam camera coordinates were not preserved")
+    return projected, raw_camera_xyz, valid
 
 
 def ocam_projection_scales(
