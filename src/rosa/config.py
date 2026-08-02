@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import math
 from typing import Mapping
 
-
 _BALANCED_PROFILE = {
     "hidden_dims": 64,
     "max_candidate_range_m": 68.0,
@@ -29,6 +28,10 @@ _BALANCED_PROFILE = {
     "anchor_z_is_bottom": False,
 }
 
+_DENSE_RFL_TOPOLOGY_CONTRACT = "rosa.rfl.dense_outer_product.v2"
+_FACTORIZED_RFL_TOPOLOGY_CONTRACT = "rosa.rfl.signed_gated_cp16.v3"
+_RETIRED_COMPACT_PROFILES = frozenset(("compact_v2", "compact_v2_fast"))
+
 # Users choose one behavior profile.  The individual values remain available
 # only for release reproduction and controlled ablations.
 _PROFILES = {
@@ -36,13 +39,6 @@ _PROFILES = {
     "legacy_release": {},
     "balanced": _BALANCED_PROFILE,
     "fast": {
-        **_BALANCED_PROFILE,
-        "refine_topk": 50,
-        "num_refinement_steps": 1,
-    },
-    # Backward-compatible aliases for early v2 experiment configs.
-    "compact_v2": _BALANCED_PROFILE,
-    "compact_v2_fast": {
         **_BALANCED_PROFILE,
         "refine_topk": 50,
         "num_refinement_steps": 1,
@@ -139,6 +135,11 @@ class ROSAConfig:
         raw.pop("_delete_", None)
         profile = raw.pop("profile", None)
         if profile is not None:
+            if profile in _RETIRED_COMPACT_PROFILES:
+                raise ValueError(
+                    f"ROSA profile {profile!r} names the retired dense compact "
+                    "v2 topology; use its pinned v2 source and checkpoint"
+                )
             if profile not in _PROFILES:
                 raise ValueError(f"unknown ROSA profile: {profile!r}")
             raw = {**_PROFILES[profile], **raw}
@@ -286,9 +287,7 @@ class ROSAConfig:
                     "yaw_class_loss_weights requires compact wrapped-yaw training"
                 )
             try:
-                weights = tuple(
-                    float(value) for value in self.yaw_class_loss_weights
-                )
+                weights = tuple(float(value) for value in self.yaw_class_loss_weights)
             except (TypeError, ValueError) as error:
                 raise ValueError(
                     "yaw_class_loss_weights must contain six finite positive values"
@@ -321,6 +320,14 @@ class ROSAConfig:
     @property
     def max_shape2_yaw_delta_rad(self) -> float:
         return self.max_second_yaw_delta_rad
+
+    @property
+    def rfl_topology_contract(self) -> str:
+        """Return the architecture-owned RFL checkpoint topology."""
+
+        if self.architecture_profile == "compact":
+            return _FACTORIZED_RFL_TOPOLOGY_CONTRACT
+        return _DENSE_RFL_TOPOLOGY_CONTRACT
 
 
 __all__ = ["ROSAConfig"]

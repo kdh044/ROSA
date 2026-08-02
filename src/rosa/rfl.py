@@ -1,9 +1,9 @@
 """Spherical ray-feature lifting for sparse object-support observations.
 
 The module is deliberately smaller than a spherical attention block.  Each
-already-sampled detector observation is processed independently: a fixed real
-spherical-harmonic basis of its calibrated camera ray is tensor-multiplied
-with a low-dimensional appearance feature and projected back as a residual.
+already-sampled detector observation is processed independently.  Released
+legacy models retain the dense ray-appearance outer product.  Compact models
+use a signed rank-16 gate over the same fixed real spherical-harmonic basis.
 
 No keypoint interaction, camera selection, additional image sampling, or KB
 Jacobian descriptor is used here.  Camera fusion remains the responsibility
@@ -42,31 +42,68 @@ class SphericalRayFeatureLifting(nn.Module):
 
     relation_dims = 19
     num_sh_basis = 9
+    compact_factor_dims = 16
 
-    def __init__(self, embed_dims: int = 256, hidden_dims: int = 16) -> None:
+    def __init__(
+        self,
+        embed_dims: int = 256,
+        hidden_dims: int = 16,
+        *,
+        _factorized: bool = False,
+    ) -> None:
         super().__init__()
         if int(embed_dims) <= 0 or int(hidden_dims) <= 0:
             raise ValueError("RFL dimensions must be positive")
+        if _factorized and int(hidden_dims) != self.compact_factor_dims:
+            raise ValueError(
+                "compact factorized RFL has a fixed rank of "
+                f"{self.compact_factor_dims}"
+            )
 
         self.embed_dims = int(embed_dims)
         self.hidden_dims = int(hidden_dims)
+        self.factorized = bool(_factorized)
         # Parameter-free normalization avoids a geometry-only learned offset.
         self.feature_norm = nn.LayerNorm(self.embed_dims, elementwise_affine=False)
         # Bias-free projections ensure the lifted branch is a genuine
         # appearance-by-ray interaction rather than an independent ray PE.
         self.appearance_proj = nn.Linear(self.embed_dims, self.hidden_dims, bias=False)
+        self.ray_proj = (
+            nn.Linear(self.num_sh_basis, self.hidden_dims, bias=False)
+            if self.factorized
+            else None
+        )
         self.output_proj = nn.Linear(
-            self.num_sh_basis * self.hidden_dims,
+            (
+                self.hidden_dims
+                if self.factorized
+                else self.num_sh_basis * self.hidden_dims
+            ),
             self.embed_dims,
             bias=False,
         )
 
         self.reset_parameters()
 
+    @classmethod
+    def for_compact_profile(
+        cls,
+        embed_dims: int = 256,
+    ) -> "SphericalRayFeatureLifting":
+        """Build the fixed signed-gated CP16 topology used by compact ROSA."""
+
+        return cls(
+            embed_dims=embed_dims,
+            hidden_dims=cls.compact_factor_dims,
+            _factorized=True,
+        )
+
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.appearance_proj.weight)
+        if self.ray_proj is not None:
+            nn.init.xavier_uniform_(self.ray_proj.weight)
         # One zero map provides both exact identity and a non-zero first-step
-        # gradient.  A second zero gate would deadlock the inner projection.
+        # gradient.  Zeroing an inner factor would deadlock that projection.
         nn.init.zeros_(self.output_proj.weight)
 
     @staticmethod
@@ -205,15 +242,17 @@ class SphericalRayFeatureLifting(nn.Module):
             ):
                 observed = getattr(relation, "shape", None)
                 raise ValueError(
-                    "RFL relation shape mismatch: "
-                    f"{observed} vs {expected_relation}"
+                    "RFL relation shape mismatch: " f"{observed} vs {expected_relation}"
                 )
             relation_bncp = relation.permute(0, 2, 1, 3, 4).contiguous()
             basis, valid = self.basis_and_valid(relation_bncp)
 
         appearance = self.appearance_proj(self.feature_norm(features))
-        lifted = basis[..., :, None] * appearance[..., None, :]
-        lifted = lifted.flatten(start_dim=-2)
+        if self.ray_proj is None:
+            lifted = basis[..., :, None] * appearance[..., None, :]
+            lifted = lifted.flatten(start_dim=-2)
+        else:
+            lifted = appearance * self.ray_proj(basis)
         delta = self.output_proj(lifted)
         delta = torch.where(valid[..., None], delta, torch.zeros_like(delta))
         delta = torch.nan_to_num(delta, nan=0.0, posinf=0.0, neginf=0.0)

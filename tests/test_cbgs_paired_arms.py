@@ -57,7 +57,7 @@ def test_c1_restores_only_the_balanced_rosa_head_without_merge_residue() -> None
     assert c1.experiment_contract.max_epochs == 20
     assert c1.experiment_contract.cbgs_optimizer_steps_20e == 63_660
     assert c1.experiment_contract.rosa_sidecar is True
-    assert c1.experiment_contract.learned_refiner_parameters == 120_559
+    assert c1.experiment_contract.learned_refiner_parameters == 87_935
 
 
 def test_c2_reuses_q1_values_without_changing_the_c1_train_contract() -> None:
@@ -80,7 +80,7 @@ def test_c2_reuses_q1_values_without_changing_the_c1_train_contract() -> None:
     assert c2.param_scheduler == c1.param_scheduler
     assert c2.optim_wrapper == c1.optim_wrapper
     assert c2.randomness == c1.randomness
-    assert c2.experiment_contract.learned_refiner_parameters == 122_117
+    assert c2.experiment_contract.learned_refiner_parameters == 89_493
 
 
 def test_c1_actual_optimizer_parameters_and_paired_initialization() -> None:
@@ -128,7 +128,7 @@ def test_c1_actual_optimizer_parameters_and_paired_initialization() -> None:
         torch.testing.assert_close(baseline_rng, rosa_rng, rtol=0, atol=0)
 
         refiner_parameters = list(rosa.head.rosa_refiner.parameters())
-        assert sum(parameter.numel() for parameter in refiner_parameters) == 120_559
+        assert sum(parameter.numel() for parameter in refiner_parameters) == 87_935
         refiner_ids = {id(parameter) for parameter in refiner_parameters}
         marked_groups = [
             group
@@ -142,7 +142,7 @@ def test_c1_actual_optimizer_parameters_and_paired_initialization() -> None:
         }
         assert marked_ids == refiner_ids
         assert sum(parameter.numel() for group in marked_groups
-                   for parameter in group["params"]) == 120_559
+                   for parameter in group["params"]) == 87_935
         assert not any(
             group.get("rosa_sidecar", False)
             for group in baseline_wrapper.optimizer.param_groups

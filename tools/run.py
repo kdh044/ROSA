@@ -22,14 +22,15 @@ import torch
 from mmengine.config import Config, DictAction
 from mmengine.logging.history_buffer import HistoryBuffer
 
-
 Runner = None
 
 
-_FAST_PROFILES = frozenset({"fast", "compact_v2_fast"})
+_FAST_PROFILES = frozenset({"fast"})
 _KNOWN_RELEASE_ARCHITECTURE = "ROSA R18 Main126"
+_ROSA_CONTRACT_VERSION = 3
 _ROSA_TOPOLOGY_FIELDS = (
     "architecture_profile",
+    "rfl_topology_contract",
     "embed_dims",
     "hidden_dims",
     "num_keypoints",
@@ -37,21 +38,15 @@ _ROSA_TOPOLOGY_FIELDS = (
     "num_levels",
     "enable_quality_score",
 )
-_ROSA_GEOMETRY_FIELDS = (
-    "anchor_z_is_bottom",
-)
+_ROSA_GEOMETRY_FIELDS = ("anchor_z_is_bottom",)
 _OBJECT_DEPTH_TRAIN_ONLY_KEYS = tuple(
     f"depth_branch.depth_layers.{level}.{field}"
     for level in range(3)
     for field in ("weight", "bias")
 )
 _OBJECT_DEPTH_TRAIN_ONLY_SHAPES = {
-    f"depth_branch.depth_layers.{level}.weight": (1, 256, 1, 1)
-    for level in range(3)
-} | {
-    f"depth_branch.depth_layers.{level}.bias": (1,)
-    for level in range(3)
-}
+    f"depth_branch.depth_layers.{level}.weight": (1, 256, 1, 1) for level in range(3)
+} | {f"depth_branch.depth_layers.{level}.bias": (1,) for level in range(3)}
 _OBJECT_DEPTH_TRAIN_ONLY_ELEMENTS = 771
 _OBJECT_DEPTH_SOURCE_STATE_KEYS = 601
 _OBJECT_DEPTH_DEPLOY_STATE_KEYS = 595
@@ -83,9 +78,7 @@ _C73_APPROVED_SOURCE_SHA256 = frozenset(
         "6835bdc7be22798ecd6278334b826a862dddf2072eeb71d97b7f41e58a9fa1e8",
     }
 )
-_OBJECT_DEPTH_DEPLOY_CONTRACT = (
-    "rosa.native.object_lidar_depth.train_only_strip.v1"
-)
+_OBJECT_DEPTH_DEPLOY_CONTRACT = "rosa.native.object_lidar_depth.train_only_strip.v1"
 _C73_DEPLOY_BEHAVIOR = "rosa.c73.official_sparse4d_gnn_residual.v1"
 _NATIVE_DEPLOY_TARGET_HEADS = {
     _C73_DEPLOY_BEHAVIOR: "ROSAOfficialResidualNativeBaselineHead",
@@ -93,10 +86,7 @@ _NATIVE_DEPLOY_TARGET_HEADS = {
 _C73_DEPLOY_DEFORMABLE_TYPES = frozenset(
     {
         "ROSAFullFOVDeformableFeatureAggregation",
-        (
-            "ROSAInferenceReuseExactHomogeneous4x4FullFOV"
-            "DeformableFeatureAggregation"
-        ),
+        ("ROSAInferenceReuseExactHomogeneous4x4FullFOV" "DeformableFeatureAggregation"),
     }
 )
 _C73_DEPLOY_KEYPOINT_GENERATOR = "ROSANormalizedKeyPointsGenerator"
@@ -220,11 +210,7 @@ def load_config(args: argparse.Namespace) -> Config:
 
 def _rosa_profile(config: Config) -> str | None:
     rosa_config = config.model.get("head", {}).get("rosa_cfg")
-    return (
-        rosa_config.get("profile", "explicit")
-        if rosa_config is not None
-        else None
-    )
+    return rosa_config.get("profile", "explicit") if rosa_config is not None else None
 
 
 def _effective_rosa_config(config: Config):
@@ -242,7 +228,8 @@ def _checkpoint_contract_metadata(config: Config) -> dict | None:
     if effective is None:
         return None
     return {
-        "rosa_contract_version": 2,
+        "rosa_contract_version": _ROSA_CONTRACT_VERSION,
+        "rfl_topology_contract": effective.rfl_topology_contract,
         "projection_contract": effective.projection_contract,
         "refinement_profile": _rosa_profile(config),
         "rosa_config": asdict(effective),
@@ -431,9 +418,7 @@ def _object_depth_deploy_state_dict(state_dict: Mapping) -> OrderedDict:
             f"{source_metadata_sha256}"
         )
 
-    depth_keys = {
-        key for key in state_dict if key.startswith("depth_branch.")
-    }
+    depth_keys = {key for key in state_dict if key.startswith("depth_branch.")}
     expected_keys = set(_OBJECT_DEPTH_TRAIN_ONLY_KEYS)
     if depth_keys != expected_keys:
         missing = sorted(expected_keys.difference(depth_keys))
@@ -463,9 +448,7 @@ def _object_depth_deploy_state_dict(state_dict: Mapping) -> OrderedDict:
         )
 
     deploy_state = OrderedDict(
-        (key, value)
-        for key, value in state_dict.items()
-        if key not in expected_keys
+        (key, value) for key, value in state_dict.items() if key not in expected_keys
     )
     if len(deploy_state) != _OBJECT_DEPTH_DEPLOY_STATE_KEYS:
         raise ValueError(
@@ -547,20 +530,14 @@ def export_deploy(args: argparse.Namespace) -> dict:
             "native_deploy_allowed_deformable_types": sorted(
                 _C73_DEPLOY_DEFORMABLE_TYPES
             ),
-            "native_deploy_keypoint_generator_type": (
-                _C73_DEPLOY_KEYPOINT_GENERATOR
-            ),
+            "native_deploy_keypoint_generator_type": (_C73_DEPLOY_KEYPOINT_GENERATOR),
             "native_deploy_projection_type": "ocam_fisheye",
             "native_deploy_anchor_z_is_bottom": False,
             "source_checkpoint_sha256": source_sha256,
             "source_state_keys": len(state_dict),
             "deploy_state_keys": len(deploy_state),
-            "deploy_state_structure_sha256": (
-                _OBJECT_DEPTH_DEPLOY_STRUCTURE_SHA256
-            ),
-            "deploy_state_metadata_sha256": (
-                _OBJECT_DEPTH_DEPLOY_METADATA_SHA256
-            ),
+            "deploy_state_structure_sha256": (_OBJECT_DEPTH_DEPLOY_STRUCTURE_SHA256),
+            "deploy_state_metadata_sha256": (_OBJECT_DEPTH_DEPLOY_METADATA_SHA256),
             "stripped_state_keys": list(_OBJECT_DEPTH_TRAIN_ONLY_KEYS),
             "stripped_elements": _OBJECT_DEPTH_TRAIN_ONLY_ELEMENTS,
             "optimizer_state_included": False,
@@ -633,22 +610,14 @@ def _c73_deploy_payload_mismatches(checkpoint: Mapping, config: Config) -> list[
         "native_deploy_target_head_type": (
             _NATIVE_DEPLOY_TARGET_HEADS[_C73_DEPLOY_BEHAVIOR]
         ),
-        "native_deploy_allowed_deformable_types": sorted(
-            _C73_DEPLOY_DEFORMABLE_TYPES
-        ),
-        "native_deploy_keypoint_generator_type": (
-            _C73_DEPLOY_KEYPOINT_GENERATOR
-        ),
+        "native_deploy_allowed_deformable_types": sorted(_C73_DEPLOY_DEFORMABLE_TYPES),
+        "native_deploy_keypoint_generator_type": (_C73_DEPLOY_KEYPOINT_GENERATOR),
         "native_deploy_projection_type": "ocam_fisheye",
         "native_deploy_anchor_z_is_bottom": False,
         "source_state_keys": _OBJECT_DEPTH_SOURCE_STATE_KEYS,
         "deploy_state_keys": _OBJECT_DEPTH_DEPLOY_STATE_KEYS,
-        "deploy_state_structure_sha256": (
-            _OBJECT_DEPTH_DEPLOY_STRUCTURE_SHA256
-        ),
-        "deploy_state_metadata_sha256": (
-            _OBJECT_DEPTH_DEPLOY_METADATA_SHA256
-        ),
+        "deploy_state_structure_sha256": (_OBJECT_DEPTH_DEPLOY_STRUCTURE_SHA256),
+        "deploy_state_metadata_sha256": (_OBJECT_DEPTH_DEPLOY_METADATA_SHA256),
         "stripped_state_keys": list(_OBJECT_DEPTH_TRAIN_ONLY_KEYS),
         "stripped_elements": _OBJECT_DEPTH_TRAIN_ONLY_ELEMENTS,
         "optimizer_state_included": False,
@@ -693,9 +662,7 @@ def _c73_deploy_payload_mismatches(checkpoint: Mapping, config: Config) -> list[
     head_config = config.model.get("head", {})
     expected_head_type = _NATIVE_DEPLOY_TARGET_HEADS[_C73_DEPLOY_BEHAVIOR]
     if head_config.get("type") != expected_head_type:
-        mismatches.append(
-            f"deploy behavior requires head {expected_head_type!r}"
-        )
+        mismatches.append(f"deploy behavior requires head {expected_head_type!r}")
     deformable = head_config.get("deformable_model", {})
     if deformable.get("type") not in _C73_DEPLOY_DEFORMABLE_TYPES:
         mismatches.append("deploy behavior requires exact homogeneous OCam projection")
@@ -725,9 +692,7 @@ def _validate_checkpoint_contract(
     rosa_mapping = config.model.get("head", {}).get("rosa_cfg")
     effective = _effective_rosa_config(config)
     target_has_rosa = rosa_mapping is not None
-    checkpoint_has_rosa = _state_dict_has_rosa(
-        _checkpoint_state_dict(checkpoint)
-    )
+    checkpoint_has_rosa = _state_dict_has_rosa(_checkpoint_state_dict(checkpoint))
     mismatches = []
 
     deploy_contract = metadata.get("deploy_contract")
@@ -740,10 +705,7 @@ def _validate_checkpoint_contract(
     elif deploy_behavior is not None:
         mismatches.append("native deploy behavior is missing its deploy contract")
 
-    if (
-        checkpoint_has_rosa is not None
-        and checkpoint_has_rosa != target_has_rosa
-    ):
+    if checkpoint_has_rosa is not None and checkpoint_has_rosa != target_has_rosa:
         mismatches.append(
             "topology "
             f"checkpoint ROSA={checkpoint_has_rosa} != "
@@ -753,14 +715,35 @@ def _validate_checkpoint_contract(
     checkpoint_contract = metadata.get("projection_contract")
     if target_has_rosa and checkpoint_has_rosa is not False:
         if checkpoint_contract is None:
-            mismatches.append(
-                "ROSA checkpoint lacks projection_contract metadata"
-            )
+            mismatches.append("ROSA checkpoint lacks projection_contract metadata")
         elif checkpoint_contract != effective.projection_contract:
             mismatches.append(
                 "projection "
                 f"{checkpoint_contract!r} != "
                 f"{effective.projection_contract!r}"
+            )
+
+        checkpoint_version = metadata.get("rosa_contract_version")
+        checkpoint_rfl_topology = metadata.get("rfl_topology_contract")
+        expected_rfl_topology = effective.rfl_topology_contract
+        if effective.architecture_profile == "compact":
+            if checkpoint_version != _ROSA_CONTRACT_VERSION:
+                mismatches.append(
+                    "factorized compact RFL requires checkpoint contract "
+                    f"v{_ROSA_CONTRACT_VERSION}, got {checkpoint_version!r}"
+                )
+            if checkpoint_rfl_topology != expected_rfl_topology:
+                mismatches.append(
+                    "RFL topology "
+                    f"{checkpoint_rfl_topology!r} != {expected_rfl_topology!r}"
+                )
+        elif (
+            checkpoint_rfl_topology is not None
+            and checkpoint_rfl_topology != expected_rfl_topology
+        ):
+            mismatches.append(
+                "RFL topology "
+                f"{checkpoint_rfl_topology!r} != {expected_rfl_topology!r}"
             )
 
     checkpoint_rosa_config = metadata.get("rosa_config")
@@ -772,15 +755,9 @@ def _validate_checkpoint_contract(
         except (TypeError, ValueError) as error:
             mismatches.append(f"invalid checkpoint ROSA config ({error})")
         else:
-            if _topology_signature(source_effective) != _topology_signature(
-                effective
-            ):
-                mismatches.append(
-                    "ROSA learned topology differs from the checkpoint"
-                )
-            if _geometry_signature(source_effective) != _geometry_signature(
-                effective
-            ):
+            if _topology_signature(source_effective) != _topology_signature(effective):
+                mismatches.append("ROSA learned topology differs from the checkpoint")
+            if _geometry_signature(source_effective) != _geometry_signature(effective):
                 mismatches.append(
                     "ROSA box-coordinate geometry differs from the checkpoint"
                 )
@@ -804,6 +781,8 @@ def _validate_checkpoint_contract(
 def _compile_fast_inference(runner, config: Config) -> bool:
     """Compile only the latency-oriented sidecar after weights are loaded."""
 
+    if _rosa_profile(config) is not None:
+        _effective_rosa_config(config)
     if _rosa_profile(config) not in _FAST_PROFILES:
         return False
     from mmengine.model import is_model_wrapper
@@ -933,19 +912,13 @@ def benchmark(args: argparse.Namespace, config: Config) -> None:
                 sample_count += len(output)
 
     total_time = sum(timings)
-    profile = (
-        "baseline"
-        if args.baseline
-        else (_rosa_profile(config) or "none")
-    )
+    profile = "baseline" if args.baseline else (_rosa_profile(config) or "none")
     result = {
         "config": str(args.config.resolve()),
         "profile": profile,
         "compiled_refiner": compiled,
         "checkpoint": (
-            str(args.checkpoint.resolve())
-            if args.checkpoint is not None
-            else None
+            str(args.checkpoint.resolve()) if args.checkpoint is not None else None
         ),
         "warmup_iterations": args.warmup,
         "measured_iterations": args.iterations,
@@ -953,15 +926,11 @@ def benchmark(args: argparse.Namespace, config: Config) -> None:
         "mean_batch_size": sample_count / len(timings),
         "mean_iteration_ms": 1000.0 * statistics.mean(timings),
         "median_iteration_ms": 1000.0 * statistics.median(timings),
-        "p95_iteration_ms": 1000.0
-        * float(torch.tensor(timings).quantile(0.95)),
+        "p95_iteration_ms": 1000.0 * float(torch.tensor(timings).quantile(0.95)),
         "mean_latency_per_sample_ms": 1000.0 * total_time / sample_count,
         "samples_per_second": sample_count / total_time,
-        "peak_cuda_memory_mib": torch.cuda.max_memory_allocated()
-        / (1024.0 * 1024.0),
-        "parameter_count": sum(
-            parameter.numel() for parameter in model.parameters()
-        ),
+        "peak_cuda_memory_mib": torch.cuda.max_memory_allocated() / (1024.0 * 1024.0),
+        "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
         "trainable_parameter_count": sum(
             parameter.numel()
             for parameter in model.parameters()

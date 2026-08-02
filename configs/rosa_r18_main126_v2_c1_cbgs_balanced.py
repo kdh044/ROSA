@@ -20,5 +20,5 @@ experiment_contract = dict(
     detector="native Sparse4D D0-D5 plus balanced ROSA sidecar",
     rosa_sidecar=True,
     refinement_profile="balanced",
-    learned_refiner_parameters=120_559,
+    learned_refiner_parameters=87_935,
 )

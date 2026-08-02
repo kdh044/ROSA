@@ -34,16 +34,13 @@ def mean_pairwise_camera_cosine(values: Tensor, valid: Tensor) -> Tensor:
 
     if values.ndim != 5 or valid.shape != values.shape[:-1]:
         raise ValueError("camera consistency tensors are misaligned")
-    masked = values.permute(0, 1, 3, 2, 4) * valid.permute(
-        0, 1, 3, 2
-    )[..., None].to(values.dtype)
+    masked = values.permute(0, 1, 3, 2, 4) * valid.permute(0, 1, 3, 2)[..., None].to(
+        values.dtype
+    )
     camera_count = valid.sum(dim=2).to(values.dtype)
     pair_count = camera_count * (camera_count - 1.0) * 0.5
     summed = masked.sum(dim=3)
-    pair_sum = (
-        summed.square().sum(dim=-1)
-        - masked.square().sum(dim=(-1, -2))
-    ) * 0.5
+    pair_sum = (summed.square().sum(dim=-1) - masked.square().sum(dim=(-1, -2))) * 0.5
     return torch.where(
         pair_count > 0,
         pair_sum / pair_count.clamp_min(1.0),
@@ -61,9 +58,13 @@ class PointwiseROSA(nn.Module):
         self.cfg = config
         dims = config.embed_dims
         hidden = config.hidden_dims
-        self.rfl = SphericalRayFeatureLifting(
-            embed_dims=dims,
-            hidden_dims=max(16, hidden // 4),
+        self.rfl = (
+            SphericalRayFeatureLifting.for_compact_profile(embed_dims=dims)
+            if config.architecture_profile == "compact"
+            else SphericalRayFeatureLifting(
+                embed_dims=dims,
+                hidden_dims=max(16, hidden // 4),
+            )
         )
         self.feature_norm = nn.LayerNorm(dims)
         self.query_proj = nn.Linear(dims, hidden, bias=False)
@@ -157,8 +158,7 @@ class PointwiseROSA(nn.Module):
             ).sum(dim=-1)
         else:
             point_logits = (
-                self.point_query(query)[:, :, None, :]
-                * self.point_key(point_features)
+                self.point_query(query)[:, :, None, :] * self.point_key(point_features)
             ).sum(dim=-1)
             point_logits = point_logits / math.sqrt(self.cfg.embed_dims)
         if self.cfg.uniform_point_fusion:
@@ -207,15 +207,15 @@ class PointwiseROSA(nn.Module):
                 pair_count = pair_valid.sum(dim=(-1, -2))
                 point_consistency = torch.where(
                     pair_count > 0,
-                    (
-                        similarity * pair_valid.to(similarity.dtype)
-                    ).sum(dim=(-1, -2))
+                    (similarity * pair_valid.to(similarity.dtype)).sum(dim=(-1, -2))
                     / pair_count.clamp_min(1).to(similarity.dtype),
                     torch.zeros_like(pair_count, dtype=similarity.dtype),
                 )
             consistency = torch.where(
                 point_valid.any(dim=-1),
-                (point_consistency * point_valid.to(point_consistency.dtype)).sum(dim=-1)
+                (point_consistency * point_valid.to(point_consistency.dtype)).sum(
+                    dim=-1
+                )
                 / point_valid.sum(dim=-1).clamp_min(1).to(point_consistency.dtype),
                 torch.zeros_like(point_consistency[..., 0]),
             )

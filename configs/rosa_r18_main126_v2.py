@@ -88,7 +88,7 @@ work_dir = str(
 
 experiment_contract = dict(
     refinement_profile=profile,
-    learned_refiner_parameters=120_559,
+    learned_refiner_parameters=87_935,
     candidate_range_m=68.0,
     candidate_count=3,
     yaw_gate="support",

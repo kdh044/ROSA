@@ -62,7 +62,8 @@ SEED = 3407
 BOOTSTRAP_SEED = 3407
 BOOTSTRAP_SAMPLES = 20_000
 EXPECTED_CHECKPOINT_REFINEMENT_PROFILE = "balanced"
-EXPECTED_CHECKPOINT_ROSA_CONTRACT_VERSION = 2
+EXPECTED_CHECKPOINT_ROSA_CONTRACT_VERSION = 3
+EXPECTED_CHECKPOINT_RFL_TOPOLOGY_CONTRACT = "rosa.rfl.signed_gated_cp16.v3"
 FAST_CHECKPOINT_ALLOWED_DELTAS = {
     "refine_topk": {"checkpoint": 100, "runtime": 50},
     "num_refinement_steps": {"checkpoint": 2, "runtime": 1},
@@ -1210,6 +1211,11 @@ def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
         != EXPECTED_CHECKPOINT_ROSA_CONTRACT_VERSION
     ):
         raise ProtocolError("checkpoint ROSA contract version drifted")
+    if (
+        metadata.get("rfl_topology_contract")
+        != EXPECTED_CHECKPOINT_RFL_TOPOLOGY_CONTRACT
+    ):
+        raise ProtocolError("checkpoint RFL topology contract drifted")
 
     effective_loader = getattr(run_tool, "_effective_rosa_config", None)
     state_loader = getattr(run_tool, "_checkpoint_state_dict", None)
@@ -1228,6 +1234,13 @@ def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
         ) from error
     if checkpoint_has_rosa is not True:
         raise ProtocolError("checkpoint must contain the ROSA sidecar state")
+    if (
+        getattr(source_effective, "rfl_topology_contract", None)
+        != EXPECTED_CHECKPOINT_RFL_TOPOLOGY_CONTRACT
+        or getattr(target_effective, "rfl_topology_contract", None)
+        != EXPECTED_CHECKPOINT_RFL_TOPOLOGY_CONTRACT
+    ):
+        raise ProtocolError("checkpoint/runtime RFL topology is not factorized v3")
 
     source_config = asdict(source_effective)
     target_config = asdict(target_effective)
@@ -1254,6 +1267,7 @@ def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
         "validated_against_arm": arm,
         "source_refinement_profile": metadata["refinement_profile"],
         "rosa_contract_version": metadata["rosa_contract_version"],
+        "rfl_topology_contract": metadata["rfl_topology_contract"],
         "projection_contract": observed_projection,
         "checkpoint_has_rosa_state": True,
         "source_effective_config_sha256": canonical_sha256(source_config),

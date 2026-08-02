@@ -15,7 +15,6 @@ pytest.importorskip("mmengine")
 from mmengine.config import Config
 from mmengine.logging.history_buffer import HistoryBuffer
 
-
 _SPEC = importlib.util.spec_from_file_location(
     "rosa_run_tool",
     Path(__file__).parents[1] / "tools" / "run.py",
@@ -41,8 +40,7 @@ def _native_deploy_config(
     *,
     head_type: str = "ROSAOfficialResidualNativeBaselineHead",
     deformable_type: str = (
-        "ROSAInferenceReuseExactHomogeneous4x4FullFOV"
-        "DeformableFeatureAggregation"
+        "ROSAInferenceReuseExactHomogeneous4x4FullFOV" "DeformableFeatureAggregation"
     ),
 ) -> Config:
     return Config(
@@ -98,15 +96,47 @@ def test_checkpoint_contract_accepts_matching_release(tmp_path: Path):
     )
 
 
+def test_checkpoint_contract_accepts_matching_factorized_compact(tmp_path: Path):
+    checkpoint = tmp_path / "factorized_v3.pth"
+    _save_checkpoint(
+        checkpoint,
+        has_rosa=True,
+        metadata=run_tool._checkpoint_contract_metadata(_config("balanced")),
+    )
+
+    run_tool._validate_checkpoint_contract(
+        checkpoint,
+        _config("balanced"),
+        allow_mismatch=False,
+    )
+
+
+def test_checkpoint_contract_rejects_dense_compact_v2(tmp_path: Path):
+    checkpoint = tmp_path / "dense_compact_v2.pth"
+    metadata = run_tool._checkpoint_contract_metadata(_config("balanced"))
+    assert metadata is not None
+    metadata["rosa_contract_version"] = 2
+    metadata.pop("rfl_topology_contract")
+    _save_checkpoint(checkpoint, has_rosa=True, metadata=metadata)
+
+    with pytest.raises(
+        ValueError,
+        match="factorized compact RFL requires checkpoint contract v3",
+    ):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _config("balanced"),
+            allow_mismatch=False,
+        )
+
+
 def test_checkpoint_contract_reads_mmengine_history_without_unsafe_pickle(
     tmp_path: Path,
 ):
     checkpoint = tmp_path / "mmengine_checkpoint.pth"
     torch.save(
         {
-            "state_dict": {
-                "head.canonical_sixth_block.rosa.weight": torch.ones(1)
-            },
+            "state_dict": {"head.canonical_sixth_block.rosa.weight": torch.ones(1)},
             "meta": {
                 "architecture": "ROSA R18 Main126",
                 "projection_contract": "legacy_front_only",
@@ -283,6 +313,10 @@ def test_checkpoint_hook_records_effective_contract():
     )
 
     assert checkpoint["meta"]["epoch"] == 2
+    assert checkpoint["meta"]["rosa_contract_version"] == 3
+    assert checkpoint["meta"]["rfl_topology_contract"] == (
+        "rosa.rfl.signed_gated_cp16.v3"
+    )
     assert checkpoint["meta"]["projection_contract"] == "full_fov"
     assert checkpoint["meta"]["refinement_profile"] == "fast"
     assert checkpoint["meta"]["rosa_config"]["architecture_profile"] == "compact"
@@ -300,20 +334,24 @@ class _FakeRefiner:
         self._compiled_call_impl = object()
 
 
-def test_fast_compile_supports_alias_and_is_idempotent():
+def test_fast_compile_is_idempotent():
     refiner = _FakeRefiner()
     runner = SimpleNamespace(
         model=SimpleNamespace(
             head=SimpleNamespace(rosa_refiner=refiner),
         )
     )
-    config = _config("compact_v2_fast")
+    config = _config("fast")
 
     assert run_tool._compile_fast_inference(runner, config)
     assert run_tool._compile_fast_inference(runner, config)
-    assert refiner.compile_calls == [
-        {"mode": "reduce-overhead", "fullgraph": False}
-    ]
+    assert refiner.compile_calls == [{"mode": "reduce-overhead", "fullgraph": False}]
+
+
+def test_retired_dense_compact_v2_fails_before_compile():
+    runner = SimpleNamespace(model=SimpleNamespace())
+    with pytest.raises(ValueError, match="retired dense compact v2 topology"):
+        run_tool._compile_fast_inference(runner, _config("compact_v2_fast"))
 
 
 def test_non_fast_profile_is_not_compiled():
@@ -343,9 +381,7 @@ def test_evaluate_enables_trusted_mmengine_checkpoint_load(
     class FakeRunner:
         @classmethod
         def from_cfg(cls, received_config):
-            assert (
-                run_tool.os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] == "1"
-            )
+            assert run_tool.os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] == "1"
             calls.append(("build", received_config.load_from))
             return cls()
 
@@ -383,9 +419,7 @@ def _object_depth_source_state() -> OrderedDict:
         for index in range(run_tool._OBJECT_DEPTH_DEPLOY_STATE_KEYS)
     )
     for level in range(3):
-        state[f"depth_branch.depth_layers.{level}.weight"] = torch.ones(
-            1, 256, 1, 1
-        )
+        state[f"depth_branch.depth_layers.{level}.weight"] = torch.ones(1, 256, 1, 1)
         state[f"depth_branch.depth_layers.{level}.bias"] = torch.ones(1)
     state._metadata = OrderedDict(
         [
@@ -482,9 +516,7 @@ def test_export_deploy_strips_only_train_depth_and_training_state(
         source,
     )
     _approve_synthetic_source(monkeypatch, source)
-    result = run_tool.export_deploy(
-        SimpleNamespace(checkpoint=source, output=output)
-    )
+    result = run_tool.export_deploy(SimpleNamespace(checkpoint=source, output=output))
 
     exported = torch.load(output, map_location="cpu", weights_only=True)
     assert set(exported) == {"meta", "state_dict"}
@@ -496,9 +528,7 @@ def test_export_deploy_strips_only_train_depth_and_training_state(
         run_tool._OBJECT_DEPTH_TRAIN_ONLY_KEYS
     )
     assert exported["meta"]["stripped_elements"] == 771
-    assert exported["meta"]["native_deploy_behavior"] == (
-        run_tool._C73_DEPLOY_BEHAVIOR
-    )
+    assert exported["meta"]["native_deploy_behavior"] == (run_tool._C73_DEPLOY_BEHAVIOR)
     assert exported["meta"]["native_deploy_target_head_type"] == (
         "ROSAOfficialResidualNativeBaselineHead"
     )
@@ -523,8 +553,7 @@ def test_export_deploy_strips_only_train_depth_and_training_state(
             output,
             _native_deploy_config(
                 deformable_type=(
-                    "ROSAMetricGatedAffine3x3FullFOV"
-                    "DeformableFeatureAggregation"
+                    "ROSAMetricGatedAffine3x3FullFOV" "DeformableFeatureAggregation"
                 )
             ),
             allow_mismatch=False,
@@ -650,9 +679,7 @@ def test_export_deploy_never_overwrites_existing_output(tmp_path: Path):
     output.write_bytes(b"keep-me")
 
     with pytest.raises(FileExistsError):
-        run_tool.export_deploy(
-            SimpleNamespace(checkpoint=source, output=output)
-        )
+        run_tool.export_deploy(SimpleNamespace(checkpoint=source, output=output))
     assert output.read_bytes() == b"keep-me"
 
 
@@ -682,8 +709,8 @@ def test_approved_source_is_deserialized_from_its_hashed_snapshot(
         load_snapshot,
     )
 
-    checkpoint, observed_sha256, byte_count = (
-        run_tool._load_approved_c73_checkpoint(source)
+    checkpoint, observed_sha256, byte_count = run_tool._load_approved_c73_checkpoint(
+        source
     )
 
     assert checkpoint == {"state_dict": "captured"}

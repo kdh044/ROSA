@@ -191,9 +191,7 @@ def test_global_relation_hook_keeps_the_legacy_tensor_abi():
             assert relation.shape[-1] == 19
             observed.append(relation[..., 8:11])
 
-    handle = torch.nn.modules.module.register_module_forward_pre_hook(
-        inspect_relation
-    )
+    handle = torch.nn.modules.module.register_module_forward_pre_hook(inspect_relation)
     try:
         output = stage(anchor, query, fpn, metas, generator)
     finally:
@@ -497,9 +495,7 @@ def test_balanced_profile_vectorizes_three_full_span_candidates():
     assert output.candidate_features.shape == (1, 2, 3, 16)
     assert torch.equal(output.final_anchor, anchor)
 
-    legacy, *_ = _fixture(
-        ROSAConfig(embed_dims=16, hidden_dims=8)
-    )
+    legacy, *_ = _fixture(ROSAConfig(embed_dims=16, hidden_dims=8))
     legacy_output = legacy(anchor, query, fpn, metas, generator)
     torch.testing.assert_close(
         output.iteration_candidate_offsets[:, :, 0, (0, 2)],
@@ -761,9 +757,25 @@ def test_lean_inference_hook_keeps_full_observation_abi():
 def test_compact_refiner_parameter_contract():
     balanced = ROSARefiner(ROSAConfig.from_mapping({"profile": "balanced"}))
     fast = ROSARefiner(ROSAConfig.from_mapping({"profile": "fast"}))
-    assert sum(parameter.numel() for parameter in balanced.parameters()) == 120_559
-    assert sum(parameter.numel() for parameter in fast.parameters()) == 120_559
-    assert len(balanced.state_dict()) == 39
+    assert sum(parameter.numel() for parameter in balanced.parameters()) == 87_935
+    assert sum(parameter.numel() for parameter in fast.parameters()) == 87_935
+    assert len(balanced.state_dict()) == 40
+
+    rfl = fast.rosa.rfl
+    assert sum(parameter.numel() for parameter in rfl.parameters()) == 8_336
+    learned_macs_per_observation = (
+        rfl.appearance_proj.weight.numel()
+        + rfl.ray_proj.weight.numel()
+        + rfl.output_proj.weight.numel()
+    )
+    assert learned_macs_per_observation == 8_336
+    fast_observations = 4 * (50 + 150) * 4 * 13
+    assert fast_observations == 41_600
+    assert learned_macs_per_observation * fast_observations == 346_777_600
+    assert rfl.hidden_dims * fast_observations == 665_600
+    assert (
+        learned_macs_per_observation + rfl.hidden_dims
+    ) * fast_observations == 347_443_200
 
 
 def test_compact_candidate_confidence_uses_only_supported_hypotheses():
@@ -885,9 +897,7 @@ def test_corrected_geometry_normalizes_yaw_without_changing_native_box():
     observed_norms = []
 
     def captured_generator(box, sidecar_query):
-        observed_norms.append(
-            torch.linalg.vector_norm(box[..., 6:8], dim=-1)
-        )
+        observed_norms.append(torch.linalg.vector_norm(box[..., 6:8], dim=-1))
         return generator(box, sidecar_query)
 
     output = stage(anchor, query, fpn, metas, captured_generator)

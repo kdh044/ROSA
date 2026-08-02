@@ -819,6 +819,10 @@ class _SemanticConfig:
     def from_mapping(cls, value):
         return cls(**dict(value))
 
+    @property
+    def rfl_topology_contract(self):
+        return "rosa.rfl.signed_gated_cp16.v3"
+
 
 class _SemanticRunTool:
     target = _SemanticConfig(50, 1, "full_fov", 68.0, True)
@@ -851,7 +855,8 @@ def _semantic_checkpoint(**source_overrides):
         "meta": {
             "rosa_config": source,
             "refinement_profile": "balanced",
-            "rosa_contract_version": 2,
+            "rosa_contract_version": 3,
+            "rfl_topology_contract": "rosa.rfl.signed_gated_cp16.v3",
             "projection_contract": "full_fov",
         },
         "state_dict": {"head.rosa_refiner.weight": "sealed"},
@@ -871,6 +876,8 @@ def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta(
 
     assert record["validated_against_arm"] == arm
     assert record["source_refinement_profile"] == "balanced"
+    assert record["rosa_contract_version"] == 3
+    assert record["rfl_topology_contract"] == ("rosa.rfl.signed_gated_cp16.v3")
     assert record["allowed_runtime_delta"] == tool.FAST_CHECKPOINT_ALLOWED_DELTAS
     assert record["observed_runtime_delta"] == tool.FAST_CHECKPOINT_ALLOWED_DELTAS
     assert record["runtime_model_profile"] == "fast"
@@ -899,6 +906,14 @@ def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta(
                 refinement_profile="published"
             ),
             "not balanced",
+        ),
+        (
+            lambda checkpoint: checkpoint["meta"].update(rosa_contract_version=2),
+            "contract version",
+        ),
+        (
+            lambda checkpoint: checkpoint["meta"].pop("rfl_topology_contract"),
+            "RFL topology contract",
         ),
     ),
 )

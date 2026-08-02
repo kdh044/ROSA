@@ -5,7 +5,6 @@ from mmengine.config import Config
 
 from rosa import ROSAConfig
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -68,9 +67,7 @@ def test_v2_native_sampling_and_refiner_share_gravity_center_z_contract():
 
 
 def test_v2_b0_removes_only_the_rosa_sidecar_contract():
-    resolved = Config.fromfile(
-        ROOT / "configs" / "rosa_r18_main126_v2_b0_native.py"
-    )
+    resolved = Config.fromfile(ROOT / "configs" / "rosa_r18_main126_v2_b0_native.py")
     head = resolved.model.head
     assert head.type == "ROSANativeBaselineHead"
     assert head.rosa_cfg is None
@@ -78,9 +75,7 @@ def test_v2_b0_removes_only_the_rosa_sidecar_contract():
         "ROSANormalizedKeyPointsGenerator"
     )
     assert not head.instance_bank.anchor_handler.anchor_z_is_bottom
-    assert head.deformable_model.type == (
-        "ROSAFullFOVDeformableFeatureAggregation"
-    )
+    assert head.deformable_model.type == ("ROSAFullFOVDeformableFeatureAggregation")
     assert not head.deformable_model.kps_generator.anchor_z_is_bottom
     assert not resolved.experiment_contract.rosa_sidecar
 
@@ -98,16 +93,31 @@ def test_fast_profile_only_changes_the_compute_budget():
     assert fast.num_refinement_steps == 1
 
 
-def test_early_compact_profile_name_remains_an_exact_alias():
-    assert ROSAConfig.from_mapping(
-        {"profile": "compact_v2"}
-    ) == ROSAConfig.from_mapping({"profile": "balanced"})
+@pytest.mark.parametrize("profile", ("compact_v2", "compact_v2_fast"))
+def test_dense_compact_v2_profile_names_fail_closed(profile):
+    with pytest.raises(ValueError, match="retired dense compact v2 topology"):
+        ROSAConfig.from_mapping({"profile": profile})
+
+
+def test_rfl_topology_is_owned_by_the_behavior_profile():
+    assert (
+        ROSAConfig.from_mapping({"profile": "balanced"}).rfl_topology_contract
+        == "rosa.rfl.signed_gated_cp16.v3"
+    )
+    assert (
+        ROSAConfig.from_mapping({"profile": "fast"}).rfl_topology_contract
+        == "rosa.rfl.signed_gated_cp16.v3"
+    )
+    assert (
+        ROSAConfig.from_mapping({"profile": "published"}).rfl_topology_contract
+        == "rosa.rfl.dense_outer_product.v2"
+    )
 
 
 def test_published_profile_keeps_the_release_alias():
-    assert ROSAConfig.from_mapping(
-        {"profile": "published"}
-    ) == ROSAConfig.from_mapping({"profile": "legacy_release"})
+    assert ROSAConfig.from_mapping({"profile": "published"}) == ROSAConfig.from_mapping(
+        {"profile": "legacy_release"}
+    )
 
 
 def test_unknown_profile_is_rejected():
