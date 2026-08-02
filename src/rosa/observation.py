@@ -282,7 +282,10 @@ def sample_multiscale_features(
         and levels.layout == torch.strided
         and levels._base is None
         and not levels.is_quantized
-        and all(name is None for name in levels.names)
+        and (
+            torch._dynamo.is_compiling()
+            or all(name is None for name in levels.names)
+        )
     ):
         # ``levels`` is the private result of ``stack``.  Evaluation can reuse
         # that storage for the weighted reduction instead of materializing a

@@ -79,6 +79,34 @@ def test_eval_multiscale_storage_reuse_is_raw_exact():
     assert torch.equal(actual, expected)
 
 
+def test_eval_multiscale_storage_reuse_supports_fullgraph_compile():
+    generator = torch.Generator().manual_seed(7101080)
+    fpn = tuple(
+        torch.randn(1, 2, 8, size, size, generator=generator)
+        for size in (8, 4, 2, 1)
+    )
+    uv = torch.rand(1, 3, 2, 13, 2, generator=generator)
+    query = torch.randn(1, 3, 8, generator=generator)
+    sampler = FusedBilinearSampler()
+    level_head = torch.nn.Linear(8, 4)
+
+    def fuse(query_value, uv_value, *features):
+        return sample_multiscale_features(
+            features,
+            uv_value,
+            query_value,
+            sampler,
+            level_head,
+        )
+
+    with torch.no_grad():
+        expected = fuse(query, uv, *fpn)
+        compiled = torch.compile(fuse, backend="eager", fullgraph=True)
+        actual = compiled(query, uv, *fpn)
+
+    assert torch.equal(actual, expected)
+
+
 def test_training_multiscale_path_preserves_output_and_gradients():
     generator = torch.Generator().manual_seed(7101080)
     parent_fpn = [
