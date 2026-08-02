@@ -111,9 +111,10 @@ def _camera_xyz_affine(points: Tensor, lidar2cam: Tensor) -> Tensor:
 def _sanitize_camera_xyz(camera_xyz: Tensor) -> tuple[Tensor, Tensor]:
     """Make undefined rays harmless before differentiable projection math."""
 
-    finite_and_bounded = torch.isfinite(camera_xyz).all(dim=-1) & (
-        camera_xyz.detach().abs().amax(dim=-1) < 1e4
-    )
+    # IEEE comparisons with NaN are false and abs(Inf) exceeds the bound, so
+    # this single reduction is exactly the former finite-and-bounded test.
+    # Avoid a redundant isfinite/all reduction in every decoder stage.
+    finite_and_bounded = camera_xyz.detach().abs().amax(dim=-1) < 1e4
     bounded = torch.where(
         finite_and_bounded[..., None],
         camera_xyz,
@@ -139,9 +140,10 @@ def _sanitize_camera_xyz_inference_storage_reuse(
             "OCam inference storage reuse requires torch.no_grad() or "
             "torch.inference_mode()"
         )
-    finite_and_bounded = torch.isfinite(camera_xyz).all(dim=-1) & (
-        camera_xyz.detach().abs().amax(dim=-1) < 1e4
-    )
+    # The strict magnitude comparison rejects NaN and both infinities while
+    # also enforcing the historical bound; a separate finite reduction would
+    # only materialize the same predicate twice.
+    finite_and_bounded = camera_xyz.detach().abs().amax(dim=-1) < 1e4
     # ``camera_xyz`` is the freshly allocated affine/matmul result and never
     # aliases a caller input.  Reuse it instead of retaining separate
     # bounded and safe full-size XYZ tensors.
@@ -303,8 +305,8 @@ def ocam_project_points(
     width = image_wh[..., 0][:, :, None, None]
     height = image_wh[..., 1][:, :, None, None]
     if inference_storage_reuse:
-        valid.logical_and_(torch.isfinite(pixel_u))
-        valid.logical_and_(torch.isfinite(pixel_v))
+        # Range comparisons already reject NaN and either infinity under IEEE
+        # semantics.  The explicit isfinite masks were therefore redundant.
         valid.logical_and_(pixel_u.ge(0))
         valid.logical_and_(pixel_u.lt(width))
         valid.logical_and_(pixel_v.ge(0))
@@ -312,8 +314,6 @@ def ocam_project_points(
     else:
         valid = (
             valid
-            & torch.isfinite(pixel_u)
-            & torch.isfinite(pixel_v)
             & pixel_u.ge(0)
             & pixel_u.lt(width)
             & pixel_v.ge(0)

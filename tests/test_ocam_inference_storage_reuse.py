@@ -276,7 +276,10 @@ def test_inference_storage_reuse_preserves_polynomial_dtype_promotion():
 
 @pytest.mark.parametrize(
     ("contract", "expected_inplace_conjunctions"),
-    (("full_fov", 7), ("legacy_front_only", 8)),
+    # Incidence plus four rectangular bounds; the legacy contract adds its
+    # front-plane predicate.  Non-finite pixels need no extra conjunction
+    # because IEEE range comparisons already reject them.
+    (("full_fov", 5), ("legacy_front_only", 6)),
 )
 def test_inference_storage_reuse_owns_incidence_and_validity_buffers(
     contract,

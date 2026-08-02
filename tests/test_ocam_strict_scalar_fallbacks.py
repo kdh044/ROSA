@@ -205,11 +205,81 @@ def test_scalar_fallback_projection_preserves_invalid_ray_sentinels():
     assert torch.equal(invalid, torch.full_like(invalid, 2.0))
 
 
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float64))
+def test_single_bound_reduction_matches_explicit_finiteness_oracle(dtype):
+    rows = torch.tensor(
+        [
+            [0.0, 0.0, -1.0],
+            [float("nan"), 0.0, -1.0],
+            [0.0, float("nan"), -1.0],
+            [0.0, 0.0, float("nan")],
+            [float("inf"), 0.0, -1.0],
+            [0.0, float("-inf"), -1.0],
+            [0.0, 0.0, float("inf")],
+            [9_999.0, 0.0, -1.0],
+            [10_000.0, 0.0, -1.0],
+            [-10_000.0, 0.0, -1.0],
+            [5.0e-4, 0.0, 0.0],
+            [1.0e-3, 0.0, 0.0],
+        ],
+        dtype=dtype,
+    ).reshape(1, 1, -1, 1, 3)
+    expected_safe, expected_valid = _legacy_sanitize(rows)
+
+    actual_safe, actual_valid = geometry._sanitize_camera_xyz(rows)
+    with torch.no_grad():
+        reused_safe, reused_valid = (
+            geometry._sanitize_camera_xyz_inference_storage_reuse(
+                rows.clone()
+            )
+        )
+
+    assert torch.equal(actual_safe, expected_safe)
+    assert torch.equal(actual_valid, expected_valid)
+    assert torch.equal(reused_safe, expected_safe)
+    assert torch.equal(reused_valid, expected_valid)
+
+
+@pytest.mark.parametrize("source", ("polynomial_nan", "intrinsic_inf"))
+def test_range_predicates_reject_nonfinite_projected_pixels(source):
+    points, metas, image_wh, _ = _fixture(
+        dtype=torch.float32,
+        seed=3407,
+        camera_conditioned=False,
+    )
+    if source == "polynomial_nan":
+        metas["ocam_pol"][..., 0] = float("nan")
+    else:
+        metas["ocam_intrinsic"][..., 1, 0] = float("inf")
+
+    parent = _legacy_project(points, metas, image_wh, contract="full_fov")
+    candidate = geometry.ocam_project_points(
+        points,
+        metas,
+        image_wh,
+        contract="full_fov",
+    )
+    with torch.no_grad():
+        reused = geometry.ocam_project_points(
+            points,
+            metas,
+            image_wh,
+            contract="full_fov",
+            inference_storage_reuse=True,
+        )
+
+    assert torch.equal(candidate, parent)
+    assert torch.equal(reused, parent)
+    assert torch.equal(candidate, torch.full_like(candidate, 2.0))
+
+
 def test_scalar_fallback_source_avoids_full_fallback_inputs():
     sanitize_source = inspect.getsource(geometry._sanitize_camera_xyz)
     projection_source = inspect.getsource(geometry.ocam_project_points)
     assert "torch.zeros_like(camera_xyz)" not in sanitize_source
+    assert "torch.isfinite(camera_xyz)" not in sanitize_source
     assert "torch.zeros_like(rho)" not in projection_source
+    assert "torch.isfinite(pixel_" not in projection_source
     assert "torch.full_like(normalized_u" not in projection_source
 
 
