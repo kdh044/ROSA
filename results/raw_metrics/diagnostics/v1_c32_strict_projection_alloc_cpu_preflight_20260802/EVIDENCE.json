@@ -1,0 +1,67 @@
+{
+  "schema": "rosa.c32_strict_ocam_projection_alloc.cpu_preflight.v1",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "parent_commit": "4d39531c9510a2e666abb860af5f97b3c9e02d46",
+  "candidate_commit": "c19cb45f860be0167edbd4cba0c12e4f198b97d5",
+  "change": "remove full fallback/sentinel inputs and defer redundant Horner materialization while preserving the exact historical projection arithmetic",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "gpu_execution": false,
+  "gpu_context_or_allocation": false,
+  "failed_device_count_probe_observed_from_cpu_profiler": true,
+  "exactness": {
+    "dtypes": ["torch.float32", "torch.float64"],
+    "seeds": [3407, 7101080, 918031],
+    "point_layouts": ["shared [B,N,P,3]", "camera-conditioned [B,C,N,P,3]"],
+    "projection_contracts": ["legacy_front_only", "full_fov"],
+    "projection_output_raw_bit_equal": true,
+    "gradient_raw_bit_equal": ["points", "lidar2cam", "ocam_intrinsic", "ocam_pol"],
+    "horner_coefficient_counts": [1, 2, 5, 8],
+    "horner_output_stride_equal": true,
+    "invalid_nan_inf_origin_sentinel_equal": true
+  },
+  "cpu_projection_observation": {
+    "scope": "one full CPU OCam projection; no H2D, CUDA, detector, or end-to-end claim",
+    "shape": [4, 4, 300, 13],
+    "torch_threads": 1,
+    "warmup_per_arm": 60,
+    "physical_round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
+    "measured_per_arm_per_round": 300,
+    "rounds": [
+      {"round": 0, "order": "PC", "parent_median_ms": 4.0517164999999995, "candidate_median_ms": 4.0307045, "candidate_over_parent_median_ratio": 0.9948140497984003, "parent_p95_ms": 4.5588895, "candidate_p95_ms": 4.417933700000001},
+      {"round": 1, "order": "CP", "parent_median_ms": 4.0406495, "candidate_median_ms": 4.0238095000000005, "candidate_over_parent_median_ratio": 0.9958323531897535, "parent_p95_ms": 4.191876, "candidate_p95_ms": 4.1871395499999995},
+      {"round": 2, "order": "PC", "parent_median_ms": 4.036509000000001, "candidate_median_ms": 4.020944999999999, "candidate_over_parent_median_ratio": 0.9961441929152143, "parent_p95_ms": 4.2325921, "candidate_p95_ms": 4.2911128},
+      {"round": 3, "order": "CP", "parent_median_ms": 4.043082999999999, "candidate_median_ms": 4.0330285, "candidate_over_parent_median_ratio": 0.9975131601305244, "parent_p95_ms": 4.2152791, "candidate_p95_ms": 4.21884755},
+      {"round": 4, "order": "PC", "parent_median_ms": 4.036077000000001, "candidate_median_ms": 4.0207395, "candidate_over_parent_median_ratio": 0.9961998990603994, "parent_p95_ms": 4.20087615, "candidate_p95_ms": 4.1984734},
+      {"round": 5, "order": "CP", "parent_median_ms": 4.0355170000000005, "candidate_median_ms": 4.0183965, "candidate_over_parent_median_ratio": 0.9957575448201554, "parent_p95_ms": 4.1993606, "candidate_p95_ms": 4.19528965}
+    ],
+    "median_of_round_median_ratios": 0.9959882730524838,
+    "parent_positive_self_cpu_allocation_bytes": 24024260,
+    "candidate_positive_self_cpu_allocation_bytes": 21840260,
+    "allocation_reduction_bytes": 2184000,
+    "allocation_reduction_fraction": 0.09090810705511845,
+    "parent_zeros_like_calls": 3,
+    "candidate_zeros_like_calls": 0,
+    "parent_full_like_calls": 1,
+    "candidate_full_like_calls": 0,
+    "parent_clone_calls": 3,
+    "candidate_clone_calls": 2,
+    "interpretation": "strict allocation reduction with only a small CPU latency change; no CUDA or detector speed claim"
+  },
+  "tests": {
+    "focused": "34 passed in 1.01s",
+    "full_cpu_suite": "242 passed, 5 skipped, 68 warnings in 14.63s",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/geometry.py": "f158c9e4243047cb7da2763bd10657c397212f03ccfd7961e0a27e5fb7d88d88",
+    "tests/test_ocam_strict_scalar_fallbacks.py": "035138a72b029fa8eeaccc93efac91bf7532e855081a6d046b9ddd348ab287d2"
+  },
+  "pending_gates": [
+    "CUDA FP32/BF16 raw-bit forward and first-order-gradient equality",
+    "real Main126 D0-D5 validity mask and decoded prediction equality",
+    "paired CUDA projection/full-test-step latency and peak-memory non-regression"
+  ]
+}
