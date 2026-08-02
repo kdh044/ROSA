@@ -103,16 +103,21 @@ class Fisheye3DODSingleFrameInplaceDataPreprocessor(
             )
         if img.requires_grad:
             raise ValueError("image ingress must not require gradients")
+        if img.ndim != 5 or img.shape[-3] != 3:
+            raise ValueError(
+                "in-place uint8 preprocessing requires [B,camera,3,H,W] input"
+            )
         if not self._channel_conversion:
             raise ValueError(
                 "in-place uint8 preprocessing requires fixed BGR-to-RGB conversion"
             )
 
-        # Advanced channel indexing allocates fresh uint8 storage; float then
-        # allocates the model's FP32 input.  Normalizing that owned tensor in
-        # place removes the otherwise live input and subtraction temporaries
-        # while the division output is allocated.
-        img = img[..., [2, 1, 0], :, :].float()
+        # Flipping the fixed three-channel axis allocates fresh uint8 storage
+        # without building an advanced-index kernel; float then allocates the
+        # model's FP32 input.  Normalizing that owned tensor in place removes
+        # the otherwise live input and subtraction temporaries while the
+        # division output is allocated.
+        img = img.flip(dims=(-3,)).float()
         if self._enable_normalize:
             shape = [1] * (img.dim() - 3) + list(self.mean.shape)
             mean = self.mean.view(shape)

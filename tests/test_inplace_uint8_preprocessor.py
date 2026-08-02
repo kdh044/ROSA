@@ -59,6 +59,10 @@ def test_inplace_uint8_processing_fails_closed_outside_owned_ingress():
         candidate._process_img(torch.zeros(1, 4, 3, 32, 32))
     with pytest.raises(RuntimeError, match="prediction-only"):
         candidate({}, training=True)
+    with pytest.raises(ValueError, match=r"\[B,camera,3,H,W\]"):
+        candidate._process_img(
+            torch.zeros(4, 3, 32, 32, dtype=torch.uint8)
+        )
 
     no_conversion = Fisheye3DODSingleFrameInplaceDataPreprocessor(
         mean=(123.675, 116.28, 103.53),

@@ -22,12 +22,12 @@ experiment_contract = dict(
     arm="C32-runtime-owned-buffer-inplace-normalization",
     paired_parent="C32-runtime-pinned-asynchronous-uint8-image-transfer",
     changed_operation=(
-        "normalize the freshly allocated FP32 prediction image with sub_ and "
-        "div_ instead of retaining a full-sized subtraction temporary"
+        "reverse the fixed three-channel BGR axis with flip, then normalize "
+        "the freshly allocated FP32 image with sub_ and div_"
     ),
     ingress="prediction-only contiguous uint8 BGR with fixed RGB conversion",
     training="fail closed; use the unchanged training configuration",
-    model_math="same eager subtract then divide elementwise sequence",
+    model_math="same exact channel permutation and eager subtract/divide sequence",
     logical_fp32_temporary_bytes_removed_per_batch4=245760000,
     learned_parameters_added=0,
     buffers_added=0,
