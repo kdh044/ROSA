@@ -268,6 +268,76 @@ def test_full_loss_backward_keeps_every_parameter_in_the_ddp_graph(
     assert nonfinite == []
 
 
+def test_compact_production_loss_unlocks_factorized_rfl_on_third_backward(
+    monkeypatch,
+):
+    with torch.random.fork_rng(devices=[]):
+        config = ROSAConfig.from_mapping(
+            {
+                "profile": "fast",
+                "embed_dims": 16,
+                "hidden_dims": 8,
+            }
+        )
+        refiner, _, _ = _full_loss(config)
+        # Reuse one trained module while _full_loss rebuilds the same seeded
+        # inputs and the complete production supervision on every pass.
+        monkeypatch.setitem(globals(), "ROSARefiner", lambda _config: refiner)
+        optimizer = torch.optim.SGD(refiner.parameters(), lr=1e-3)
+        readouts = (
+            refiner.shared_shape_head[-1],
+            refiner.shared_tangent_head[-1],
+            refiner.range_distribution_head[-1],
+            refiner.candidate_head[-1],
+            refiner.center_gate_head[-1],
+        )
+        rfl = refiner.rosa.rfl
+        assert rfl.ray_proj is not None
+        assert all(torch.count_nonzero(head.weight) == 0 for head in readouts)
+        assert torch.count_nonzero(rfl.output_proj.weight) == 0
+
+        expected_rfl_gradients = (
+            (False, False, False),
+            (True, False, False),
+            (True, True, True),
+        )
+        for backward_index, expected in enumerate(expected_rfl_gradients):
+            optimizer.zero_grad(set_to_none=True)
+            reused, losses, objective = _full_loss(config)
+            assert reused is refiner
+            assert all(
+                torch.isfinite(value).all()
+                for name, value in losses.items()
+                if name.startswith("loss_")
+            )
+            objective.backward()
+
+            for head in readouts:
+                gradient = head.weight.grad
+                assert gradient is not None
+                assert torch.isfinite(gradient).all()
+                assert torch.count_nonzero(gradient) > 0
+            for parameter, should_be_nonzero in zip(
+                (
+                    rfl.output_proj.weight,
+                    rfl.appearance_proj.weight,
+                    rfl.ray_proj.weight,
+                ),
+                expected,
+            ):
+                gradient = parameter.grad
+                assert gradient is not None
+                assert torch.isfinite(gradient).all()
+                assert bool(torch.count_nonzero(gradient)) is should_be_nonzero
+
+            optimizer.step()
+            if backward_index == 0:
+                assert all(torch.count_nonzero(head.weight) > 0 for head in readouts)
+                assert torch.count_nonzero(rfl.output_proj.weight) == 0
+            elif backward_index == 1:
+                assert torch.count_nonzero(rfl.output_proj.weight) > 0
+
+
 def test_candidate_target_stays_normalized_when_best_hypothesis_is_hidden():
     distribution = _candidate_target_distribution(
         offsets=torch.tensor([[[-1.0, 0.0, 1.0]]]),

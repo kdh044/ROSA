@@ -7,11 +7,13 @@ import argparse
 import builtins
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
 import json
 import os
 from pathlib import Path
+import stat
 import statistics
 import tempfile
 import time
@@ -435,6 +437,175 @@ def _load_checkpoint_without_executing_code(checkpoint_path: Path):
             map_location="cpu",
             weights_only=True,
         )
+
+
+class _PrivateCheckpointSnapshot:
+    """One process-local, unlinked checkpoint snapshot held by a descriptor."""
+
+    __slots__ = ("path", "source_path", "private_directory", "sha256", "byte_count")
+
+    def __init__(
+        self,
+        *,
+        path: Path,
+        source_path: Path,
+        private_directory: Path,
+        sha256: str,
+        byte_count: int,
+    ) -> None:
+        self.path = path
+        self.source_path = source_path
+        self.private_directory = private_directory
+        self.sha256 = sha256
+        self.byte_count = byte_count
+
+
+def _regular_file_signature(file_stat: os.stat_result) -> tuple[int, ...]:
+    """Return fields that expose replacement or ordinary in-place mutation."""
+
+    return (
+        int(file_stat.st_dev),
+        int(file_stat.st_ino),
+        int(file_stat.st_mode),
+        int(file_stat.st_size),
+        int(file_stat.st_mtime_ns),
+        int(file_stat.st_ctime_ns),
+    )
+
+
+@contextmanager
+def _private_checkpoint_snapshot(checkpoint_path: Path):
+    """Copy a local regular file once and expose only its held descriptor.
+
+    Validation and MMEngine loading must both use ``snapshot.path``.  The
+    copied file is unlinked before yielding, so replacing the source pathname,
+    mutating the source inode, or guessing the private directory cannot change
+    the bytes reached through ``/proc/self/fd``.  The descriptor and its 0700
+    directory remain alive for the caller's load window and are released on
+    every normal or exceptional exit.
+
+    Under torchrun each DDP process executes this function independently.  A
+    descriptor path is process-local by definition, so it must never be passed
+    between ranks; every rank validates and loads its own exact-byte snapshot.
+    """
+
+    source_path = Path(checkpoint_path).expanduser().resolve(strict=True)
+    read_flags = os.O_RDONLY
+    read_flags |= getattr(os, "O_CLOEXEC", 0)
+    read_flags |= getattr(os, "O_NOFOLLOW", 0)
+    read_flags |= getattr(os, "O_NONBLOCK", 0)
+    create_flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    create_flags |= getattr(os, "O_CLOEXEC", 0)
+    create_flags |= getattr(os, "O_NOFOLLOW", 0)
+    directory_flags = os.O_RDONLY
+    directory_flags |= getattr(os, "O_CLOEXEC", 0)
+    directory_flags |= getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+
+    source_fd: int | None = None
+    directory_fd: int | None = None
+    writable_snapshot_fd: int | None = None
+    sealed_snapshot_fd: int | None = None
+    with tempfile.TemporaryDirectory(prefix="rosa-checkpoint-") as directory_name:
+        private_directory = Path(directory_name)
+        directory_stat = private_directory.stat()
+        if not stat.S_ISDIR(directory_stat.st_mode) or (
+            stat.S_IMODE(directory_stat.st_mode) & 0o077
+        ):
+            raise RuntimeError("checkpoint snapshot directory must be private")
+        try:
+            source_fd = os.open(source_path, read_flags)
+            source_before = os.fstat(source_fd)
+            if not stat.S_ISREG(source_before.st_mode):
+                raise ValueError("checkpoint source must be a regular file")
+
+            directory_fd = os.open(private_directory, directory_flags)
+            opened_directory_stat = os.fstat(directory_fd)
+            if (
+                not stat.S_ISDIR(opened_directory_stat.st_mode)
+                or stat.S_IMODE(opened_directory_stat.st_mode) & 0o077
+                or int(opened_directory_stat.st_dev) != int(directory_stat.st_dev)
+                or int(opened_directory_stat.st_ino) != int(directory_stat.st_ino)
+            ):
+                raise RuntimeError("checkpoint snapshot directory changed")
+            writable_snapshot_fd = os.open(
+                "checkpoint.pth",
+                create_flags,
+                0o600,
+                dir_fd=directory_fd,
+            )
+            digest = hashlib.sha256()
+            byte_count = 0
+            while True:
+                block = os.read(source_fd, 1024 * 1024)
+                if not block:
+                    break
+                digest.update(block)
+                byte_count += len(block)
+                remaining = memoryview(block)
+                while remaining:
+                    written = os.write(writable_snapshot_fd, remaining)
+                    if written <= 0:
+                        raise OSError("checkpoint snapshot write made no progress")
+                    remaining = remaining[written:]
+            os.fsync(writable_snapshot_fd)
+
+            source_after = os.fstat(source_fd)
+            if _regular_file_signature(source_before) != _regular_file_signature(
+                source_after
+            ):
+                raise RuntimeError("checkpoint source changed while being snapshotted")
+            if byte_count != int(source_before.st_size):
+                raise RuntimeError("checkpoint snapshot byte count changed during copy")
+
+            snapshot_stat = os.fstat(writable_snapshot_fd)
+            if not stat.S_ISREG(snapshot_stat.st_mode):
+                raise RuntimeError("checkpoint snapshot is not a regular file")
+            if int(snapshot_stat.st_size) != byte_count:
+                raise RuntimeError("checkpoint snapshot size is incomplete")
+
+            sealed_snapshot_fd = os.open(
+                "checkpoint.pth",
+                read_flags,
+                dir_fd=directory_fd,
+            )
+            sealed_stat = os.fstat(sealed_snapshot_fd)
+            if (
+                not stat.S_ISREG(sealed_stat.st_mode)
+                or int(sealed_stat.st_dev) != int(snapshot_stat.st_dev)
+                or int(sealed_stat.st_ino) != int(snapshot_stat.st_ino)
+                or int(sealed_stat.st_size) != byte_count
+            ):
+                raise RuntimeError("checkpoint snapshot descriptor changed")
+
+            os.unlink("checkpoint.pth", dir_fd=directory_fd)
+            os.close(writable_snapshot_fd)
+            writable_snapshot_fd = None
+            os.close(directory_fd)
+            directory_fd = None
+            os.close(source_fd)
+            source_fd = None
+            descriptor_path = Path(f"/proc/self/fd/{sealed_snapshot_fd}")
+            if not descriptor_path.is_file():
+                raise RuntimeError(
+                    "checkpoint sealing requires Linux procfs descriptors"
+                )
+            yield _PrivateCheckpointSnapshot(
+                path=descriptor_path,
+                source_path=source_path,
+                private_directory=private_directory,
+                sha256=digest.hexdigest(),
+                byte_count=byte_count,
+            )
+        finally:
+            for descriptor in (
+                sealed_snapshot_fd,
+                writable_snapshot_fd,
+                directory_fd,
+                source_fd,
+            ):
+                if descriptor is not None:
+                    os.close(descriptor)
 
 
 def _sha256_file(path: Path) -> str:
@@ -968,22 +1139,9 @@ def _resolve_train_resume_checkpoint(
     return None if discovered is None else Path(discovered).expanduser().resolve()
 
 
-def train(args: argparse.Namespace, config: Config) -> None:
-    if args.resume:
-        os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-        resume_checkpoint = _resolve_train_resume_checkpoint(args.resume, config)
-        if resume_checkpoint is not None:
-            _validate_checkpoint_contract(
-                resume_checkpoint,
-                config,
-                allow_mismatch=False,
-            )
-        # A missing auto checkpoint means a fresh run. Disable Runner's second
-        # discovery pass so a file created after validation cannot be loaded.
-        config.resume = resume_checkpoint is not None
-        # Pin auto-discovery to the validated path. Otherwise a changed
-        # ``last_checkpoint`` file could make Runner load a different artifact.
-        config.load_from = None if resume_checkpoint is None else str(resume_checkpoint)
+def _run_training(args: argparse.Namespace, config: Config) -> None:
+    """Build and run MMEngine after any resume checkpoint has been sealed."""
+
     if args.amp:
         if config.optim_wrapper.type != "OptimWrapper":
             raise ValueError("--amp requires a plain OptimWrapper")
@@ -1008,6 +1166,35 @@ def train(args: argparse.Namespace, config: Config) -> None:
             priority="VERY_LOW",
         )
     runner.train()
+
+
+def train(args: argparse.Namespace, config: Config) -> None:
+    if not args.resume:
+        _run_training(args, config)
+        return
+
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
+    resume_checkpoint = _resolve_train_resume_checkpoint(args.resume, config)
+    if resume_checkpoint is None:
+        # A missing auto checkpoint means a sealed fresh run. Disable Runner's
+        # later discovery pass so a newly-created last_checkpoint is ignored.
+        config.resume = False
+        config.load_from = None
+        _run_training(args, config)
+        return
+
+    # Keep this process-local descriptor alive until Runner has completed its
+    # internal load_or_resume call. Replacing or overwriting the original path
+    # after validation therefore cannot change the bytes MMEngine consumes.
+    with _private_checkpoint_snapshot(resume_checkpoint) as snapshot:
+        _validate_checkpoint_contract(
+            snapshot.path,
+            config,
+            allow_mismatch=False,
+        )
+        config.resume = True
+        config.load_from = str(snapshot.path)
+        _run_training(args, config)
 
 
 def evaluate(args: argparse.Namespace, config: Config) -> None:

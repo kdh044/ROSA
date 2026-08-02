@@ -22,9 +22,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
+import sys
 import tempfile
 from typing import Any, Callable
 
@@ -600,14 +602,6 @@ def routed_metric_records(
     return records
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as stream:
-        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
 def _atomic_torch_save(value: Any, path: Path, *, force: bool) -> None:
     path = path.resolve()
     if path.exists() and not force:
@@ -674,17 +668,37 @@ def _config_fingerprint(config: Any) -> str:
     return hashlib.sha256(config.pretty_text.encode("utf-8")).hexdigest()
 
 
+_RUN_TOOL_MODULE_NAME = "_rosa_stage_route_run_tool"
+
+
+def _checkpoint_run_tool():
+    """Load the sibling run tool without relying on ambient ``sys.path``."""
+
+    existing = sys.modules.get(_RUN_TOOL_MODULE_NAME)
+    if existing is not None:
+        return existing
+    module_path = Path(__file__).resolve().with_name("run.py")
+    spec = importlib.util.spec_from_file_location(_RUN_TOOL_MODULE_NAME, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load checkpoint contract tool from {module_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_RUN_TOOL_MODULE_NAME] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        sys.modules.pop(_RUN_TOOL_MODULE_NAME, None)
+        raise
+    return module
+
+
 def _validate_checkpoint_contract(checkpoint: Path, config: Any) -> None:
     """Apply the train/evaluate topology contract before MMEngine loading."""
 
-    try:
-        from tools.run import _validate_checkpoint_contract as validate
-    except ModuleNotFoundError as error:  # Direct ``python tools/...`` execution.
-        if error.name not in {"tools", "tools.run"}:
-            raise
-        from run import _validate_checkpoint_contract as validate
-
-    validate(checkpoint, config, allow_mismatch=False)
+    _checkpoint_run_tool()._validate_checkpoint_contract(
+        checkpoint,
+        config,
+        allow_mismatch=False,
+    )
 
 
 def _dataset_metainfo(dataset: Any) -> Mapping[str, Any]:
@@ -716,8 +730,6 @@ def dump_command(args: argparse.Namespace) -> None:
     checkpoint = args.checkpoint.resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
-    _validate_checkpoint_contract(checkpoint, config)
-    config.load_from = str(checkpoint)
     config.resume = False
     config.launcher = "none"
     if args.work_dir is not None:
@@ -729,8 +741,12 @@ def dump_command(args: argparse.Namespace) -> None:
     # This affects checkpoint loading only; the produced dump is weights-only
     # loadable because its schema contains tensors and primitive containers.
     os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-    runner = Runner.from_cfg(config)
-    runner.load_or_resume()
+    with _checkpoint_run_tool()._private_checkpoint_snapshot(checkpoint) as snapshot:
+        _validate_checkpoint_contract(snapshot.path, config)
+        config.load_from = str(snapshot.path)
+        runner = Runner.from_cfg(config)
+        runner.load_or_resume()
+        checkpoint_sha256 = snapshot.sha256
     model = _unwrapped_model(runner.model)
     model.eval()
     head = getattr(model, "head", None)
@@ -797,7 +813,7 @@ def dump_command(args: argparse.Namespace) -> None:
         config_path=args.config,
         config_fingerprint=fingerprint,
         checkpoint_path=checkpoint,
-        checkpoint_sha256=_sha256(checkpoint),
+        checkpoint_sha256=checkpoint_sha256,
     )
     _atomic_torch_save(payload, args.output, force=args.force)
     print(

@@ -155,10 +155,13 @@ The `balanced` and `fast` profiles use a signed rank-16 factorization of the
 appearance-by-degree-2-SH interaction. This reduces the RFL from 40,960 to
 8,336 learned weights while leaving the `published` and `legacy_release`
 profiles on the released dense outer-product topology. The compact output
-projection starts at zero: the first optimizer step trains that projection,
-and the resulting nonzero map unlocks finite gradients for the appearance and
-ray factors on the second step. This delayed unlock is intentional and covered
-by a two-step regression test.
+projection starts at zero. At the isolated RFL module boundary, a supplied
+upstream gradient trains that projection on the first optimizer step and
+unlocks the appearance and ray factors on the second backward. The complete
+refiner also starts its task readouts at zero to preserve the native box: its
+first backward trains those readouts, its second trains the RFL output
+projection, and its third unlocks the appearance and ray factors. Separate
+module-local and production-loss regressions cover both intentional sequences.
 
 Factorized compact checkpoints use contract v3 and
 `rosa.rfl.signed_gated_cp16.v3`. Dense compact-v2 checkpoints are not
@@ -169,6 +172,10 @@ complete config-owned ROSA refiner key/shape schema before MMEngine loads the
 checkpoint. The mismatch override may relax audited projection metadata, but
 cannot bypass topology or state integrity failures. Historical
 `canonical_sixth_block` prefixes remain accepted through the released remap.
+Training resume and stage-route dumping validate and load the same unlinked,
+private exact-byte snapshot rather than reopening the source pathname. Under
+torchrun, every DDP process owns, validates, and cleans up its own descriptor;
+descriptor paths are process-local and are never shared between ranks.
 
 ## Checkpoint and results
 

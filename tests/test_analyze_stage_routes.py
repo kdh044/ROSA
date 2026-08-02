@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import importlib.util
 from dataclasses import asdict
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -384,6 +386,21 @@ def test_dump_rejects_partial_factorized_checkpoint_before_runner_build(
         }
     )
     monkeypatch.setattr(stage_routes, "_config_from_args", lambda _args: config)
+    checkpoint_tool = stage_routes._checkpoint_run_tool()
+    snapshot_factory = checkpoint_tool._private_checkpoint_snapshot
+    observed = {}
+
+    @contextmanager
+    def observe_snapshot(path):
+        with snapshot_factory(path) as snapshot:
+            observed["snapshot"] = snapshot
+            yield snapshot
+
+    monkeypatch.setattr(
+        checkpoint_tool,
+        "_private_checkpoint_snapshot",
+        observe_snapshot,
+    )
 
     from mmengine.runner import Runner
 
@@ -401,3 +418,139 @@ def test_dump_rejects_partial_factorized_checkpoint_before_runner_build(
 
     with pytest.raises(ValueError, match="topology integrity.*missing keys"):
         stage_routes.dump_command(args)
+    snapshot = observed["snapshot"]
+    assert not snapshot.path.exists()
+    assert not snapshot.private_directory.exists()
+
+
+def _save_factorized_checkpoint(path: Path) -> None:
+    from rosa import ROSAConfig, ROSARefiner
+
+    effective = ROSAConfig.from_mapping({"profile": "balanced"})
+    with torch.random.fork_rng(devices=[]):
+        state = ROSARefiner(effective).state_dict()
+    torch.save(
+        {
+            "state_dict": {
+                "head.rosa_refiner." + key: value for key, value in state.items()
+            },
+            "meta": {
+                "rosa_contract_version": 3,
+                "rfl_topology_contract": effective.rfl_topology_contract,
+                "projection_contract": effective.projection_contract,
+                "rosa_config": asdict(effective),
+            },
+        },
+        path,
+    )
+
+
+@pytest.mark.parametrize("attack", ("rename_replace", "in_place_overwrite"))
+def test_dump_loads_verified_snapshot_after_source_path_attack_and_cleans_up(
+    tmp_path,
+    monkeypatch,
+    attack,
+):
+    pytest.importorskip("mmengine")
+    from mmengine.config import Config
+    from mmengine.runner import Runner
+
+    checkpoint = tmp_path / "valid.pth"
+    _save_factorized_checkpoint(checkpoint)
+    original_inode = checkpoint.stat().st_ino
+    config = Config(
+        {
+            "model": {
+                "head": {
+                    "type": "ROSASparse4DHead",
+                    "rosa_cfg": {"profile": "balanced"},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(stage_routes, "_config_from_args", lambda _args: config)
+
+    checkpoint_tool = stage_routes._checkpoint_run_tool()
+    snapshot_factory = checkpoint_tool._private_checkpoint_snapshot
+    validate = stage_routes._validate_checkpoint_contract
+    observed = {}
+
+    @contextmanager
+    def observe_snapshot(path):
+        with snapshot_factory(path) as snapshot:
+            observed["snapshot"] = snapshot
+            yield snapshot
+
+    def validate_then_attack(snapshot_path, received_config):
+        validate(snapshot_path, received_config)
+        invalid = {
+            "state_dict": {"head.decoder.weight": torch.ones(1)},
+            "meta": {},
+        }
+        if attack == "rename_replace":
+            replacement = tmp_path / "replacement.pth"
+            torch.save(invalid, replacement)
+            os.replace(replacement, checkpoint)
+            assert checkpoint.stat().st_ino != original_inode
+        else:
+            torch.save(invalid, checkpoint)
+            assert checkpoint.stat().st_ino == original_inode
+
+    class StopAfterLoad(RuntimeError):
+        pass
+
+    class FakeRunner:
+        def __init__(self, load_from):
+            self.load_from = Path(load_from)
+
+        def load_or_resume(self):
+            from mmengine.runner.checkpoint import CheckpointLoader
+
+            loaded = CheckpointLoader.load_checkpoint(
+                str(self.load_from),
+                map_location="cpu",
+                logger=None,
+            )
+            state = checkpoint_tool._checkpoint_state_dict(loaded)
+            assert state is not None
+            assert (
+                len([key for key in state if key.startswith("head.rosa_refiner.")])
+                == 40
+            )
+            assert "head.rosa_refiner.rosa.rfl.ray_proj.weight" in state
+            observed["loaded"] = True
+            raise StopAfterLoad("stop after sealed analyzer load")
+
+    def build_runner(_runner_cls, received_config):
+        snapshot = observed["snapshot"]
+        assert received_config.load_from == str(snapshot.path)
+        return FakeRunner(received_config.load_from)
+
+    monkeypatch.setattr(
+        checkpoint_tool,
+        "_private_checkpoint_snapshot",
+        observe_snapshot,
+    )
+    monkeypatch.setattr(
+        stage_routes,
+        "_validate_checkpoint_contract",
+        validate_then_attack,
+    )
+    monkeypatch.setattr(Runner, "from_cfg", classmethod(build_runner))
+    args = SimpleNamespace(
+        config=tmp_path / "config.py",
+        checkpoint=checkpoint,
+        output=tmp_path / "routes.pt",
+        work_dir=None,
+        cfg_options=None,
+    )
+
+    with pytest.raises(StopAfterLoad, match="sealed analyzer load"):
+        stage_routes.dump_command(args)
+
+    attacked = checkpoint_tool._load_checkpoint_without_executing_code(checkpoint)
+    assert set(attacked["state_dict"]) == {"head.decoder.weight"}
+    assert observed["loaded"] is True
+    snapshot = observed["snapshot"]
+    assert not snapshot.path.exists()
+    assert not snapshot.private_directory.exists()

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 from collections import OrderedDict
+import os
 from pathlib import Path
 import pickle
 from types import SimpleNamespace
@@ -579,12 +581,25 @@ def test_train_resume_rejects_partial_factorized_state_before_runner_build(
 
     config = _config("balanced")
     config.work_dir = str(work_dir)
+    snapshot_factory = run_tool._private_checkpoint_snapshot
+    observed = {}
+
+    @contextmanager
+    def observe_snapshot(path):
+        with snapshot_factory(path) as snapshot:
+            observed["snapshot"] = snapshot
+            yield snapshot
+
+    monkeypatch.setattr(run_tool, "_private_checkpoint_snapshot", observe_snapshot)
     monkeypatch.setattr(run_tool, "Runner", MustNotBuild)
     with pytest.raises(ValueError, match="topology integrity.*missing keys"):
         run_tool.train(
             SimpleNamespace(resume=resume, amp=False),
             config,
         )
+    snapshot = observed["snapshot"]
+    assert not snapshot.path.exists()
+    assert not snapshot.private_directory.exists()
 
 
 @pytest.mark.parametrize("resume_mode", ("explicit", "auto"))
@@ -608,6 +623,14 @@ def test_train_resume_validates_and_pins_checkpoint_before_runner_build(
 
     events = []
     validate = run_tool._validate_checkpoint_contract
+    snapshot_factory = run_tool._private_checkpoint_snapshot
+    observed_snapshot = {}
+
+    @contextmanager
+    def observe_snapshot(path):
+        with snapshot_factory(path) as snapshot:
+            observed_snapshot["value"] = snapshot
+            yield snapshot
 
     def observed_validate(*args, **kwargs):
         events.append(("validate", args[0], kwargs["allow_mismatch"]))
@@ -621,9 +644,12 @@ def test_train_resume_validates_and_pins_checkpoint_before_runner_build(
 
         @classmethod
         def from_cfg(cls, received_config):
-            assert events == [("validate", checkpoint.resolve(), False)]
+            snapshot = observed_snapshot["value"]
+            assert events == [("validate", snapshot.path, False)]
             assert received_config.resume is True
-            assert received_config.load_from == str(checkpoint.resolve())
+            assert received_config.load_from == str(snapshot.path)
+            assert snapshot.path.is_file()
+            assert snapshot.source_path == checkpoint.resolve()
             events.append(("build", received_config.load_from))
             return cls()
 
@@ -631,10 +657,12 @@ def test_train_resume_validates_and_pins_checkpoint_before_runner_build(
             events.append(("hook", priority))
 
         def train(self):
+            assert observed_snapshot["value"].path.is_file()
             events.append(("train", None))
 
     config = _config("balanced")
     config.work_dir = str(work_dir)
+    monkeypatch.setattr(run_tool, "_private_checkpoint_snapshot", observe_snapshot)
     monkeypatch.setattr(run_tool, "_validate_checkpoint_contract", observed_validate)
     monkeypatch.setattr(run_tool, "Runner", FakeRunner)
 
@@ -643,12 +671,144 @@ def test_train_resume_validates_and_pins_checkpoint_before_runner_build(
         config,
     )
 
+    snapshot = observed_snapshot["value"]
     assert events == [
-        ("validate", checkpoint.resolve(), False),
-        ("build", str(checkpoint.resolve())),
+        ("validate", snapshot.path, False),
+        ("build", str(snapshot.path)),
         ("hook", "VERY_LOW"),
         ("train", None),
     ]
+    assert not snapshot.path.exists()
+    assert not snapshot.private_directory.exists()
+
+
+@pytest.mark.parametrize("raise_inside", (False, True))
+def test_private_checkpoint_snapshot_is_exact_unlinked_and_always_cleans_up(
+    tmp_path: Path,
+    raise_inside: bool,
+):
+    checkpoint = tmp_path / "valid.pth"
+    _save_factorized_checkpoint(checkpoint)
+    expected_bytes = checkpoint.read_bytes()
+    observed = {}
+
+    def exercise() -> None:
+        with run_tool._private_checkpoint_snapshot(checkpoint) as snapshot:
+            observed["snapshot"] = snapshot
+            assert snapshot.source_path == checkpoint.resolve()
+            assert snapshot.byte_count == len(expected_bytes)
+            assert snapshot.sha256 == hashlib.sha256(expected_bytes).hexdigest()
+            assert snapshot.path.read_bytes() == expected_bytes
+            assert snapshot.path.is_file()
+            assert os.readlink(snapshot.path).endswith(" (deleted)")
+            assert snapshot.private_directory.is_dir()
+            assert snapshot.private_directory.stat().st_mode & 0o077 == 0
+            if raise_inside:
+                raise RuntimeError("stop inside snapshot")
+
+    if raise_inside:
+        with pytest.raises(RuntimeError, match="stop inside snapshot"):
+            exercise()
+    else:
+        exercise()
+
+    snapshot = observed["snapshot"]
+    assert not snapshot.path.exists()
+    assert not snapshot.private_directory.exists()
+
+
+@pytest.mark.parametrize("resume_mode", ("explicit", "auto"))
+@pytest.mark.parametrize("attack", ("rename_replace", "in_place_overwrite"))
+def test_train_resume_loads_verified_snapshot_after_source_path_attack(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_mode: str,
+    attack: str,
+):
+    checkpoint = tmp_path / "valid.pth"
+    _save_factorized_checkpoint(checkpoint)
+    original_inode = checkpoint.stat().st_ino
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    if resume_mode == "auto":
+        (work_dir / "last_checkpoint").write_text(
+            str(checkpoint.resolve()),
+            encoding="utf-8",
+        )
+        resume = "auto"
+    else:
+        resume = str(checkpoint)
+
+    snapshot_factory = run_tool._private_checkpoint_snapshot
+    validate = run_tool._validate_checkpoint_contract
+    observed = {}
+
+    @contextmanager
+    def observe_snapshot(path):
+        with snapshot_factory(path) as snapshot:
+            observed["snapshot"] = snapshot
+            yield snapshot
+
+    def validate_then_attack(snapshot_path, config, *, allow_mismatch):
+        validate(snapshot_path, config, allow_mismatch=allow_mismatch)
+        if attack == "rename_replace":
+            replacement = tmp_path / "replacement.pth"
+            _save_checkpoint(replacement, has_rosa=False)
+            os.replace(replacement, checkpoint)
+            assert checkpoint.stat().st_ino != original_inode
+        else:
+            _save_checkpoint(checkpoint, has_rosa=False)
+            assert checkpoint.stat().st_ino == original_inode
+
+    training_work_dir = work_dir
+
+    class FakeRunner:
+        rank = 1
+        work_dir = str(training_work_dir)
+
+        @classmethod
+        def from_cfg(cls, received_config):
+            snapshot = observed["snapshot"]
+            assert received_config.resume is True
+            assert received_config.load_from == str(snapshot.path)
+            instance = cls()
+            instance.load_from = Path(received_config.load_from)
+            return instance
+
+        def register_hook(self, _hook, *, priority):
+            assert priority == "VERY_LOW"
+
+        def train(self):
+            from mmengine.runner.checkpoint import CheckpointLoader
+
+            loaded = CheckpointLoader.load_checkpoint(
+                str(self.load_from),
+                map_location="cpu",
+                logger=None,
+            )
+            state = run_tool._checkpoint_state_dict(loaded)
+            assert state is not None
+            assert (
+                len([key for key in state if key.startswith("head.rosa_refiner.")])
+                == 40
+            )
+            assert "head.rosa_refiner.rosa.rfl.ray_proj.weight" in state
+            observed["loaded"] = True
+
+    config = _config("balanced")
+    config.work_dir = str(work_dir)
+    monkeypatch.setattr(run_tool, "_private_checkpoint_snapshot", observe_snapshot)
+    monkeypatch.setattr(run_tool, "_validate_checkpoint_contract", validate_then_attack)
+    monkeypatch.setattr(run_tool, "Runner", FakeRunner)
+
+    run_tool.train(SimpleNamespace(resume=resume, amp=False), config)
+
+    attacked = run_tool._load_checkpoint_without_executing_code(checkpoint)
+    assert set(attacked["state_dict"]) == {"head.decoder.weight"}
+    assert observed["loaded"] is True
+    snapshot = observed["snapshot"]
+    assert not snapshot.path.exists()
+    assert not snapshot.private_directory.exists()
 
 
 def test_train_auto_without_checkpoint_pins_a_fresh_run(
