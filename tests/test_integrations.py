@@ -27,6 +27,15 @@ from rosa.integrations.sparse4d_scores import (
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _detector_host() -> Path:
+    return Path(
+        os.environ.get(
+            "ROSA_DETECTOR_HOST_ROOT",
+            ROOT / "external" / "detector_host",
+        )
+    ).resolve()
+
+
 def test_integration_package_does_not_eagerly_import_sparse4d():
     code = textwrap.dedent(
         """
@@ -54,7 +63,7 @@ def test_integration_package_does_not_eagerly_import_sparse4d():
 
 
 def test_gravity_center_keypoints_are_symmetric_about_anchor_z():
-    host = ROOT / "external" / "detector_host"
+    host = _detector_host()
     if not host.is_dir():
         pytest.skip("optional Sparse4D detector host is not available")
     code = textwrap.dedent(
@@ -98,7 +107,7 @@ def test_gravity_center_keypoints_are_symmetric_about_anchor_z():
 
 
 def test_compact_sidecar_preserves_paired_native_initialization_and_rng():
-    host = ROOT / "external" / "detector_host"
+    host = _detector_host()
     if not host.is_dir():
         pytest.skip("optional Sparse4D detector host is not available")
     code = textwrap.dedent(
@@ -237,7 +246,7 @@ def test_fpn_detach_accepts_framework_neutral_level_tensors():
 
 
 def test_packed_fpn_restore_is_zero_copy_and_sampler_equivalent():
-    host = ROOT / "external" / "detector_host"
+    host = _detector_host()
     if not host.is_dir():
         pytest.skip("optional Sparse4D detector host is not available")
     code = textwrap.dedent(

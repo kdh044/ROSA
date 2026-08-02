@@ -18,6 +18,15 @@ from mmengine.config import Config
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _detector_host() -> Path:
+    return Path(
+        os.environ.get(
+            "ROSA_DETECTOR_HOST_ROOT",
+            ROOT / "external" / "detector_host",
+        )
+    ).resolve()
+
+
 def _config(name: str) -> Config:
     return Config.fromfile(ROOT / "configs" / name)
 
@@ -51,7 +60,7 @@ def test_c32_changes_only_the_registered_native_head_behavior() -> None:
 
 
 def test_c32_matches_the_released_mmcv_wrapper_and_preserves_state() -> None:
-    host = ROOT / "external" / "detector_host"
+    host = _detector_host()
     if not host.is_dir():
         pytest.skip("optional Sparse4D detector host is not available")
     code = textwrap.dedent("""

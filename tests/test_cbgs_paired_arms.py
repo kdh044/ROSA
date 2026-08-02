@@ -16,6 +16,15 @@ ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "configs"
 
 
+def _detector_host() -> Path:
+    return Path(
+        os.environ.get(
+            "ROSA_DETECTOR_HOST_ROOT",
+            ROOT / "external" / "detector_host",
+        )
+    ).resolve()
+
+
 def _config(name: str) -> Config:
     return Config.fromfile(CONFIG_DIR / name)
 
@@ -75,7 +84,7 @@ def test_c2_reuses_q1_values_without_changing_the_c1_train_contract() -> None:
 
 
 def test_c1_actual_optimizer_parameters_and_paired_initialization() -> None:
-    host = ROOT / "external" / "detector_host"
+    host = _detector_host()
     if not host.is_dir():
         pytest.skip("optional Sparse4D detector host is not available")
     code = textwrap.dedent("""
