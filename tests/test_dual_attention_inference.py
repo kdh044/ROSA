@@ -444,6 +444,62 @@ def test_dual_guard_preserves_bypassed_and_new_public_helpers(
     _assert_encoding_equal(actual, expected)
 
 
+def test_dual_attention_composes_with_normalize_storage_fallback(monkeypatch):
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+    relation = RayFeatureRelation(ray=relation.ray, valid=relation.valid.clone())
+    with torch.no_grad():
+        assert _dual_guard(module, features, geometry, relation, valid, query)
+        assert module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        expected = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    released_normalize = F.normalize
+    observed_out = []
+
+    def hooked_normalize(*args, **kwargs):
+        observed_out.append(kwargs.get("out"))
+        return released_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(F, "normalize", hooked_normalize)
+    with torch.no_grad():
+        # The normalization-buffer optimization must fail closed while the
+        # independent dual-attention optimization remains admissible.
+        assert not module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        assert _dual_guard(module, features, geometry, relation, valid, query)
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    assert observed_out
+    assert all(value is None for value in observed_out)
+    _assert_encoding_equal(actual, expected)
+
+
 def test_private_entry_does_not_invoke_overridden_pointwise_reuse_guard():
     module, features, geometry, relation, valid, query = _pointwise_fixture()
     with torch.no_grad():
