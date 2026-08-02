@@ -1,0 +1,48 @@
+{
+  "schema": "rosa.c32_uint8_transfer_source_approval.v1",
+  "date_utc": "2026-08-02",
+  "status": "CORRECTNESS_PARITY_APPROVED_CUDA_PENDING",
+  "parent_commit": "b83a436d2efbed030c412873a0101f574a1b5e65",
+  "branch": "optimize/c32-uint8-transfer",
+  "scientific_model": "C32 official Sparse4D self-attention residual",
+  "change": "retain released uint8 images until existing device img.float()",
+  "opt_in_only": true,
+  "public_default_changed": false,
+  "parameter_delta": 0,
+  "buffer_delta": 0,
+  "checkpoint_key_delta": 0,
+  "numeric_model_hyperparameter_delta": 0,
+  "real_parity_splits": [
+    "train",
+    "validation",
+    "test"
+  ],
+  "real_train_gt_boxes_checked": 5,
+  "packed_non_image_parity": "BYTE_EQUAL",
+  "post_preprocessor_model_input_parity": "RAW_BYTE_EQUAL",
+  "post_preprocessor_data_sample_parity": "RAW_BYTE_EQUAL",
+  "host_image_payload_bytes_batch4": {
+    "parent_fp32": 122880000,
+    "candidate_uint8": 30720000,
+    "theoretical_reduction": 92160000,
+    "theoretical_reduction_fraction": 0.75
+  },
+  "tests": {
+    "independent_focused_passed": 25,
+    "candidate_file_passed": 5,
+    "full_passed": 177,
+    "full_skipped": 5
+  },
+  "independent_correctness_review": "APPROVE",
+  "cuda_raw_bit_parity": "PENDING",
+  "cuda_transfer_profile": "PENDING",
+  "cuda_cast_cost": "PENDING",
+  "cuda_peak_memory": "PENDING",
+  "paired_latency": "PENDING",
+  "speed_claim_authorized": false,
+  "file_sha256": {
+    "src/rosa/integrations/fisheye3dod/runtime_transforms.py": "86f947dd1f535641259edb8dec813ee76a66271679c1b8782b1a70078b64ae1b",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer.py": "4a49223cf9c4e2fb2eb6a392456773847af7ad4c5a59ab206903fcb2e73f41ff",
+    "tests/test_uint8_image_transfer.py": "35208193ed5da4d99748bfc1ee99b10cf57674d00c068de90ec3f21fbcd5c640"
+  }
+}
