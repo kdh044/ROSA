@@ -73,6 +73,65 @@ class Fisheye3DODSingleFrameDataPreprocessor(Sparse4DDataPreprocessor):
         return processed
 
 
+@MODELS.register_module()
+class Fisheye3DODSingleFrameInplaceDataPreprocessor(
+    Fisheye3DODSingleFrameDataPreprocessor
+):
+    """Normalize compact uint8 prediction images without a FP32 temporary.
+
+    This deployment-only path is sealed to the released BGR uint8 ingress.
+    Channel selection and ``float()`` therefore create fresh storage before
+    the in-place normalization; caller-owned input tensors are never mutated.
+    Training retains its separately validated preprocessor contract instead of
+    silently taking this runtime-only path.
+    """
+
+    def forward(self, data, training: bool = False):
+        if training:
+            raise RuntimeError(
+                "in-place uint8 preprocessing is prediction-only; use the "
+                "training config that produced the checkpoint"
+            )
+        return super().forward(data, training=False)
+
+    def _process_img(self, img: torch.Tensor) -> torch.Tensor:
+        if not isinstance(img, torch.Tensor):
+            raise TypeError("in-place uint8 preprocessing requires a tensor")
+        if img.dtype != torch.uint8:
+            raise TypeError(
+                "in-place uint8 preprocessing requires torch.uint8 ingress"
+            )
+        if img.requires_grad:
+            raise ValueError("image ingress must not require gradients")
+        if not self._channel_conversion:
+            raise ValueError(
+                "in-place uint8 preprocessing requires fixed BGR-to-RGB conversion"
+            )
+
+        # Advanced channel indexing allocates fresh uint8 storage; float then
+        # allocates the model's FP32 input.  Normalizing that owned tensor in
+        # place removes the otherwise live input and subtraction temporaries
+        # while the division output is allocated.
+        img = img[..., [2, 1, 0], :, :].float()
+        if self._enable_normalize:
+            shape = [1] * (img.dim() - 3) + list(self.mean.shape)
+            mean = self.mean.view(shape)
+            std = self.std.view(shape)
+            img.sub_(mean).div_(std)
+        if self.pad_size_divisor > 1:
+            height, width = img.shape[-2:]
+            divisor = self.pad_size_divisor
+            pad_height = (divisor - height % divisor) % divisor
+            pad_width = (divisor - width % divisor) % divisor
+            if pad_height or pad_width:
+                img = torch.nn.functional.pad(
+                    img,
+                    (0, pad_width, 0, pad_height),
+                    value=self.pad_value,
+                )
+        return img
+
+
 def _require_temporal_free_metadata_path(head) -> None:
     if type(head) is not ROSAOfficialResidualNativeBaselineHead:
         raise TypeError(
@@ -150,4 +209,5 @@ class Fisheye3DODGravityCenterSparse4D(Sparse4D):
 __all__ = [
     "Fisheye3DODGravityCenterSparse4D",
     "Fisheye3DODSingleFrameDataPreprocessor",
+    "Fisheye3DODSingleFrameInplaceDataPreprocessor",
 ]
