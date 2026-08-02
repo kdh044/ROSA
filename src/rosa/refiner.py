@@ -39,6 +39,7 @@ _RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
 _RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
 _RELEASED_POINTWISE_ROSA_IMPL = PointwiseROSA._forward_impl
 _RELEASED_POINTWISE_ROSA_REUSE_GUARD = PointwiseROSA._can_reuse_owned_rfl_delta
+_RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
 _RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
 _RELEASED_RFL_OWNED_DELTA_FORWARD = (
     SphericalRayFeatureLifting._forward_lifted_owned_delta_inference
@@ -402,10 +403,13 @@ class ROSARefiner(nn.Module):
         observation_usage: str = "full",
     ) -> ObservationEncoding:
         rfl = getattr(self.rosa, "rfl", None)
+        relation_modules = tuple(self.rosa.modules())
         released_relation_surface = bool(
             type(self.rosa) is PointwiseROSA
             and "forward" not in self.rosa.__dict__
             and type(self.rosa).forward is _RELEASED_POINTWISE_ROSA_FORWARD
+            and "_call_impl" not in self.rosa.__dict__
+            and type(self.rosa)._call_impl is _RELEASED_MODULE_CALL_IMPL
             and "_forward_compact_lean_inference" not in self.rosa.__dict__
             and type(self.rosa)._forward_compact_lean_inference
             is _RELEASED_POINTWISE_ROSA_LEAN_FORWARD
@@ -420,8 +424,12 @@ class ROSARefiner(nn.Module):
             and "_forward_lifted_owned_delta_inference" not in rfl.__dict__
             and type(rfl)._forward_lifted_owned_delta_inference
             is _RELEASED_RFL_OWNED_DELTA_FORWARD
+            and all(
+                "_call_impl" not in module.__dict__
+                and type(module)._call_impl is _RELEASED_MODULE_CALL_IMPL
+                for module in relation_modules
+            )
         )
-        relation_modules = tuple(self.rosa.modules())
         relation_hooks_active = bool(
             any(
                 module._forward_pre_hooks

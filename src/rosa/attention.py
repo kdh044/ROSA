@@ -242,6 +242,7 @@ class PointwiseROSA(nn.Module):
     ) -> bool:
         """Seal Pointwise buffer reuse to the released FP32 lean eager edge."""
 
+        modules = tuple(self.modules())
         if (
             "_can_reuse_owned_pointwise_storage" in self.__dict__
             or type(self)._can_reuse_owned_pointwise_storage
@@ -249,6 +250,12 @@ class PointwiseROSA(nn.Module):
             or _is_owned_plain_fp32_tensor is not _RELEASED_OWNED_TENSOR_CHECK
             or _mean_pairwise_camera_cosine_owned_inference
             is not _RELEASED_OWNED_CONSISTENCY
+            or mean_pairwise_camera_cosine is not _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE
+            or any(
+                "_call_impl" in module.__dict__
+                or type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
+                for module in modules
+            )
             or _rfl._plain_eager_no_grad_execution is not _RELEASED_PLAIN_EAGER_NO_GRAD
             or not _rfl._plain_eager_no_grad_execution()
             or not self._can_reuse_owned_rfl_delta(
@@ -339,7 +346,7 @@ class PointwiseROSA(nn.Module):
             and not self.cfg.uniform_point_fusion
             and all(
                 getattr(module, "_compiled_call_impl", None) is None
-                for module in self.modules()
+                for module in modules
             )
             and self.feature_norm.normalized_shape == (dims,)
             and self.feature_norm.elementwise_affine
@@ -687,6 +694,8 @@ _RELEASED_ALIAS_CHECK = getattr(torch._C, "_is_alias_of", None)
 _RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
 _RELEASED_OWNED_TENSOR_CHECK = _is_owned_plain_fp32_tensor
 _RELEASED_OWNED_CONSISTENCY = _mean_pairwise_camera_cosine_owned_inference
+_RELEASED_MEAN_PAIRWISE_CAMERA_COSINE = mean_pairwise_camera_cosine
+_RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
 _RELEASED_LINEAR_FORWARD = nn.Linear.forward
 _RELEASED_LAYER_NORM_FORWARD = nn.LayerNorm.forward
 _RELEASED_IDENTITY_FORWARD = nn.Identity.forward

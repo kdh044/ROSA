@@ -7,6 +7,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils import _python_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+import rosa.attention as attention_module
 from rosa.attention import (
     PointwiseROSA,
     _is_owned_plain_fp32_tensor,
@@ -26,6 +27,16 @@ def _raw_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
             right.detach().contiguous().view(torch.uint8),
         )
     )
+
+
+def _assert_encoding_raw_equal(actual, expected) -> None:
+    for name in actual.__dataclass_fields__:
+        actual_value = getattr(actual, name)
+        expected_value = getattr(expected, name)
+        if actual_value is None or expected_value is None:
+            assert actual_value is expected_value, name
+        else:
+            assert _raw_equal(actual_value, expected_value), name
 
 
 def _inject_fp32_special_values(value: torch.Tensor) -> None:
@@ -368,6 +379,133 @@ def test_pointwise_storage_guard_rejects_forward_override_and_compiled_child():
         )
 
 
+def test_pointwise_storage_guard_rejects_instance_and_class_call_impl_overrides(
+    monkeypatch,
+):
+    module, features, geometry, relation, valid, query = _fixture()
+
+    def can_reuse():
+        with torch.no_grad():
+            return module._can_reuse_owned_pointwise_storage(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                "candidate",
+            )
+
+    assert can_reuse()
+    for child in tuple(module.modules()):
+        child._call_impl = types.MethodType(lambda *_args, **_kwargs: None, child)
+        try:
+            assert not can_reuse(), type(child).__name__
+        finally:
+            del child.__dict__["_call_impl"]
+
+    for module_type in {type(child) for child in module.modules()}:
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                module_type,
+                "_call_impl",
+                lambda *_args, **_kwargs: None,
+            )
+            assert not can_reuse(), module_type.__name__
+
+
+def test_key_projection_call_impl_retained_output_is_not_mutated_on_fallback():
+    module, features, geometry, relation, valid, query = _fixture()
+    released_call_impl = module.key_proj._call_impl
+    retained_outputs = []
+
+    def overridden(_self, *args, **kwargs):
+        output = released_call_impl(*args, **kwargs)
+        retained_outputs.append((output, output.clone()))
+        return output
+
+    module.key_proj._call_impl = types.MethodType(overridden, module.key_proj)
+    try:
+        with torch.no_grad():
+            assert not module._can_reuse_owned_pointwise_storage(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                "candidate",
+            )
+            expected = module(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage="candidate",
+            )
+            retained_outputs.clear()
+            actual = module._forward_compact_lean_inference(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage="candidate",
+            )
+    finally:
+        del module.key_proj.__dict__["_call_impl"]
+
+    assert len(retained_outputs) == 1
+    retained, snapshot = retained_outputs[0]
+    assert _raw_equal(retained, snapshot)
+    _assert_encoding_raw_equal(actual, expected)
+
+
+def test_public_consistency_override_is_observed_on_private_fallback(monkeypatch):
+    module, features, geometry, relation, valid, query = _fixture()
+    released_consistency = attention_module.mean_pairwise_camera_cosine
+    calls = []
+
+    def overridden(values, mask):
+        calls.append(None)
+        return released_consistency(values, mask) + 1.0
+
+    monkeypatch.setattr(
+        attention_module,
+        "mean_pairwise_camera_cosine",
+        overridden,
+    )
+    with torch.no_grad():
+        assert not module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+        assert calls == [None]
+        calls.clear()
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    assert calls == [None]
+    _assert_encoding_raw_equal(actual, expected)
+
+
 def test_pointwise_private_route_falls_back_with_child_and_global_hooks():
     module, features, geometry, relation, valid, query = _fixture()
     with torch.no_grad():
@@ -519,25 +657,64 @@ def test_pointwise_storage_guard_fails_closed_for_unknown_mode_state(
             )
 
 
-def test_pointwise_storage_guard_fails_closed_for_autocast_trace_and_compile(
+def test_pointwise_storage_guard_fails_closed_for_autocast_script_trace_and_compile(
     monkeypatch,
 ):
     module, features, geometry, relation, valid, query = _fixture()
     with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
         assert not module._can_reuse_owned_pointwise_storage(
             features, geometry, relation, valid, query, "candidate"
         )
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+    _assert_encoding_raw_equal(actual, expected)
 
-    with torch.no_grad(), monkeypatch.context() as patch:
-        patch.setattr(torch.jit, "is_tracing", lambda: True)
-        assert not module._can_reuse_owned_pointwise_storage(
-            features, geometry, relation, valid, query, "candidate"
-        )
-    with torch.no_grad(), monkeypatch.context() as patch:
-        patch.setattr(torch._dynamo, "is_compiling", lambda: True)
-        assert not module._can_reuse_owned_pointwise_storage(
-            features, geometry, relation, valid, query, "candidate"
-        )
+    for owner, attribute in (
+        (torch.jit, "is_scripting"),
+        (torch.jit, "is_tracing"),
+        (torch._dynamo, "is_compiling"),
+    ):
+        with torch.no_grad(), monkeypatch.context() as patch:
+            patch.setattr(owner, attribute, lambda: True)
+            expected = module(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage="candidate",
+            )
+            assert not module._can_reuse_owned_pointwise_storage(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                "candidate",
+            )
+            actual = module._forward_compact_lean_inference(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage="candidate",
+            )
+        _assert_encoding_raw_equal(actual, expected)
 
 
 def test_public_full_and_training_paths_retain_their_contracts():

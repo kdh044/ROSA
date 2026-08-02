@@ -5,6 +5,7 @@ import types
 import pytest
 import torch
 
+import rosa.attention as attention_module
 import rosa.observation as observation_module
 import rosa.refiner as refiner_module
 import rosa.rfl as rfl_module
@@ -240,13 +241,19 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
         "single_ocam_transform": (
             observation_module._ocam_project_points_with_raw_camera_xyz.__code__
         ),
+        "owned_pointwise_consistency": (
+            attention_module._mean_pairwise_camera_cosine_owned_inference.__code__
+        ),
     }
+    owned_pointwise_check_code = attention_module._is_owned_plain_fp32_tensor.__code__
 
     def invoke(*, force_parent_fallback):
         calls = Counter()
 
         def profile(frame, event, _arg):
-            if event == "call":
+            if frame.f_code is owned_pointwise_check_code and event == "return":
+                calls[f"owned_pointwise_check_{_arg}"] += 1
+            elif event == "call":
                 for name, code in path_codes.items():
                     if frame.f_code is code:
                         calls[name] += 1
@@ -294,6 +301,8 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
             "direct_level_buffer": 2,
             "owned_rfl_delta": 2,
             "single_ocam_transform": 2,
+            "owned_pointwise_check_True": 9,
+            "owned_pointwise_consistency": 1,
         }
     )
     assert parent_calls == Counter()
@@ -468,11 +477,11 @@ def test_instance_pointwise_private_override_disables_compact_relation(
             relation,
             valid,
             sidecar_query,
-                *,
-                observation_usage,
-                reuse_owned_rfl_delta,
-                reuse_owned_pointwise_storage,
-            ):
+            *,
+            observation_usage,
+            reuse_owned_rfl_delta,
+            reuse_owned_pointwise_storage,
+        ):
             assert torch.is_tensor(relation)
             assert relation.shape[-1] == 19
             private_calls.append(None)
@@ -482,10 +491,10 @@ def test_instance_pointwise_private_override_disables_compact_relation(
                 relation,
                 valid,
                 sidecar_query,
-                    observation_usage=observation_usage,
-                    reuse_owned_rfl_delta=reuse_owned_rfl_delta,
-                    reuse_owned_pointwise_storage=reuse_owned_pointwise_storage,
-                )
+                observation_usage=observation_usage,
+                reuse_owned_rfl_delta=reuse_owned_rfl_delta,
+                reuse_owned_pointwise_storage=reuse_owned_pointwise_storage,
+            )
 
     else:
 
@@ -510,6 +519,71 @@ def test_instance_pointwise_private_override_disables_compact_relation(
         assert len(private_calls) == 2
     else:
         assert private_calls == []
+    assert torch.equal(output, anchor)
+
+
+@pytest.mark.parametrize("override_scope", ("instance", "class"))
+def test_pointwise_call_impl_override_keeps_the_legacy_tensor_abi(
+    override_scope,
+    monkeypatch,
+):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    compact_relation_arguments = []
+    released_project_and_describe = refiner_module.project_and_describe
+
+    def captured_project_and_describe(*args, **kwargs):
+        compact_relation_arguments.append(kwargs["compact_relation"])
+        return released_project_and_describe(*args, **kwargs)
+
+    monkeypatch.setattr(
+        refiner_module,
+        "project_and_describe",
+        captured_project_and_describe,
+    )
+    calls = []
+    if override_scope == "instance":
+        released_call_impl = stage.rosa._call_impl
+
+        def overridden(_self, *args, **kwargs):
+            calls.append(None)
+            return released_call_impl(*args, **kwargs)
+
+        monkeypatch.setattr(
+            stage.rosa,
+            "_call_impl",
+            types.MethodType(overridden, stage.rosa),
+        )
+    else:
+        pointwise_type = type(stage.rosa)
+        released_call_impl = pointwise_type._call_impl
+
+        def overridden(self, *args, **kwargs):
+            calls.append(None)
+            return released_call_impl(self, *args, **kwargs)
+
+        monkeypatch.setattr(pointwise_type, "_call_impl", overridden)
+
+    with torch.no_grad():
+        output = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+    assert compact_relation_arguments == [False, False]
+    assert len(calls) == 2
     assert torch.equal(output, anchor)
 
 
