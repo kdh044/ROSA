@@ -294,6 +294,13 @@ class PointwiseROSA(nn.Module):
             or torch.softmax is not _RELEASED_TORCH_SOFTMAX
             or torch.where is not _RELEASED_TORCH_WHERE
             or torch.zeros_like is not _RELEASED_TORCH_ZEROS_LIKE
+            or torch.Tensor.masked_fill is not _RELEASED_TENSOR_MASKED_FILL
+            or torch.Tensor.masked_fill_ is not _RELEASED_TENSOR_MASKED_FILL_INPLACE
+            or torch.Tensor.clamp_min is not _RELEASED_TENSOR_CLAMP_MIN
+            or torch.Tensor.clamp_min_ is not _RELEASED_TENSOR_CLAMP_MIN_INPLACE
+            or torch.Tensor.__truediv__ is not _RELEASED_TENSOR_TRUE_DIVIDE
+            or torch.Tensor.div_ is not _RELEASED_TENSOR_DIVIDE_INPLACE
+            or torch.Tensor.new_zeros is not _RELEASED_TENSOR_NEW_ZEROS
             or any(
                 "_call_impl" in module.__dict__
                 or type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
@@ -1007,6 +1014,13 @@ _RELEASED_TORCH_FINFO = torch.finfo
 _RELEASED_TORCH_SOFTMAX = torch.softmax
 _RELEASED_TORCH_WHERE = torch.where
 _RELEASED_TORCH_ZEROS_LIKE = torch.zeros_like
+_RELEASED_TENSOR_MASKED_FILL = torch.Tensor.masked_fill
+_RELEASED_TENSOR_MASKED_FILL_INPLACE = torch.Tensor.masked_fill_
+_RELEASED_TENSOR_CLAMP_MIN = torch.Tensor.clamp_min
+_RELEASED_TENSOR_CLAMP_MIN_INPLACE = torch.Tensor.clamp_min_
+_RELEASED_TENSOR_TRUE_DIVIDE = torch.Tensor.__truediv__
+_RELEASED_TENSOR_DIVIDE_INPLACE = torch.Tensor.div_
+_RELEASED_TENSOR_NEW_ZEROS = torch.Tensor.new_zeros
 _RELEASED_RFL_REUSE_GUARD = SphericalRayFeatureLifting._can_reuse_owned_delta
 _RELEASED_MODULE_CALL = nn.Module.__call__
 _RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl

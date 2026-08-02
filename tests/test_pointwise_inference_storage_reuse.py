@@ -616,6 +616,9 @@ def test_public_normalize_override_is_observed_on_private_fallback(monkeypatch):
         (torch, "softmax"),
         (torch, "where"),
         (torch, "zeros_like"),
+        (torch.Tensor, "masked_fill"),
+        (torch.Tensor, "clamp_min"),
+        (torch.Tensor, "__truediv__"),
     ),
 )
 def test_masked_softmax_primitive_override_disables_owned_route(
@@ -661,6 +664,52 @@ def test_masked_softmax_primitive_override_disables_owned_route(
         )
 
     assert calls
+    _assert_encoding_raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ("masked_fill_", "clamp_min_", "div_", "new_zeros"),
+)
+def test_owned_masked_softmax_tensor_primitive_override_disables_route(
+    monkeypatch,
+    name,
+):
+    module, features, geometry, relation, valid, query = _fixture()
+    with torch.no_grad():
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    released = getattr(torch.Tensor, name)
+
+    def overridden(*args, **kwargs):
+        return released(*args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, name, overridden)
+    with torch.no_grad():
+        assert not module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
     _assert_encoding_raw_equal(actual, expected)
 
 
