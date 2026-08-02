@@ -12,7 +12,10 @@ from projects.mmdet3d_plugin.data_preprocessor.sparse4d_preprocessor import (
 )
 from projects.mmdet3d_plugin.models.sparse4d import Sparse4D
 
-from rosa.integrations.sparse4d import ROSAOfficialResidualNativeBaselineHead
+from rosa.integrations.sparse4d import (
+    ROSANativeBaselineHead,
+    ROSAOfficialResidualNativeBaselineHead,
+)
 
 
 @MODELS.register_module()
@@ -134,10 +137,13 @@ class Fisheye3DODSingleFrameInplaceDataPreprocessor(
 
 
 def _require_temporal_free_metadata_path(head) -> None:
-    if type(head) is not ROSAOfficialResidualNativeBaselineHead:
+    if type(head) not in (
+        ROSANativeBaselineHead,
+        ROSAOfficialResidualNativeBaselineHead,
+    ):
         raise TypeError(
             "single-frame CPU metadata is sealed to the exact "
-            "ROSAOfficialResidualNativeBaselineHead"
+            "C0/C32 native baseline heads"
         )
     instance_bank = getattr(head, "instance_bank", None)
     raw_count = getattr(instance_bank, "num_temp_instances", None)
@@ -153,7 +159,7 @@ def _require_temporal_free_metadata_path(head) -> None:
         )
     operation_order = getattr(head, "operation_order", None)
     if not isinstance(operation_order, (list, tuple)):
-        raise TypeError("the audited C32 head requires an operation_order sequence")
+        raise TypeError("the audited native head requires an operation_order sequence")
     if "temp_gnn" in operation_order:
         raise ValueError("single-frame CPU metadata forbids temp_gnn operations")
 

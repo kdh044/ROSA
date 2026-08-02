@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib.util
 from pathlib import Path
+import random
 import sys
 from types import ModuleType
 
 from mmengine.config import Config
+from mmengine.utils import import_modules_from_strings
+from mmdet3d.registry import MODELS
+from mmdet3d.utils import register_all_modules
+import numpy as np
 import pytest
 import torch
 
@@ -117,6 +123,64 @@ def test_real_configs_differ_only_by_exact_head_type() -> None:
         "ROSAInferenceReuseExactHomogeneous4x4"
     )
     assert contract["only_executable_delta"] == "model.head.type"
+
+
+def test_cumulative_c0_c32_models_build_with_identical_state() -> None:
+    parent_config, candidate_config = _configs()
+    register_all_modules(init_default_scope=True)
+    records = []
+    reference_state = None
+    for config in (parent_config, candidate_config):
+        import_modules_from_strings(**config.custom_imports)
+        random.seed(3407)
+        np.random.seed(3407)
+        torch.manual_seed(3407)
+        model = MODELS.build(copy.deepcopy(config.model))
+        module_types = [type(module).__name__ for module in model.modules()]
+        records.append(
+            {
+                "head": type(model.head).__name__,
+                "preprocessor": type(model.data_preprocessor).__name__,
+                "parameters": sum(value.numel() for value in model.parameters()),
+                "buffers": sum(value.numel() for value in model.buffers()),
+                "deformable_instances": module_types.count(
+                    "ROSAInferenceReuseExactHomogeneous4x4FullFOV"
+                    "DeformableFeatureAggregation"
+                ),
+                "num_temp_instances": model.head.instance_bank.num_temp_instances,
+            }
+        )
+        state = model.state_dict()
+        if reference_state is None:
+            reference_state = {
+                name: value.detach().clone() for name, value in state.items()
+            }
+        else:
+            assert reference_state.keys() == state.keys()
+            assert all(
+                torch.equal(value, state[name])
+                for name, value in reference_state.items()
+            )
+        del model
+        gc.collect()
+
+    assert [record["head"] for record in records] == [
+        "ROSANativeBaselineHead",
+        "ROSAOfficialResidualNativeBaselineHead",
+    ]
+    for field in (
+        "preprocessor",
+        "parameters",
+        "buffers",
+        "deformable_instances",
+        "num_temp_instances",
+    ):
+        assert records[0][field] == records[1][field]
+    assert records[0]["preprocessor"] == (
+        "Fisheye3DODSingleFrameInplaceDataPreprocessor"
+    )
+    assert records[0]["deformable_instances"] == 6
+    assert records[0]["num_temp_instances"] == 0
 
 
 @pytest.mark.parametrize(

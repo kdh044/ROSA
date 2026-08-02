@@ -20,7 +20,10 @@ from rosa.integrations.fisheye3dod.model import (
     Fisheye3DODSingleFrameDataPreprocessor,
     _require_temporal_free_metadata_path,
 )
-from rosa.integrations.sparse4d import ROSAOfficialResidualNativeBaselineHead
+from rosa.integrations.sparse4d import (
+    ROSANativeBaselineHead,
+    ROSAOfficialResidualNativeBaselineHead,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_DIR = ROOT / "configs"
@@ -181,8 +184,12 @@ def test_non_cpu_prediction_metadata_fails_closed():
         preprocessor(batch, training=False)
 
 
-def _audited_head(count=0, operation_order=("deformable", "refine", "gnn")):
-    head = object.__new__(ROSAOfficialResidualNativeBaselineHead)
+def _audited_head(
+    count=0,
+    operation_order=("deformable", "refine", "gnn"),
+    head_type=ROSAOfficialResidualNativeBaselineHead,
+):
+    head = object.__new__(head_type)
     object.__setattr__(
         head,
         "instance_bank",
@@ -192,15 +199,26 @@ def _audited_head(count=0, operation_order=("deformable", "refine", "gnn")):
     return head
 
 
-def test_only_exact_audited_non_temporal_head_is_accepted():
-    _require_temporal_free_metadata_path(_audited_head())
+def test_only_exact_audited_non_temporal_c0_c32_heads_are_accepted():
+    class ExtendedC0Head(ROSANativeBaselineHead):
+        pass
+
+    for head_type in (
+        ROSANativeBaselineHead,
+        ROSAOfficialResidualNativeBaselineHead,
+    ):
+        _require_temporal_free_metadata_path(_audited_head(head_type=head_type))
+    with pytest.raises(TypeError, match="exact C0/C32"):
+        _require_temporal_free_metadata_path(
+            _audited_head(head_type=ExtendedC0Head)
+        )
 
     with pytest.raises(ValueError, match="num_temp_instances=0"):
         _require_temporal_free_metadata_path(_audited_head(count=1))
     for invalid in (0.5, "0", True, None):
         with pytest.raises(TypeError, match="exact integer zero"):
             _require_temporal_free_metadata_path(_audited_head(count=invalid))
-    with pytest.raises(TypeError, match="exact.*Head"):
+    with pytest.raises(TypeError, match="exact C0/C32"):
         _require_temporal_free_metadata_path(
             SimpleNamespace(instance_bank=SimpleNamespace(num_temp_instances=0))
         )
