@@ -180,7 +180,6 @@ class PointwiseROSA(nn.Module):
             observation_usage=observation_usage,
             reuse_owned_rfl_delta=False,
             reuse_owned_pointwise_storage=False,
-            use_dual_camera_logits=False,
         )
 
     def _can_reuse_owned_rfl_delta(
@@ -406,6 +405,9 @@ class PointwiseROSA(nn.Module):
             "_can_reuse_owned_pointwise_storage" not in self.__dict__
             and type(self)._can_reuse_owned_pointwise_storage
             is _RELEASED_POINTWISE_ROSA_STORAGE_GUARD
+            and "_can_reuse_owned_rfl_delta" not in self.__dict__
+            and type(self)._can_reuse_owned_rfl_delta
+            is _RELEASED_POINTWISE_ROSA_REUSE_GUARD
             and self._can_reuse_owned_pointwise_storage(
                 features,
                 geometry,
@@ -666,7 +668,7 @@ class PointwiseROSA(nn.Module):
         observation_usage: str,
         reuse_owned_rfl_delta: bool,
         reuse_owned_pointwise_storage: bool,
-        use_dual_camera_logits: bool,
+        use_dual_camera_logits: bool = False,
     ) -> ObservationEncoding:
         if not isinstance(use_dual_camera_logits, bool):
             raise TypeError("use_dual_camera_logits must be a bool")
@@ -736,7 +738,9 @@ class PointwiseROSA(nn.Module):
                 query_key.squeeze(2).squeeze(2),
             )
         else:
-            camera_key = self.key_proj(torch.cat((normalized, scoring_geometry), dim=-1))
+            camera_key = self.key_proj(
+                torch.cat((normalized, scoring_geometry), dim=-1)
+            )
             if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
                 camera_key,
                 shape=features.shape[:-1] + (self.cfg.hidden_dims,),
