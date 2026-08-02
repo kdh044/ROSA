@@ -439,6 +439,8 @@ def test_ephemeral_id_counter_is_attested_outside_persistent_state() -> None:
     bank.num_temp_instances = 0
     bank.num_anchor = 300
     bank.prev_id = 0
+    for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS:
+        setattr(bank, name, None)
 
     reset = verify_tool._ephemeral_id_counter_contract(
         model,
@@ -457,6 +459,60 @@ def test_ephemeral_id_counter_is_attested_outside_persistent_state() -> None:
             model,
             expected_invocations=2,
         )
+
+
+def test_runtime_state_snapshot_excludes_forward_diagnostics() -> None:
+    model = torch.nn.Module()
+    model.head = torch.nn.Module()
+    model.head.instance_bank = torch.nn.Module()
+    for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS:
+        setattr(model.head.instance_bank, name, None)
+    model.head._last_decoder_query_reliabilities = torch.tensor([1.0])
+    model.head.sampler = torch.nn.Module()
+    model.head.sampler._last_base_key_points = torch.tensor([2.0])
+    model.head.sampler.mask = torch.tensor([False])
+
+    before = verify_tool._runtime_state_snapshot(model)
+    model.head._last_decoder_query_reliabilities = torch.tensor([3.0])
+    model.head.sampler._last_base_key_points = torch.tensor([4.0])
+    model.head.sampler.mask = torch.tensor([True])
+
+    assert verify_tool._runtime_state_snapshot(model) == before
+
+
+def test_runtime_state_snapshot_tracks_instance_bank_cache_diagnostics() -> None:
+    model = torch.nn.Module()
+    model.head = torch.nn.Module()
+    model.head.instance_bank = torch.nn.Module()
+    bank = model.head.instance_bank
+    for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS:
+        setattr(bank, name, None)
+
+    before = verify_tool._runtime_state_snapshot(model)
+    bank._last_cache_selection_indices = torch.tensor([[1, 0]])
+    after = verify_tool._runtime_state_snapshot(model)
+
+    expected_keys = {
+        f"head.instance_bank.{name}"
+        for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS
+    }
+    assert set(before) == expected_keys
+    assert set(after) == expected_keys
+    assert after != before
+
+
+def test_runtime_state_snapshot_fails_closed_on_missing_bank_field() -> None:
+    model = torch.nn.Module()
+    model.head = torch.nn.Module()
+    model.head.instance_bank = torch.nn.Module()
+    for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS[:-1]:
+        setattr(model.head.instance_bank, name, None)
+
+    with pytest.raises(
+        VerificationContractError,
+        match="_last_cache_selection_indices",
+    ):
+        verify_tool._runtime_state_snapshot(model)
 
 
 def test_foreign_rosa_module_is_rejected(tmp_path, monkeypatch) -> None:

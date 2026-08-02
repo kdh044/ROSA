@@ -77,6 +77,19 @@ IDLE_RESERVED_TOKEN = "I_HAVE_VERIFIED_THE_GPU_IS_IDLE_AND_RESERVED"
 EXPECTED_BATCH_SIZE = 4
 CAPTURE_BATCHES = 2
 EXPECTED_CLASSES = ("Car", "Van", "Truck", "Bus", "Pedestrian", "Cyclist")
+PERSISTENT_RUNTIME_STATE_FIELDS = (
+    "cached_feature",
+    "cached_anchor",
+    "metas",
+    "mask",
+    "confidence",
+    "temp_confidence",
+    "instance_id",
+    "_last_cache_update_multiplier",
+    "_last_cache_unsuppressed_count",
+    "_last_fixed_selection_indices",
+    "_last_cache_selection_indices",
+)
 EXPECTED_ANNOTATION_SHA256 = (
     "efafe89c6dc34d116f0ce01fa818505a6387248d9a3ca6dcac035418a664da6f"
 )
@@ -1149,23 +1162,31 @@ def _reset_runtime_state(model: torch.nn.Module) -> None:
 
 
 def _runtime_state_snapshot(model: torch.nn.Module) -> dict[str, Any]:
-    selected = {
-        "cached_feature",
-        "cached_anchor",
-        "metas",
-        "mask",
-        "confidence",
-        "temp_confidence",
-        "instance_id",
+    """Fingerprint only state that can persist across detector invocations.
+
+    Many inference modules expose ``_last_*`` tensors solely for diagnostics.
+    Those tensors are expected to be replaced on every forward and therefore
+    are not temporal detector state.  Keep this allowlist aligned with the
+    instance-bank reset contract instead of classifying attributes by prefix.
+    """
+
+    bank = getattr(getattr(model, "head", None), "instance_bank", None)
+    if not isinstance(bank, torch.nn.Module):
+        raise VerificationContractError(
+            "model.head.instance_bank is required for runtime-state attestation"
+        )
+    missing = [
+        name for name in PERSISTENT_RUNTIME_STATE_FIELDS if name not in vars(bank)
+    ]
+    if missing:
+        raise VerificationContractError(
+            "instance bank is missing persistent runtime-state fields: "
+            + ", ".join(missing)
+        )
+    return {
+        f"head.instance_bank.{name}": raw_fingerprint(vars(bank)[name])
+        for name in PERSISTENT_RUNTIME_STATE_FIELDS
     }
-    captured = {}
-    for module_name, module in model.named_modules():
-        for name, value in vars(module).items():
-            if name not in selected and not name.startswith("_last_"):
-                continue
-            key = f"{module_name}.{name}" if module_name else name
-            captured[key] = raw_fingerprint(value)
-    return captured
 
 
 def _ephemeral_id_counter_contract(
