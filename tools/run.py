@@ -20,10 +20,7 @@ import warnings
 import numpy as np
 import torch
 from mmengine.config import Config, DictAction
-from mmengine.hooks import Hook
 from mmengine.logging.history_buffer import HistoryBuffer
-from mmengine.model import is_model_wrapper
-from mmengine.runner import Runner
 
 
 _FAST_PROFILES = frozenset({"fast", "compact_v2_fast"})
@@ -122,19 +119,20 @@ _C73_DEPLOY_META_KEYS = frozenset(
 )
 
 
-class _CheckpointContractHook(Hook):
-    """Add the effective ROSA contract to checkpoints written by this CLI."""
+def _CheckpointContractHook(metadata: Mapping):
+    """Build the hook lazily so checkpoint inspection stays device-agnostic."""
 
-    def __init__(self, metadata: Mapping) -> None:
-        self.metadata = dict(metadata)
+    from mmengine.hooks import Hook
 
-    def before_save_checkpoint(
-        self,
-        runner: Runner,
-        checkpoint: dict,
-    ) -> None:
-        del runner
-        checkpoint.setdefault("meta", {}).update(self.metadata)
+    class CheckpointContractHook(Hook):
+        def __init__(self, hook_metadata: Mapping) -> None:
+            self.metadata = dict(hook_metadata)
+
+        def before_save_checkpoint(self, runner, checkpoint: dict) -> None:
+            del runner
+            checkpoint.setdefault("meta", {}).update(self.metadata)
+
+    return CheckpointContractHook(metadata)
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -798,8 +796,10 @@ def _validate_checkpoint_contract(
     warnings.warn(message, stacklevel=2)
 
 
-def _compile_fast_inference(runner: Runner, config: Config) -> bool:
+def _compile_fast_inference(runner, config: Config) -> bool:
     """Compile only the latency-oriented sidecar after weights are loaded."""
+
+    from mmengine.model import is_model_wrapper
 
     if _rosa_profile(config) not in _FAST_PROFILES:
         return False
@@ -813,6 +813,8 @@ def _compile_fast_inference(runner: Runner, config: Config) -> bool:
 
 
 def train(args: argparse.Namespace, config: Config) -> None:
+    from mmengine.runner import Runner
+
     if args.resume:
         os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
         config.resume = True
@@ -844,6 +846,8 @@ def train(args: argparse.Namespace, config: Config) -> None:
 
 
 def evaluate(args: argparse.Namespace, config: Config) -> None:
+    from mmengine.runner import Runner
+
     _validate_checkpoint_contract(
         args.checkpoint.resolve(),
         config,
@@ -874,6 +878,8 @@ def evaluate(args: argparse.Namespace, config: Config) -> None:
 
 def benchmark(args: argparse.Namespace, config: Config) -> None:
     """Measure end-to-end single-GPU ``test_step`` latency."""
+
+    from mmengine.runner import Runner
 
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark requires CUDA")
