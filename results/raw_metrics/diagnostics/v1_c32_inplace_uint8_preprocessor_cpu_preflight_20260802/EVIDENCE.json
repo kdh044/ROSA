@@ -1,0 +1,54 @@
+{
+  "schema": "rosa.c32_inplace_uint8_preprocessor.cpu_preflight.v1",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "gpu_used": false,
+  "parent_commit": "dab6ea1",
+  "candidate_commit": "c5ddf96db4d54a5babddf2e2b3c49828b459f916",
+  "scope": "prediction-only C32 uint8 image normalization",
+  "ingress_contract": "torch.uint8 BGR with fixed BGR-to-RGB advanced indexing",
+  "training_path": "fail closed",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "cpu_correctness": {
+    "direct_process_shapes": [
+      "2,4,3,32,64",
+      "1,4,3,33,35"
+    ],
+    "seeds": [
+      3407,
+      7101080
+    ],
+    "direct_output_raw_bit_equal": true,
+    "full_prediction_preprocessor_raw_bit_equal": true,
+    "caller_input_unchanged": true,
+    "candidate_output_owns_distinct_storage": true
+  },
+  "cpu_full_batch_observation": {
+    "shape": "B4,C4,RGB,800,800",
+    "dtype": "uint8 ingress to float32 normalized output",
+    "output_bytes": 122880000,
+    "parent_positive_self_allocation_bytes": 399360024,
+    "candidate_positive_self_allocation_bytes": 153600024,
+    "positive_self_allocation_reduction_bytes": 245760000,
+    "parent_blocked_median_ms": 133.20223096525297,
+    "candidate_blocked_median_ms": 51.306784502230585,
+    "candidate_over_parent_ratio": 0.38517961846760984,
+    "interpretation": "CPU preprocessor observation only; not CUDA or end-to-end model latency"
+  },
+  "tests": {
+    "focused": "24 passed, 68 warnings",
+    "full_cpu_suite": "202 passed, 5 skipped, 68 warnings in 14.23s",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/integrations/fisheye3dod/model.py": "538987680e72b7afece9c0d7539d3d354b81b16a278a5dc37e93e16386b7de63",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer_pinned_inplace.py": "8bcf620ad2fed58c52265635318702bb5ecfc9a8d3282f8ceb6b461c6c04cdb5",
+    "tests/test_inplace_uint8_preprocessor.py": "f08273276d0a4aee87e142d55b16cfb33f0df2afd5d31a5b0463217e7de1abfd"
+  },
+  "pending_gates": [
+    "CUDA raw-bit post-preprocessor and full prediction parity",
+    "paired CUDA transfer, preprocessor, model test_step, and peak-memory measurements",
+    "retain parent if strict preregistered adoption gate does not pass"
+  ]
+}
