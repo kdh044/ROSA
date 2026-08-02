@@ -298,6 +298,36 @@ def test_native_eval_cleanup_fails_closed_for_training_extensions_and_stale_stat
     assert deformable._last_view_support is None
     assert deformable._strict_native_eval_diagnostics_are_clear()
 
+    # The fallback must retain the historical external-subclass call
+    # signature: an explicit forward accepting the established spherical-RoI
+    # keyword, but not the new private keyword, must still work.
+    original_forward = deformable.forward
+
+    def explicit_forward(
+        _self,
+        instance_feature,
+        anchor,
+        anchor_embed,
+        maps,
+        metadata,
+        spherical_object_roi_query_confidence=None,
+    ):
+        return original_forward(
+            instance_feature,
+            anchor,
+            anchor_embed,
+            maps,
+            metadata,
+            spherical_object_roi_query_confidence=(
+                spherical_object_roi_query_confidence
+            ),
+        )
+
+    deformable.forward = MethodType(explicit_forward, deformable)
+    head._diagnostic_return_all_cls = True
+    with torch.inference_mode():
+        head(feature_maps, metas)
+
 
 def test_training_forward_gradients_and_one_step_stay_raw_exact(monkeypatch):
     _install_cpu_daf(monkeypatch)
