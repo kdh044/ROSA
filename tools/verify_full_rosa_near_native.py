@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Disarmed C0/ROSA full-model CUDA benchmark protocol.
+"""Disarmed native/ROSA full-model CUDA benchmark protocol.
 
 The default command is a standard-library-only dry run.  It hashes and prints
 the immutable experiment plan but does not import Torch, NumPy, MMEngine,
@@ -9,8 +9,10 @@ directory; or acquire a runtime lock.
 The separately armed path is intentionally difficult to invoke accidentally.
 It requires two explicit attestations, revalidates every source/checkpoint/DAF
 input, rejects a non-default current stream and concurrent GPU processes, then
-measures the exact same captured batches in one isolated C0/compiled-fast,
-C0/eager-fast, or C0/balanced paired alternating protocol.  Candidate variants
+measures the exact same captured batches in one isolated native/compiled-fast,
+native/eager-fast, or native/balanced paired alternating protocol.  The default
+native detector is C0; ``--detector-pair c32`` selects the exact official-
+residual C32 head on both sides of the ROSA-only derivation.  Candidate variants
 are deliberately separate process invocations with separate output directories.
 """
 
@@ -39,6 +41,7 @@ SRC_ROOT = ROOT / "src"
 VERIFY_C0_C32_TOOL = ROOT / "tools/verify_c0_c32_near_native.py"
 
 PROTOCOL = "full-rosa-c0-fast-variants-balanced-near-native-v2"
+C32_PROTOCOL = "full-rosa-c32-fast-variants-balanced-near-native-v1"
 PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v2"
 EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v2"
 COMPLETION_SCHEMA = "rosa.full_rosa_near_native_completion.v2"
@@ -46,7 +49,12 @@ FAILURE_SCHEMA = "rosa.full_rosa_near_native_failure.v2"
 IDLE_RESERVED_TOKEN = "I_HAVE_VERIFIED_THE_GPU_IS_IDLE_AND_RESERVED"
 CURRENT_STREAM_TOKEN = "I_HAVE_VERIFIED_THE_CURRENT_STREAM_IS_DEFAULT"
 
+DETECTOR_PAIR_C0 = "c0"
+DETECTOR_PAIR_C32 = "c32"
+DETECTOR_PAIRS = (DETECTOR_PAIR_C0, DETECTOR_PAIR_C32)
 NATIVE_ARM = "c0_native"
+C32_NATIVE_ARM = "c32_native"
+NATIVE_ARMS = frozenset((NATIVE_ARM, C32_NATIVE_ARM))
 FAST_ARM = "rosa_fast"
 FAST_EAGER_ARM = "rosa_fast_eager"
 BALANCED_ARM = "rosa_balanced"
@@ -73,6 +81,11 @@ PHYSICAL_ROUND_ORDER = ("PCCP", "CPPC", "PCCP", "CPPC", "PCCP", "CPPC")
 
 DEFAULT_NATIVE_CONFIG = (
     ROOT / "configs/rosa_r18_main126_v2_c0_cumulative_runtime_exact.py"
+)
+DEFAULT_C32_NATIVE_CONFIG = ROOT / (
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_"
+    "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_"
+    "homogeneous4x4_inference_reuse_exact.py"
 )
 DEFAULT_DETECTOR_HOST_ROOT = Path(
     "/home/airlab/user/kdh/ROSA_host_wt_exacte94_native_eval_p1p2_strict"
@@ -152,7 +165,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--expected-checkpoint-sha256", required=True)
     parser.add_argument("--expected-source-revision", required=True)
-    parser.add_argument("--native-config", type=Path, default=DEFAULT_NATIVE_CONFIG)
+    parser.add_argument(
+        "--detector-pair",
+        choices=DETECTOR_PAIRS,
+        default=DETECTOR_PAIR_C0,
+        help=(
+            "native detector shared by the pair; c0 preserves the historical "
+            "default and c32 selects the exact official-residual wrapper"
+        ),
+    )
+    parser.add_argument(
+        "--native-config",
+        type=Path,
+        default=None,
+        help="optional exact frozen native config for the selected detector pair",
+    )
     parser.add_argument(
         "--detector-host-root", type=Path, default=DEFAULT_DETECTOR_HOST_ROOT
     )
@@ -298,6 +325,49 @@ def _is_within(path: Path, root: Path) -> bool:
     return True
 
 
+def detector_pair_contract(detector_pair: str) -> dict[str, Any]:
+    """Return the exact immutable-by-construction detector-pair contract."""
+
+    if detector_pair == DETECTOR_PAIR_C0:
+        return {
+            "detector_pair": DETECTOR_PAIR_C0,
+            "native_arm": NATIVE_ARM,
+            "native_head_type": "ROSANativeBaselineHead",
+            "candidate_head_type": "ROSARefinementHead",
+            "native_profile": "native C0",
+            "protocol": PROTOCOL,
+        }
+    if detector_pair == DETECTOR_PAIR_C32:
+        return {
+            "detector_pair": DETECTOR_PAIR_C32,
+            "native_arm": C32_NATIVE_ARM,
+            "native_head_type": "ROSAOfficialResidualNativeBaselineHead",
+            "candidate_head_type": "ROSAOfficialResidualRefinementHead",
+            "native_profile": "native C32 official residual",
+            "protocol": C32_PROTOCOL,
+        }
+    raise ProtocolError("detector pair must be c0 or c32")
+
+
+def selected_native_arm(detector_pair: str = DETECTOR_PAIR_C0) -> str:
+    return str(detector_pair_contract(detector_pair)["native_arm"])
+
+
+def default_native_config(detector_pair: str = DETECTOR_PAIR_C0) -> Path:
+    detector_pair_contract(detector_pair)
+    if detector_pair == DETECTOR_PAIR_C0:
+        return DEFAULT_NATIVE_CONFIG
+    return DEFAULT_C32_NATIVE_CONFIG
+
+
+def _detector_pair_from_native_arm(native_arm: str) -> str:
+    if native_arm == NATIVE_ARM:
+        return DETECTOR_PAIR_C0
+    if native_arm == C32_NATIVE_ARM:
+        return DETECTOR_PAIR_C32
+    raise ProtocolError("native arm must be c0_native or c32_native")
+
+
 def selected_candidate(profile: str) -> str:
     if profile == "fast":
         return FAST_ARM
@@ -346,8 +416,10 @@ def compiler_guard_contract(candidate_arm: str) -> dict[str, Any]:
     raise ProtocolError("unknown ROSA candidate arm")
 
 
-def selected_arms(profile: str) -> tuple[str, str]:
-    return NATIVE_ARM, selected_candidate(profile)
+def selected_arms(
+    profile: str, detector_pair: str = DETECTOR_PAIR_C0
+) -> tuple[str, str]:
+    return selected_native_arm(detector_pair), selected_candidate(profile)
 
 
 def build_alternating_schedule(
@@ -356,6 +428,7 @@ def build_alternating_schedule(
     phase: str,
     candidate_arm: str,
     batch_count: int,
+    detector_pair: str = DETECTOR_PAIR_C0,
 ) -> tuple[dict[str, Any], ...]:
     if type(iterations_per_arm) is not int or iterations_per_arm <= 0:
         raise ProtocolError("iterations_per_arm must be a positive exact integer")
@@ -369,6 +442,7 @@ def build_alternating_schedule(
         raise ProtocolError(
             "candidate_arm must be compiled fast, eager fast, or balanced"
         )
+    native_arm = selected_native_arm(detector_pair)
     if iterations_per_arm % 12:
         raise ProtocolError("iterations_per_arm must be divisible by twelve")
     iterations_per_segment = iterations_per_arm // 12
@@ -377,7 +451,7 @@ def build_alternating_schedule(
         pairs_per_round = 2 * iterations_per_segment
         for slot_index, token in enumerate(pattern):
             pair_group = 0 if slot_index < 2 else 1
-            arm = NATIVE_ARM if token == "P" else candidate_arm
+            arm = native_arm if token == "P" else candidate_arm
             for segment_iteration in range(iterations_per_segment):
                 pair_index = (
                     round_index * pairs_per_round
@@ -458,11 +532,18 @@ def _gpu_selection_contract(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def _arms_plan(arms: Sequence[str]) -> dict[str, Any]:
+def _arms_plan(
+    arms: Sequence[str], detector_pair: str = DETECTOR_PAIR_C0
+) -> dict[str, Any]:
+    pair = detector_pair_contract(detector_pair)
+    native_arm = pair["native_arm"]
+    if len(arms) != 2 or arms[0] != native_arm or arms[1] not in CANDIDATE_ARMS:
+        raise ProtocolError("arms do not match the selected detector pair")
     records: dict[str, Any] = {
-        NATIVE_ARM: {
-            "profile": "native C0",
-            "head_type": "ROSANativeBaselineHead",
+        native_arm: {
+            "profile": pair["native_profile"],
+            "detector_pair": detector_pair,
+            "head_type": pair["native_head_type"],
             "config_derivation": "unchanged frozen native config",
             "compile": False,
         }
@@ -472,11 +553,12 @@ def _arms_plan(arms: Sequence[str]) -> dict[str, Any]:
             "profile": "fast",
             "model_profile": "fast",
             "execution_mode": "compiled",
-            "head_type": "ROSARefinementHead",
+            "detector_pair": detector_pair,
+            "head_type": pair["candidate_head_type"],
             "config_derivation": {
-                "base": NATIVE_ARM,
+                "base": native_arm,
                 "only_changes": {
-                    "model.head.type": "ROSARefinementHead",
+                    "model.head.type": pair["candidate_head_type"],
                     "model.head.rosa_cfg": {"profile": "fast"},
                 },
             },
@@ -493,11 +575,12 @@ def _arms_plan(arms: Sequence[str]) -> dict[str, Any]:
             "profile": "fast_eager",
             "model_profile": "fast",
             "execution_mode": "eager",
-            "head_type": "ROSARefinementHead",
+            "detector_pair": detector_pair,
+            "head_type": pair["candidate_head_type"],
             "config_derivation": {
-                "base": NATIVE_ARM,
+                "base": native_arm,
                 "only_changes": {
-                    "model.head.type": "ROSARefinementHead",
+                    "model.head.type": pair["candidate_head_type"],
                     "model.head.rosa_cfg": {"profile": "fast"},
                 },
             },
@@ -512,11 +595,12 @@ def _arms_plan(arms: Sequence[str]) -> dict[str, Any]:
             "profile": "balanced",
             "model_profile": "balanced",
             "execution_mode": "eager",
-            "head_type": "ROSARefinementHead",
+            "detector_pair": detector_pair,
+            "head_type": pair["candidate_head_type"],
             "config_derivation": {
-                "base": NATIVE_ARM,
+                "base": native_arm,
                 "only_changes": {
-                    "model.head.type": "ROSARefinementHead",
+                    "model.head.type": pair["candidate_head_type"],
                     "model.head.rosa_cfg": {"profile": "balanced"},
                 },
             },
@@ -530,6 +614,9 @@ def prepare_plan(
 ) -> dict[str, Any]:
     if not isinstance(allow_existing_output, bool):
         raise TypeError("allow_existing_output must be bool")
+    pair = detector_pair_contract(args.detector_pair)
+    detector_pair = pair["detector_pair"]
+    native_arm = pair["native_arm"]
     expected_checkpoint = _validate_sha256(
         args.expected_checkpoint_sha256, "expected checkpoint SHA256"
     )
@@ -558,9 +645,15 @@ def prepare_plan(
     checkpoint = _file_contract(args.checkpoint, "checkpoint")
     if checkpoint["sha256"] != expected_checkpoint:
         raise ProtocolError("checkpoint hash differs from the expected SHA256")
-    native_config_path = _resolve_file(args.native_config, "native config")
-    if native_config_path != DEFAULT_NATIVE_CONFIG.resolve(strict=True):
-        raise ProtocolError("native config must be the frozen cumulative C0 config")
+    expected_native_config = default_native_config(detector_pair).resolve(strict=True)
+    requested_native_config = (
+        expected_native_config if args.native_config is None else args.native_config
+    )
+    native_config_path = _resolve_file(requested_native_config, "native config")
+    if native_config_path != expected_native_config:
+        raise ProtocolError(
+            f"native config must be the frozen cumulative {detector_pair.upper()} config"
+        )
     native_config = _file_contract(native_config_path, "native config")
     annotation = _file_contract(DEFAULT_MAIN126_ANNOTATION, "Main126 annotation")
     if annotation["sha256"] != EXPECTED_MAIN126_ANNOTATION_SHA256:
@@ -615,7 +708,7 @@ def prepare_plan(
     if output_dir.exists() and not allow_existing_output:
         raise ProtocolError("benchmark output path already exists")
 
-    arms = selected_arms(args.candidate_profile)
+    arms = selected_arms(args.candidate_profile, detector_pair)
     candidate_arm = selected_candidate(args.candidate_profile)
     schedules = {}
     for phase, iterations in (
@@ -627,6 +720,7 @@ def prepare_plan(
             phase=phase,
             candidate_arm=candidate_arm,
             batch_count=CAPTURE_BATCHES,
+            detector_pair=detector_pair,
         )
         schedules[phase] = {
             "iterations_per_arm": iterations,
@@ -635,7 +729,8 @@ def prepare_plan(
         }
     comparisons = {
         candidate_arm: {
-            "parent_arm": NATIVE_ARM,
+            "detector_pair": detector_pair,
+            "parent_arm": native_arm,
             "candidate_arm": candidate_arm,
             "physical_round_order": list(PHYSICAL_ROUND_ORDER),
             "schedules": schedules,
@@ -646,7 +741,20 @@ def prepare_plan(
     return {
         "schema": PLAN_SCHEMA,
         "status": "DRY_RUN",
-        "protocol": PROTOCOL,
+        "protocol": pair["protocol"],
+        "detector_pair": detector_pair,
+        "detector_pair_contract": {
+            **pair,
+            "candidate_derivation_only_changes": [
+                "model.head.type",
+                "model.head.rosa_cfg",
+            ],
+            "shared_backbone": "ResNet-18",
+            "shared_dataset": "Fisheye3DOD Main126 validation",
+            "shared_schedule_and_effective_config_outside_head": True,
+            "shared_checkpoint_path_and_sha256": True,
+            "shared_native_state_raw_exact": True,
+        },
         "execution_requested": bool(args.execute),
         "execution_state": args.execution_state,
         "accelerator_modules_imported": False,
@@ -688,7 +796,7 @@ def prepare_plan(
         "candidate_profile": args.candidate_profile,
         "candidate_model_profile": candidate_model_profile(candidate_arm),
         "candidate_execution_mode": candidate_execution_mode(candidate_arm),
-        "arms": _arms_plan(arms),
+        "arms": _arms_plan(arms, detector_pair),
         "comparisons": comparisons,
         "parameters": {
             "capture_batches": CAPTURE_BATCHES,
@@ -700,7 +808,7 @@ def prepare_plan(
             "seed": SEED,
         },
         "same_input_contract": {
-            "capture_once_from": NATIVE_ARM,
+            "capture_once_from": native_arm,
             "captured_batches": CAPTURE_BATCHES,
             "replay": "independent pinned CPU clone outside timed interval",
             "pairing": (
@@ -743,6 +851,8 @@ def prepare_plan(
         },
         "near_native_gate": {
             "source": "existing C0/C32 full-detector gate",
+            "detector_pair": detector_pair,
+            "ratio": f"ROSA candidate / {detector_pair.upper()} native",
             "scope": "full model.test_step only",
             "median_ratio_ci95_upper_max": 1.10,
             "p95_ratio_max": 1.10,
@@ -1019,10 +1129,13 @@ def _release_physical_gpu_lock(descriptor: int, lock: Path) -> None:
 
 
 def _expected_candidate_config(
-    native_config: Mapping[str, Any], profile: str
+    native_config: Mapping[str, Any],
+    profile: str,
+    detector_pair: str = DETECTOR_PAIR_C0,
 ) -> dict[str, Any]:
     if profile not in ("fast", "balanced"):
         raise ProtocolError("candidate profile must be fast or balanced")
+    pair = detector_pair_contract(detector_pair)
     expected = copy.deepcopy(dict(native_config))
     model = expected.get("model")
     if not isinstance(model, Mapping):
@@ -1030,28 +1143,42 @@ def _expected_candidate_config(
     head = model.get("head")
     if not isinstance(head, Mapping):
         raise ProtocolError("native config has no model.head mapping")
-    if head.get("type") != "ROSANativeBaselineHead":
-        raise ProtocolError("native config is not the exact C0 head")
-    head["type"] = "ROSARefinementHead"
+    if head.get("type") != pair["native_head_type"]:
+        raise ProtocolError(
+            f"native config is not the exact {detector_pair.upper()} head"
+        )
+    if head.get("rosa_cfg") is not None:
+        raise ProtocolError("native config unexpectedly contains ROSA sidecar settings")
+    head["type"] = pair["candidate_head_type"]
     head["rosa_cfg"] = {"profile": profile}
     return expected
 
 
-def _derive_configs(verifier, native_config_path: Path, arms: Sequence[str]):
+def _derive_configs(
+    verifier,
+    native_config_path: Path,
+    arms: Sequence[str],
+    detector_pair: str = DETECTOR_PAIR_C0,
+):
+    pair = detector_pair_contract(detector_pair)
+    native_arm = pair["native_arm"]
+    if len(arms) != 2 or arms[0] != native_arm or arms[1] not in CANDIDATE_ARMS:
+        raise ProtocolError("config arms do not match the selected detector pair")
     native = verifier.Config.fromfile(native_config_path, import_custom_modules=False)
     native_dict = native.to_dict()
-    configs = {NATIVE_ARM: native}
+    configs = {native_arm: native}
     for arm in arms:
-        if arm == NATIVE_ARM:
+        if arm == native_arm:
             continue
         profile = candidate_model_profile(arm)
         candidate = copy.deepcopy(native)
-        candidate.model.head.type = "ROSARefinementHead"
+        candidate.model.head.type = pair["candidate_head_type"]
         candidate.model.head.rosa_cfg = {"profile": profile}
-        expected = _expected_candidate_config(native_dict, profile)
+        expected = _expected_candidate_config(native_dict, profile, detector_pair)
         if candidate.to_dict() != expected:
             raise ProtocolError(
-                f"{arm} config differs from C0 outside head.type and head.rosa_cfg"
+                f"{arm} config differs from {detector_pair.upper()} outside "
+                "head.type and head.rosa_cfg"
             )
         configs[arm] = candidate
     return configs
@@ -1159,6 +1286,10 @@ def _capture_loaded_provenance(
 
 
 def _attest_armed_schedules(verifier, plan: Mapping[str, Any]) -> None:
+    pair = detector_pair_contract(plan.get("detector_pair"))
+    if plan.get("detector_pair_contract", {}).get("native_arm") != pair["native_arm"]:
+        raise ProtocolError("planned detector-pair native arm drifted")
+    native_arm = pair["native_arm"]
     for candidate_arm, comparison in plan["comparisons"].items():
         for phase, iterations in (
             ("warmup", WARMUP_ITERATIONS_PER_ARM),
@@ -1172,7 +1303,7 @@ def _attest_armed_schedules(verifier, plan: Mapping[str, Any]) -> None:
             ):
                 record = entry.to_dict()
                 record["arm"] = (
-                    NATIVE_ARM
+                    native_arm
                     if record["arm"] == verifier.PARENT_ARM
                     else candidate_arm
                 )
@@ -1195,7 +1326,51 @@ def _checkpoint_copy(state_dict):
     return copied
 
 
-def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
+def _configured_head_contract(config) -> tuple[Any, Any]:
+    model = (
+        config.get("model")
+        if isinstance(config, Mapping)
+        else getattr(config, "model", None)
+    )
+    if model is None:
+        raise ProtocolError("candidate config has no model")
+    head = (
+        model.get("head")
+        if isinstance(model, Mapping)
+        else getattr(model, "head", None)
+    )
+    if head is None:
+        raise ProtocolError("candidate config has no model.head")
+    if isinstance(head, Mapping):
+        return head.get("type"), head.get("rosa_cfg")
+    return getattr(head, "type", None), getattr(head, "rosa_cfg", None)
+
+
+def _validate_checkpoint_semantics(
+    run_tool,
+    checkpoint,
+    config,
+    arm: str,
+    *,
+    detector_pair: str | None = None,
+):
+    pair_name = DETECTOR_PAIR_C0 if detector_pair is None else detector_pair
+    pair = detector_pair_contract(pair_name)
+    if detector_pair is not None:
+        observed_head_type, observed_rosa_cfg = _configured_head_contract(config)
+        expected_rosa_cfg = {"profile": candidate_model_profile(arm)}
+        if observed_head_type != pair["candidate_head_type"]:
+            raise ProtocolError(
+                f"{arm} config does not use the exact {pair_name.upper()} "
+                "ROSA candidate head"
+            )
+        if (
+            not isinstance(observed_rosa_cfg, Mapping)
+            or dict(observed_rosa_cfg) != expected_rosa_cfg
+        ):
+            raise ProtocolError(
+                f"{arm} config does not contain the exact ROSA profile selector"
+            )
     if not isinstance(checkpoint, Mapping):
         raise ProtocolError("checkpoint is not a mapping")
     metadata = checkpoint.get("meta")
@@ -1264,6 +1439,8 @@ def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
             f"{observed_deltas}"
         )
     return {
+        "detector_pair": pair_name,
+        "candidate_head_type": pair["candidate_head_type"],
         "validated_against_arm": arm,
         "source_refinement_profile": metadata["refinement_profile"],
         "rosa_contract_version": metadata["rosa_contract_version"],
@@ -1286,19 +1463,45 @@ def _build_models(verifier, configs, state_dict, arms, device):
     from mmengine.utils import import_modules_from_strings
     from mmdet3d.registry import MODELS
     from mmdet3d.utils import register_all_modules
-    from rosa.integrations.sparse4d import ROSANativeBaselineHead, ROSARefinementHead
+    from rosa.integrations.sparse4d import (
+        ROSANativeBaselineHead,
+        ROSAOfficialResidualNativeBaselineHead,
+        ROSAOfficialResidualRefinementHead,
+        ROSARefinementHead,
+    )
+
+    native_arms = [arm for arm in configs if arm in NATIVE_ARMS]
+    if len(native_arms) != 1:
+        raise ProtocolError("configs must contain exactly one registered native arm")
+    native_arm = native_arms[0]
+    detector_pair = _detector_pair_from_native_arm(native_arm)
+    pair = detector_pair_contract(detector_pair)
+    expected_native_head = (
+        ROSANativeBaselineHead
+        if detector_pair == DETECTOR_PAIR_C0
+        else ROSAOfficialResidualNativeBaselineHead
+    )
+    expected_candidate_head = (
+        ROSARefinementHead
+        if detector_pair == DETECTOR_PAIR_C0
+        else ROSAOfficialResidualRefinementHead
+    )
 
     register_all_modules(init_default_scope=True)
     for config in configs.values():
         import_modules_from_strings(**config.custom_imports)
     models, contracts, load_contracts = {}, {}, {}
     for arm in arms:
+        if arm != native_arm and arm not in CANDIDATE_ARMS:
+            raise ProtocolError(f"unregistered model arm: {arm}")
         config = configs[arm]
         verifier._seed_everything(SEED)
         model = MODELS.build(copy.deepcopy(config.model))
-        if arm == NATIVE_ARM:
-            if type(model.head) is not ROSANativeBaselineHead:
-                raise ProtocolError("native arm did not build the exact C0 head")
+        if arm == native_arm:
+            if type(model.head) is not expected_native_head:
+                raise ProtocolError(
+                    f"native arm did not build the exact {detector_pair.upper()} head"
+                )
             model_keys = set(model.state_dict())
             missing = sorted(model_keys - set(state_dict))
             filtered = _checkpoint_copy(state_dict)
@@ -1311,6 +1514,8 @@ def _build_models(verifier, configs, state_dict, arms, device):
             excluded = sorted(set(state_dict) - model_keys)
             _validate_native_checkpoint_exclusions(excluded)
             load_contracts[arm] = {
+                "detector_pair": detector_pair,
+                "head_type": pair["native_head_type"],
                 "strict_native_subset": True,
                 "excluded_sidecar_keys": excluded,
                 "excluded_count": len(excluded),
@@ -1318,8 +1523,10 @@ def _build_models(verifier, configs, state_dict, arms, device):
                 "unexpected_keys": list(result.unexpected_keys),
             }
         else:
-            if type(model.head) is not ROSARefinementHead:
-                raise ProtocolError(f"{arm} did not build ROSARefinementHead")
+            if type(model.head) is not expected_candidate_head:
+                raise ProtocolError(
+                    f"{arm} did not build exact {pair['candidate_head_type']}"
+                )
             result = model.load_state_dict(_checkpoint_copy(state_dict), strict=True)
             profile = candidate_model_profile(arm)
             expected_topk = 50 if arm in FAST_MODEL_ARMS else 100
@@ -1330,6 +1537,8 @@ def _build_models(verifier, configs, state_dict, arms, device):
             ):
                 raise ProtocolError(f"{profile} compute-budget contract drifted")
             load_contracts[arm] = {
+                "detector_pair": detector_pair,
+                "head_type": pair["candidate_head_type"],
                 "strict_full_checkpoint": True,
                 "missing_keys": list(result.missing_keys),
                 "unexpected_keys": list(result.unexpected_keys),
@@ -1340,10 +1549,10 @@ def _build_models(verifier, configs, state_dict, arms, device):
         contracts[arm] = verifier._model_contract(model)
         model.to(device=device).eval()
         models[arm] = model
-    if NATIVE_ARM in models:
-        native_state = models[NATIVE_ARM].state_dict()
+    if native_arm in models:
+        native_state = models[native_arm].state_dict()
         for arm in arms:
-            if arm == NATIVE_ARM:
+            if arm == native_arm:
                 continue
             candidate_state = models[arm].state_dict()
             candidate_native_state = _project_shared_native_state(
@@ -1537,8 +1746,13 @@ def _measure_isolated_memory(
     sources,
     device,
     candidate_arm: str,
+    *,
+    native_arm: str = NATIVE_ARM,
 ):
-    arms = (NATIVE_ARM, candidate_arm)
+    _detector_pair_from_native_arm(native_arm)
+    if native_arm not in configs:
+        raise ProtocolError("selected native arm is missing from configs")
+    arms = (native_arm, candidate_arm)
     allocator_floor = _stabilize_cuda_allocator(torch, device)
     memory: dict[str, Any] = {
         "contract": {
@@ -1757,7 +1971,9 @@ def _run_pair_protocol(
     manifests,
     device,
     candidate_arm,
+    native_arm=NATIVE_ARM,
 ):
+    detector_pair = _detector_pair_from_native_arm(native_arm)
     _require_current_default_stream(torch, device)
     compiler_before = (
         _compiler_counter_snapshot(torch) if candidate_arm == FAST_ARM else None
@@ -1765,7 +1981,7 @@ def _run_pair_protocol(
     result = verifier._run_scope(
         scope=verifier.C0_C32_FULL_DETECTOR_SCOPE,
         models={
-            verifier.PARENT_ARM: models[NATIVE_ARM],
+            verifier.PARENT_ARM: models[native_arm],
             verifier.CANDIDATE_ARM: models[candidate_arm],
         },
         sources=sources,
@@ -1783,9 +1999,10 @@ def _run_pair_protocol(
         result["compiler_guard"].update(compiler_contract)
     result["stream_after"] = _require_current_default_stream(torch, device)
     result["arm_aliases"] = {
-        verifier.PARENT_ARM: NATIVE_ARM,
+        verifier.PARENT_ARM: native_arm,
         verifier.CANDIDATE_ARM: candidate_arm,
     }
+    result["detector_pair"] = detector_pair
     result["candidate_model_profile"] = candidate_model_profile(candidate_arm)
     result["candidate_execution_mode"] = candidate_execution_mode(candidate_arm)
     return result
@@ -1796,12 +2013,14 @@ def _evaluate_near_native_gate(
     timings: Mapping[str, Any],
     memory: Mapping[str, Any],
     candidate_arm: str,
+    native_arm: str = NATIVE_ARM,
 ) -> Mapping[str, Any]:
+    detector_pair = _detector_pair_from_native_arm(native_arm)
     paired = timings.get("paired_bootstrap")
     if not isinstance(paired, Mapping):
         raise ProtocolError("paired timing result is missing its bootstrap evidence")
     logical_memory = {
-        verifier.PARENT_ARM: memory[NATIVE_ARM],
+        verifier.PARENT_ARM: memory[native_arm],
         verifier.CANDIDATE_ARM: memory[candidate_arm],
     }
     gate = verifier.evaluate_c0_c32_near_native_gate(paired, logical_memory)
@@ -1828,7 +2047,8 @@ def _evaluate_near_native_gate(
         raise ProtocolError("runtime near-native decision is internally inconsistent")
     return {
         "gate": "rosa_vs_native_full_detector_near_native",
-        "parent_arm": NATIVE_ARM,
+        "detector_pair": detector_pair,
+        "parent_arm": native_arm,
         "candidate_arm": candidate_arm,
         "benchmark_scope": "full model.test_step",
         "passed": passed,
@@ -1844,6 +2064,15 @@ def _evaluate_near_native_gate(
 def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any]):
     """Import and execute accelerator code only after repeated hard guards."""
 
+    pair = detector_pair_contract(args.detector_pair)
+    detector_pair = pair["detector_pair"]
+    native_arm = pair["native_arm"]
+    if (
+        prepared_plan.get("detector_pair") != detector_pair
+        or prepared_plan.get("detector_pair_contract", {}).get("native_arm")
+        != native_arm
+    ):
+        raise ProtocolError("prepared detector-pair contract differs from CLI")
     validate_execution_gate(args)
     repeated = prepare_plan(args)
     if repeated != prepared_plan:
@@ -1944,9 +2173,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
         verifier._seed_everything(SEED)
         verifier._pin_import_roots(detector_root)
         verifier._pin_official_import_roots(official_root)
-        arms = selected_arms(args.candidate_profile)
+        arms = selected_arms(args.candidate_profile, detector_pair)
         candidate_arm = selected_candidate(args.candidate_profile)
-        configs = _derive_configs(verifier, Path(args.native_config), arms)
+        configs = _derive_configs(
+            verifier,
+            Path(prepared_plan["native_config"]["path"]),
+            arms,
+            detector_pair,
+        )
         _validate_effective_dataset_configs(
             configs,
             Path(prepared_plan["dataset"]["annotation"]["path"]),
@@ -1968,6 +2202,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             checkpoint,
             configs[candidate_arm],
             candidate_arm,
+            detector_pair=detector_pair,
         )
         state_dict = run_tool._checkpoint_state_dict(checkpoint)
         if not isinstance(state_dict, Mapping):
@@ -1976,7 +2211,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
 
         _register_runtime_modules(configs)
         prepared = SimpleNamespace(
-            parent_config=configs[NATIVE_ARM], expected_manifest=None
+            parent_config=configs[native_arm], expected_manifest=None
         )
         sources, manifests = verifier._capture_batches(prepared)
         _atomic_json(output_dir / "SAMPLE_MANIFEST.json", manifests)
@@ -2008,12 +2243,13 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 sources,
                 device,
                 candidate_arm,
+                native_arm=native_arm,
             )
         )
         _atomic_json(pair_dir / "MEMORY.json", memory)
         gpu_snapshots.append(_nvidia_smi_snapshot(identity["gpu_uuid"]))
 
-        pair_arms = (NATIVE_ARM, candidate_arm)
+        pair_arms = (native_arm, candidate_arm)
         models, pair_model_contracts, pair_load_contracts = _build_models(
             verifier, configs, state_dict, pair_arms, device
         )
@@ -2166,6 +2402,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             manifests,
             device,
             candidate_arm,
+            native_arm,
         )
         timing_compile_state_attestations.append(
             _attest_candidate_compile_state(
@@ -2182,12 +2419,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             timings,
             memory,
             candidate_arm,
+            native_arm,
         )
         _write_jsonl(pair_dir / "WARMUP.jsonl", warmup_records)
         _write_jsonl(pair_dir / "TIMINGS.jsonl", measured_records)
         _atomic_json(pair_dir / "STATISTICS.json", timings)
         comparison_results[candidate_arm] = {
-            "parent_arm": NATIVE_ARM,
+            "detector_pair": detector_pair,
+            "parent_arm": native_arm,
             "candidate_arm": candidate_arm,
             "output_preflight": output_preflight,
             "compiled_eager_parity": compiled_parity,
@@ -2220,7 +2459,9 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
         evidence = {
             "schema": EVIDENCE_SCHEMA,
             "status": "SEALED_PENDING_COMPLETION",
-            "protocol": PROTOCOL,
+            "protocol": final_plan["protocol"],
+            "detector_pair": detector_pair,
+            "detector_pair_contract": final_plan["detector_pair_contract"],
             "plan_sha256": file_sha256(output_dir / "PLAN.json"),
             "repository": final_plan["repository"],
             "rosa_source": final_plan["rosa_source"],

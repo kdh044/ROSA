@@ -71,6 +71,7 @@ with tempfile.TemporaryDirectory() as raw_temp:
     host_revision = '2' * 40
     official_revision = '3' * 40
     module.DEFAULT_NATIVE_CONFIG = config
+    module.DEFAULT_C32_NATIVE_CONFIG = config
     module.DEFAULT_MAIN126_ANNOTATION = annotation
     module.EXPECTED_MAIN126_ANNOTATION_SHA256 = module.file_sha256(annotation)
     module.DEFAULT_DAF_EXTENSION_SHA256 = module.file_sha256(daf)
@@ -128,6 +129,13 @@ with tempfile.TemporaryDirectory() as raw_temp:
         plan = module.prepare_plan(args)
         assert set(plan['arms']) == {module.NATIVE_ARM, candidate}
         assert set(plan['comparisons']) == {candidate}
+        assert plan['detector_pair'] == 'c0'
+        assert plan['detector_pair_contract']['native_head_type'] == (
+            'ROSANativeBaselineHead'
+        )
+        assert plan['detector_pair_contract']['candidate_head_type'] == (
+            'ROSARefinementHead'
+        )
         assert plan['candidate_profile'] == profile
         assert plan['schema'].endswith('.v2')
         assert plan['protocol'].endswith('-v2')
@@ -148,6 +156,46 @@ with tempfile.TemporaryDirectory() as raw_temp:
             ] == {'profile': 'fast'}
         assert module.main(argv) == 0
         assert not output.exists()
+
+    c32_output = temp / 'not-created-c32-fast-eager'
+    c32_argv = [
+        '--checkpoint', str(checkpoint),
+        '--expected-checkpoint-sha256', module.file_sha256(checkpoint),
+        '--expected-source-revision', source_revision,
+        '--detector-pair', 'c32',
+        '--detector-host-root', str(detector),
+        '--expected-detector-host-revision', host_revision,
+        '--official-root', str(official),
+        '--expected-official-revision', official_revision,
+        '--expected-daf-extension-sha256', module.file_sha256(daf),
+        '--output-dir', str(c32_output),
+        '--candidate-profile', 'fast_eager',
+    ]
+    c32_args = module.build_parser().parse_args(c32_argv)
+    c32_plan = module.prepare_plan(c32_args)
+    assert set(c32_plan['arms']) == {
+        module.C32_NATIVE_ARM,
+        module.FAST_EAGER_ARM,
+    }
+    assert c32_plan['detector_pair'] == 'c32'
+    assert c32_plan['protocol'] == module.C32_PROTOCOL
+    assert c32_plan['native_config']['path'] == str(config.resolve())
+    assert c32_plan['detector_pair_contract']['native_head_type'] == (
+        'ROSAOfficialResidualNativeBaselineHead'
+    )
+    assert c32_plan['detector_pair_contract']['candidate_head_type'] == (
+        'ROSAOfficialResidualRefinementHead'
+    )
+    c32_derivation = c32_plan['arms'][module.FAST_EAGER_ARM][
+        'config_derivation'
+    ]
+    assert c32_derivation['base'] == module.C32_NATIVE_ARM
+    assert c32_derivation['only_changes'] == {
+        'model.head.type': 'ROSAOfficialResidualRefinementHead',
+        'model.head.rosa_cfg': {'profile': 'fast'},
+    }
+    assert module.main(c32_argv) == 0
+    assert not c32_output.exists()
 
 assert not any(name.split('.', 1)[0] in forbidden for name in sys.modules)
 print('stdlib-only-ok')
@@ -221,6 +269,41 @@ def test_candidate_profile_selects_exactly_one_pair(
     assert tool.candidate_model_profile(candidate) == model_profile
     assert tool.candidate_execution_mode(candidate) == execution_mode
     assert set(tool._arms_plan(arms)) == {tool.NATIVE_ARM, candidate}
+
+
+def test_c32_pair_uses_explicit_native_arm_and_exact_head_labels() -> None:
+    arms = tool.selected_arms("fast_eager", "c32")
+    records = tool._arms_plan(arms, "c32")
+    schedule = tool.build_alternating_schedule(
+        iterations_per_arm=60,
+        phase="measured",
+        candidate_arm=tool.FAST_EAGER_ARM,
+        batch_count=2,
+        detector_pair="c32",
+    )
+
+    assert arms == (tool.C32_NATIVE_ARM, tool.FAST_EAGER_ARM)
+    assert records[tool.C32_NATIVE_ARM]["head_type"] == (
+        "ROSAOfficialResidualNativeBaselineHead"
+    )
+    assert records[tool.FAST_EAGER_ARM]["head_type"] == (
+        "ROSAOfficialResidualRefinementHead"
+    )
+    assert records[tool.FAST_EAGER_ARM]["config_derivation"]["only_changes"] == {
+        "model.head.type": "ROSAOfficialResidualRefinementHead",
+        "model.head.rosa_cfg": {"profile": "fast"},
+    }
+    assert {row["arm"] for row in schedule} == {
+        tool.C32_NATIVE_ARM,
+        tool.FAST_EAGER_ARM,
+    }
+    assert sum(row["arm"] == tool.C32_NATIVE_ARM for row in schedule) == 60
+
+
+@pytest.mark.parametrize("detector_pair", ("C32", "official", ""))
+def test_detector_pair_selection_fails_closed(detector_pair) -> None:
+    with pytest.raises(tool.ProtocolError, match="detector pair"):
+        tool.detector_pair_contract(detector_pair)
 
 
 def test_schedule_rejects_an_unregistered_candidate_arm() -> None:
@@ -580,8 +663,9 @@ def test_atomic_publication_removes_new_marker_when_directory_fsync_fails(
         (tool.BALANCED_ARM, 0),
     ),
 )
+@pytest.mark.parametrize("native_arm", (tool.NATIVE_ARM, tool.C32_NATIVE_ARM))
 def test_memory_measurement_builds_only_one_model_at_a_time(
-    monkeypatch, candidate, expected_compiles
+    monkeypatch, candidate, expected_compiles, native_arm
 ) -> None:
     build_calls = []
     compile_calls = []
@@ -655,7 +739,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         lambda torch: (reset_calls.append(torch), lifecycle.append("reset")),
     )
 
-    configs = {tool.NATIVE_ARM: object(), candidate: object()}
+    configs = {native_arm: object(), candidate: object()}
     fake_torch = SimpleNamespace(cuda=Cuda())
     memory, contracts, loads = tool._measure_isolated_memory(
         Verifier,
@@ -666,9 +750,10 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         [object(), object()],
         "cuda:0",
         candidate,
+        native_arm=native_arm,
     )
 
-    assert build_calls == [(tool.NATIVE_ARM,), (candidate,)]
+    assert build_calls == [(native_arm,), (candidate,)]
     assert len(compile_calls) == expected_compiles
     assert len(reset_calls) == expected_compiles
     expected_lifecycle = [
@@ -683,7 +768,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         expected_lifecycle.append("reset")
     expected_lifecycle.append("stabilize")
     assert lifecycle == expected_lifecycle
-    assert set(contracts) == set(loads) == {tool.NATIVE_ARM, candidate}
+    assert set(contracts) == set(loads) == {native_arm, candidate}
     assert memory["contract"]["one_benchmark_model_resident_per_probe"] is True
     assert memory["contract"]["between_arm_cleanup"] == [
         {
@@ -705,7 +790,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
             ],
         },
     ]
-    for arm in (tool.NATIVE_ARM, candidate):
+    for arm in (native_arm, candidate):
         assert memory[arm]["resident_benchmark_models"] == [arm]
         assert memory[arm]["peer_model_resident"] is False
         assert len(memory[arm]["probe_records"]) == 3
@@ -775,7 +860,10 @@ def test_fast_timing_rejects_compiler_counter_changes() -> None:
         (tool.BALANCED_ARM, "balanced candidate"),
     ),
 )
-def test_eager_timing_does_not_require_compiler_counters(candidate, reason) -> None:
+@pytest.mark.parametrize("native_arm", (tool.NATIVE_ARM, tool.C32_NATIVE_ARM))
+def test_eager_timing_does_not_require_compiler_counters(
+    candidate, reason, native_arm
+) -> None:
     class Cuda:
         @staticmethod
         def current_stream(device):
@@ -796,15 +884,18 @@ def test_eager_timing_does_not_require_compiler_counters(candidate, reason) -> N
     result = tool._run_pair_protocol(
         verifier,
         SimpleNamespace(cuda=Cuda()),
-        {tool.NATIVE_ARM: object(), candidate: object()},
+        {native_arm: object(), candidate: object()},
         [],
         [],
         "cuda:0",
         candidate,
+        native_arm,
     )
     assert result["compiler_guard"]["applicable"] is False
     assert reason in result["compiler_guard"]["reason"]
     assert result["candidate_execution_mode"] == "eager"
+    assert result["detector_pair"] == tool._detector_pair_from_native_arm(native_arm)
+    assert result["arm_aliases"]["parent"] == native_arm
 
 
 @dataclass(frozen=True)
@@ -883,6 +974,76 @@ def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta(
     assert record["runtime_model_profile"] == "fast"
     assert record["runtime_execution_mode"] == tool.candidate_execution_mode(arm)
     assert record["all_other_effective_fields_exact"] is True
+
+
+def _c32_semantic_config(*, head_type=None, profile="fast"):
+    return SimpleNamespace(
+        model=SimpleNamespace(
+            head=SimpleNamespace(
+                type=(
+                    "ROSAOfficialResidualRefinementHead"
+                    if head_type is None
+                    else head_type
+                ),
+                rosa_cfg={"profile": profile},
+            )
+        )
+    )
+
+
+def test_c32_checkpoint_semantics_records_exact_detector_pair() -> None:
+    record = tool._validate_checkpoint_semantics(
+        _SemanticRunTool,
+        _semantic_checkpoint(),
+        _c32_semantic_config(),
+        tool.FAST_EAGER_ARM,
+        detector_pair="c32",
+    )
+
+    assert record["detector_pair"] == "c32"
+    assert record["candidate_head_type"] == ("ROSAOfficialResidualRefinementHead")
+    assert record["checkpoint_has_rosa_state"] is True
+    assert record["all_other_effective_fields_exact"] is True
+
+
+@pytest.mark.parametrize(
+    ("config", "message"),
+    (
+        (
+            _c32_semantic_config(head_type="ROSARefinementHead"),
+            "exact C32 ROSA candidate head",
+        ),
+        (_c32_semantic_config(profile="balanced"), "exact ROSA profile selector"),
+    ),
+)
+def test_c32_checkpoint_semantics_rejects_wrong_head_or_profile(
+    config, message
+) -> None:
+    with pytest.raises(tool.ProtocolError, match=message):
+        tool._validate_checkpoint_semantics(
+            _SemanticRunTool,
+            _semantic_checkpoint(),
+            config,
+            tool.FAST_EAGER_ARM,
+            detector_pair="c32",
+        )
+
+
+def test_c32_checkpoint_semantics_rejects_missing_sidecar_state() -> None:
+    class MissingSidecarRunTool(_SemanticRunTool):
+        @staticmethod
+        def _state_dict_has_rosa(state_dict):
+            del state_dict
+            return False
+
+    with pytest.raises(tool.ProtocolError, match="must contain the ROSA sidecar state"):
+        tool._validate_checkpoint_semantics(
+            MissingSidecarRunTool,
+            _semantic_checkpoint(),
+            _c32_semantic_config(),
+            tool.FAST_EAGER_ARM,
+            detector_pair="c32",
+        )
 
 
 @pytest.mark.parametrize(
@@ -982,6 +1143,79 @@ def test_candidate_config_changes_only_the_preregistered_head_fields(profile) ->
     }
 
 
+@pytest.mark.parametrize("profile", ("fast", "balanced"))
+def test_c32_candidate_config_changes_only_exact_head_and_profile(profile) -> None:
+    native = {
+        "model": {
+            "backbone": {"depth": 18},
+            "head": {
+                "type": "ROSAOfficialResidualNativeBaselineHead",
+                "rosa_cfg": None,
+            },
+        },
+        "test_dataloader": {"batch_size": 4, "dataset": "Main126"},
+        "param_scheduler": [{"end": 30}],
+        "seed": 3407,
+    }
+
+    candidate = tool._expected_candidate_config(native, profile, "c32")
+
+    assert native["model"]["head"]["type"] == ("ROSAOfficialResidualNativeBaselineHead")
+    assert candidate["model"]["head"] == {
+        "type": "ROSAOfficialResidualRefinementHead",
+        "rosa_cfg": {"profile": profile},
+    }
+    candidate_without_delta = json.loads(json.dumps(candidate))
+    candidate_without_delta["model"]["head"] = native["model"]["head"]
+    assert candidate_without_delta == native
+
+
+@pytest.mark.parametrize(
+    ("head_type", "rosa_cfg", "message"),
+    (
+        ("ROSANativeBaselineHead", None, "exact C32 head"),
+        (
+            "ROSAOfficialResidualNativeBaselineHead",
+            {"profile": "fast"},
+            "sidecar settings",
+        ),
+    ),
+)
+def test_c32_candidate_derivation_rejects_wrong_native_config(
+    head_type, rosa_cfg, message
+) -> None:
+    native = {
+        "model": {
+            "head": {
+                "type": head_type,
+                "rosa_cfg": rosa_cfg,
+            }
+        }
+    }
+    with pytest.raises(tool.ProtocolError, match=message):
+        tool._expected_candidate_config(native, "fast", "c32")
+
+
+def test_frozen_c32_runtime_config_is_the_exact_pair_parent() -> None:
+    from mmengine import Config
+
+    native = Config.fromfile(
+        tool.DEFAULT_C32_NATIVE_CONFIG,
+        import_custom_modules=False,
+    ).to_dict()
+    candidate = tool._expected_candidate_config(native, "fast", "c32")
+
+    assert native["model"]["head"]["type"] == ("ROSAOfficialResidualNativeBaselineHead")
+    assert native["model"]["img_backbone"]["depth"] == 18
+    assert native["test_dataloader"]["batch_size"] == 4
+    assert native["test_dataloader"]["dataset"]["type"] == (
+        "Fisheye3DODSparse4DDataset"
+    )
+    assert native["model"]["head"]["rosa_cfg"] is None
+    candidate["model"]["head"] = native["model"]["head"]
+    assert candidate == native
+
+
 def test_fast_eager_derives_the_exact_fast_model_config_without_name_leak() -> None:
     native = {
         "model": {
@@ -1040,6 +1274,54 @@ def test_derive_configs_materializes_fast_eager_as_fast() -> None:
     assert configs[tool.NATIVE_ARM].model.head.type == "ROSANativeBaselineHead"
     assert configs[tool.FAST_EAGER_ARM].model.head.type == "ROSARefinementHead"
     assert configs[tool.FAST_EAGER_ARM].model.head.rosa_cfg == {"profile": "fast"}
+
+
+def test_derive_configs_materializes_c32_fast_eager_from_exact_native() -> None:
+    class FakeConfig:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                backbone=SimpleNamespace(depth=18),
+                head=SimpleNamespace(
+                    type="ROSAOfficialResidualNativeBaselineHead",
+                    rosa_cfg=None,
+                ),
+            )
+            self.schedule = {"epochs": 30}
+
+        def to_dict(self):
+            return {
+                "model": {
+                    "backbone": {"depth": self.model.backbone.depth},
+                    "head": {
+                        "type": self.model.head.type,
+                        "rosa_cfg": self.model.head.rosa_cfg,
+                    },
+                },
+                "schedule": self.schedule,
+            }
+
+    verifier = SimpleNamespace(
+        Config=SimpleNamespace(
+            fromfile=lambda path, import_custom_modules: FakeConfig()
+        )
+    )
+    configs = tool._derive_configs(
+        verifier,
+        Path("unused-c32-native-config.py"),
+        tool.selected_arms("fast_eager", "c32"),
+        "c32",
+    )
+
+    assert configs[tool.C32_NATIVE_ARM].model.head.type == (
+        "ROSAOfficialResidualNativeBaselineHead"
+    )
+    assert configs[tool.FAST_EAGER_ARM].model.head.type == (
+        "ROSAOfficialResidualRefinementHead"
+    )
+    assert configs[tool.FAST_EAGER_ARM].model.head.rosa_cfg == {"profile": "fast"}
+    assert (
+        configs[tool.C32_NATIVE_ARM].schedule == configs[tool.FAST_EAGER_ARM].schedule
+    )
 
 
 def test_native_checkpoint_filter_accepts_only_rosa_sidecar_state() -> None:
@@ -1117,7 +1399,7 @@ def test_near_native_gate_maps_physical_arms_and_freezes_thresholds() -> None:
         tool.FAST_ARM: {"peak_allocated_bytes": 101},
     }
 
-    tool._evaluate_near_native_gate(
+    c0_gate = tool._evaluate_near_native_gate(
         Verifier,
         {"paired_bootstrap": paired},
         memory,
@@ -1129,6 +1411,26 @@ def test_near_native_gate_maps_physical_arms_and_freezes_thresholds() -> None:
         "logical_parent": memory[tool.NATIVE_ARM],
         "logical_candidate": memory[tool.FAST_ARM],
     }
+    assert c0_gate["detector_pair"] == "c0"
+    assert c0_gate["parent_arm"] == tool.NATIVE_ARM
+
+    c32_memory = {
+        tool.C32_NATIVE_ARM: {"peak_allocated_bytes": 100},
+        tool.FAST_ARM: {"peak_allocated_bytes": 101},
+    }
+    c32_gate = tool._evaluate_near_native_gate(
+        Verifier,
+        {"paired_bootstrap": paired},
+        c32_memory,
+        tool.FAST_ARM,
+        tool.C32_NATIVE_ARM,
+    )
+    assert captured["memory"] == {
+        "logical_parent": c32_memory[tool.C32_NATIVE_ARM],
+        "logical_candidate": c32_memory[tool.FAST_ARM],
+    }
+    assert c32_gate["detector_pair"] == "c32"
+    assert c32_gate["parent_arm"] == tool.C32_NATIVE_ARM
 
 
 def test_plan_json_shape_is_serializable_without_accelerator_types() -> None:
