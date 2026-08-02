@@ -16,7 +16,7 @@ import sys
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
-from mmengine import Config, load
+from mmengine import Config
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
@@ -109,112 +109,22 @@ def _source_document(root: Path, label: str) -> dict[str, Any]:
     return document
 
 
-def _dataset_config(config: Config) -> tuple[Path, Path]:
-    dataset: Mapping[str, Any] = config.test_dataloader.dataset
-    while isinstance(dataset, Mapping) and "dataset" in dataset:
-        dataset = dataset["dataset"]
-    if not isinstance(dataset, Mapping):
-        raise VerificationContractError("test dataset config is invalid")
-    data_root = runtime_tool._resolve_dir(
-        Path(str(dataset.get("data_root"))),
-        "validation data root",
-    )
-    annotation = runtime_tool._resolve_file(
-        Path(str(dataset.get("ann_file"))),
-        "validation annotation",
-    )
-    return data_root, annotation
-
-
-def _camera_paths(value: Any) -> list[str]:
-    paths = []
-    if isinstance(value, Mapping):
-        for key, item in value.items():
-            if key == "cam_path" and isinstance(item, str):
-                paths.append(item)
-            else:
-                paths.extend(_camera_paths(item))
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            paths.extend(_camera_paths(item))
-    return paths
-
-
 def _dataset_document(
-    config: Config,
+    parent_config: Config,
+    candidate_config: Config,
     sequence: Mapping[str, Any],
 ) -> dict[str, Any]:
-    data_root, annotation = _dataset_config(config)
-    payload = load(annotation)
-    if not isinstance(payload, Mapping) or not isinstance(
-        payload.get("data_list"), list
-    ):
-        raise VerificationContractError("validation annotation must contain data_list")
-    data_list = payload["data_list"]
-    sample_count = (
-        REPRESENTATION_SEQUENCE_PAIRS_PER_ARM * REPRESENTATION_EXPECTED_BATCH_SIZE
+    document = runtime_tool._derive_dataset_payload_contract(
+        parent_config=parent_config,
+        candidate_config=candidate_config,
+        representation_sequence=sequence,
     )
-    if len(data_list) < sample_count:
-        raise VerificationContractError(
-            "validation annotation is shorter than the frozen 360-pair sequence"
-        )
-    sequence_tokens = []
-    for pair in sequence["pairs"]:
-        for identity in pair["sample_identities"]:
-            sequence_tokens.append(identity.get("token"))
-    annotation_tokens = [item.get("token") for item in data_list[:sample_count]]
-    if all(token is not None for token in sequence_tokens) and (
-        sequence_tokens != annotation_tokens
-    ):
-        raise VerificationContractError(
-            "dataloader sequence does not match validation annotation order"
-        )
-    referenced = {annotation}
-    camera_count = 0
-    for item in data_list[:sample_count]:
-        camera_paths = _camera_paths(item)
-        if len(camera_paths) != 4:
-            raise VerificationContractError(
-                "every sealed sample must reference exactly four camera images"
-            )
-        for relative_name in camera_paths:
-            image = runtime_tool._resolve_file(
-                data_root / relative_name,
-                "referenced validation image",
-            )
-            if data_root not in image.parents:
-                raise VerificationContractError(
-                    "referenced validation image escapes data root"
-                )
-            referenced.add(image)
-            camera_count += 1
-    records = []
-    for path in sorted(
-        referenced, key=lambda value: value.relative_to(data_root).as_posix()
-    ):
-        records.append(
-            {
-                "root": str(data_root),
-                "path": path.relative_to(data_root).as_posix(),
-                "size": path.stat().st_size,
-                "sha256": file_sha256(path),
-            }
-        )
-    document = {
-        "schema": "rosa.referenced_dataset_payload_manifest.v2",
-        "scope": "360 sequential batch pairs: annotation plus four camera images per sample",
-        "samples": sample_count,
-        "camera_image_references": camera_count,
-        "calibration_binding": (
-            "OCam calibration is inline in the sealed annotation pickle and "
-            "is also bound per batch by the representation semantic digest"
-        ),
-        "lidar_payload_in_scope": False,
-        "lidar_scope_reason": "the lean image-only runtime loader does not read LiDAR payload",
-        "files": records,
-    }
-    document["sha256"] = canonical_sha256(document)
-    runtime_tool._validate_dataset_payload_closure(document)
+    runtime_tool._validate_dataset_payload_closure(
+        document,
+        parent_config=parent_config,
+        candidate_config=candidate_config,
+        representation_sequence=sequence,
+    )
     return document
 
 
@@ -300,7 +210,11 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
             args.official_root,
             "official",
         ),
-        "DATASET_PAYLOAD_CLOSURE.json": _dataset_document(parent, sequence),
+        "DATASET_PAYLOAD_CLOSURE.json": _dataset_document(
+            parent,
+            candidate,
+            sequence,
+        ),
     }
     section_files = {
         "sequence_manifest": "REPRESENTATION_SEQUENCE_MANIFEST.json",
@@ -366,7 +280,10 @@ def generate(args: argparse.Namespace) -> dict[str, Any]:
         label="official",
     )
     runtime_tool._validate_dataset_payload_closure(
-        documents["DATASET_PAYLOAD_CLOSURE.json"]
+        documents["DATASET_PAYLOAD_CLOSURE.json"],
+        parent_config=parent,
+        candidate_config=candidate,
+        representation_sequence=sequence,
     )
     return {
         "status": "SEALED_DISARMED_PREREGISTRATION",

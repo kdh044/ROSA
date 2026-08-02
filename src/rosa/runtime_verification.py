@@ -87,7 +87,19 @@ REPRESENTATION_PREREGISTRATION_SCHEMA = (
 )
 REPRESENTATION_SEQUENCE_SCHEMA = "rosa.live_representation_pair_sequence.v2"
 REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA = (
-    "rosa.timed_common_preprocessor_boundary_receipt.v2"
+    "rosa.timed_common_preprocessor_boundary_receipt.v3"
+)
+POINT_PAYLOAD_INPUT_KEYS = frozenset(
+    {
+        "points",
+        "lidar_points",
+        "semantic_lidar_points",
+        "semantic_points",
+        "raw_points",
+        "point_cloud",
+        "pointcloud",
+        "pts",
+    }
 )
 
 
@@ -1033,6 +1045,7 @@ def validate_representation_sequence_document(
             "representation sequence pair payload is incomplete"
         )
     observed_identities: set[str] = set()
+    sequence_input_keys = None
     for pair_index, pair in enumerate(pairs):
         if not isinstance(pair, Mapping):
             raise VerificationContractError(
@@ -1058,6 +1071,7 @@ def validate_representation_sequence_document(
             raise VerificationContractError(
                 f"representation sequence pair {pair_index} arms changed"
             )
+        pair_input_keys = {}
         for arm in (PARENT_ARM, CANDIDATE_ARM):
             arm_manifest = arms[arm]
             if not isinstance(arm_manifest, Mapping):
@@ -1103,6 +1117,30 @@ def validate_representation_sequence_document(
                 raise VerificationContractError(
                     "representation arm sample identities changed"
                 )
+            input_keys = arm_manifest.get("input_keys")
+            if (
+                not isinstance(input_keys, list)
+                or input_keys != sorted(input_keys)
+                or "img" not in input_keys
+                or any(
+                    key in POINT_PAYLOAD_INPUT_KEYS
+                    for key in input_keys
+                )
+            ):
+                raise VerificationContractError(
+                    "representation arm input-key/LiDAR scope changed"
+                )
+            pair_input_keys[arm] = input_keys
+        if pair_input_keys[PARENT_ARM] != pair_input_keys[CANDIDATE_ARM]:
+            raise VerificationContractError(
+                "representation pair arms expose different input keys"
+            )
+        if sequence_input_keys is None:
+            sequence_input_keys = pair_input_keys[PARENT_ARM]
+        elif pair_input_keys[PARENT_ARM] != sequence_input_keys:
+            raise VerificationContractError(
+                "representation sequence input-key set changed between pairs"
+            )
         if not _is_sha256(pair.get("sha256")):
             raise VerificationContractError(
                 f"representation sequence pair {pair_index} SHA is missing"
@@ -1137,6 +1175,7 @@ def validate_representation_sequence_document(
         "schema": REPRESENTATION_SEQUENCE_SCHEMA,
         "pairs_per_arm": REPRESENTATION_SEQUENCE_PAIRS_PER_ARM,
         "samples": len(observed_identities),
+        "input_keys": sequence_input_keys,
         "sha256": expected_document_sha,
     }
 
@@ -1906,6 +1945,7 @@ def build_representation_batch_manifest(
         "arm": arm,
         "batch_index": batch_index,
         "batch_size": expected_batch_size,
+        "input_keys": sorted(inputs),
         "sample_identities": identities,
         "semantic_sha256": canonical_sha256(semantic_payload),
         "representation_fingerprint": representation_fingerprint,
@@ -1978,6 +2018,7 @@ def validate_representation_ingress(
         )
     return {
         "arm": arm,
+        "input_keys": sorted(batch["inputs"]),
         "image_dtype": str(image.dtype),
         "image_shape": list(image.shape),
         "image_stride": list(image.stride()),
@@ -2198,6 +2239,10 @@ def build_timed_common_boundary_receipt(
         )
     records = []
     for pair_index, expected_pair in enumerate(expected_pairs):
+        _validate_sealed_representation_pair(
+            expected_pair,
+            pair_index=pair_index,
+        )
         observed = observations[pair_index]
         if not isinstance(observed, Mapping) or set(observed) != {
             PARENT_ARM,
@@ -2206,12 +2251,17 @@ def build_timed_common_boundary_receipt(
             raise VerificationContractError(
                 f"common-boundary pair {pair_index} lacks one arm"
             )
-        parent = observed[PARENT_ARM]
-        candidate = observed[CANDIDATE_ARM]
-        for arm, arm_observation in (
-            (PARENT_ARM, parent),
-            (CANDIDATE_ARM, candidate),
-        ):
+        pair_arms = expected_pair.get("arms")
+        if not isinstance(pair_arms, Mapping) or set(pair_arms) != {
+            PARENT_ARM,
+            CANDIDATE_ARM,
+        }:
+            raise VerificationContractError(
+                f"sealed representation pair {pair_index} lacks two arms"
+            )
+        arm_records = {}
+        for arm in (PARENT_ARM, CANDIDATE_ARM):
+            arm_observation = observed[arm]
             if not isinstance(arm_observation, Mapping):
                 raise VerificationContractError(
                     f"common-boundary pair {pair_index} {arm} is invalid"
@@ -2232,11 +2282,39 @@ def build_timed_common_boundary_receipt(
                 raise VerificationContractError(
                     "common-boundary ingress arm snapshot was not exact"
                 )
-        parent_boundary = parent.get("boundary_fingerprint")
-        candidate_boundary = candidate.get("boundary_fingerprint")
+            expected_arm = pair_arms[arm]
+            if arm_observation.get("observed_arm_manifest_sha256") != (
+                expected_arm.get("sha256")
+            ):
+                raise VerificationContractError(
+                    "live arm manifest SHA is not bound to the sealed pair"
+                )
+            if arm_observation.get("observed_representation_fingerprint") != (
+                expected_arm.get("representation_fingerprint")
+            ):
+                raise VerificationContractError(
+                    "live arm representation fingerprint is not sealed"
+                )
+            boundary = _validate_raw_fingerprint_schema(
+                arm_observation.get("boundary_fingerprint"),
+                label=f"timed pair {pair_index} {arm} boundary",
+            )
+            arm_records[arm] = {
+                "raw_boundary_fingerprint": boundary,
+                "live_arm_manifest_sha256": arm_observation[
+                    "observed_arm_manifest_sha256"
+                ],
+                "sealed_arm_manifest_sha256": expected_arm["sha256"],
+                "live_representation_fingerprint": arm_observation[
+                    "observed_representation_fingerprint"
+                ],
+                "sealed_representation_fingerprint": expected_arm[
+                    "representation_fingerprint"
+                ],
+            }
         if (
-            not isinstance(parent_boundary, Mapping)
-            or parent_boundary != candidate_boundary
+            arm_records[PARENT_ARM]["raw_boundary_fingerprint"]
+            != arm_records[CANDIDATE_ARM]["raw_boundary_fingerprint"]
         ):
             raise VerificationContractError(
                 f"common preprocessor boundary mismatch at timed pair {pair_index}"
@@ -2244,8 +2322,14 @@ def build_timed_common_boundary_receipt(
         records.append(
             {
                 "pair_index": pair_index,
-                "semantic_sha256": parent["observed_semantic_sha256"],
-                "boundary_fingerprint": parent_boundary,
+                "sealed_pair_sha256": expected_pair.get("sha256"),
+                "sealed_pair_identity_sha256": canonical_sha256(
+                    expected_pair.get("sample_identities")
+                ),
+                "semantic_sha256": observed[PARENT_ARM][
+                    "observed_semantic_sha256"
+                ],
+                "arms": arm_records,
                 "parity": "raw-bit exact",
             }
         )
@@ -2261,6 +2345,79 @@ def build_timed_common_boundary_receipt(
     return receipt
 
 
+def _validate_raw_fingerprint_schema(
+    value: Any,
+    *,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != {
+        "sha256",
+        "nodes",
+        "tensor_bytes",
+    }:
+        raise VerificationContractError(f"{label} has an invalid raw schema")
+    if not _is_sha256(value.get("sha256")):
+        raise VerificationContractError(f"{label} has an invalid SHA256")
+    nodes = _exact_integer(f"{label}.nodes", value.get("nodes"), minimum=1)
+    tensor_bytes = _exact_integer(
+        f"{label}.tensor_bytes",
+        value.get("tensor_bytes"),
+        minimum=0,
+    )
+    return {
+        "sha256": value["sha256"],
+        "nodes": nodes,
+        "tensor_bytes": tensor_bytes,
+    }
+
+
+def _validate_sealed_representation_pair(
+    pair: Any,
+    *,
+    pair_index: int,
+) -> None:
+    if not isinstance(pair, Mapping):
+        raise VerificationContractError(
+            f"sealed representation pair {pair_index} is invalid"
+        )
+    pair_sha256 = pair.get("sha256")
+    if not _is_sha256(pair_sha256) or pair_sha256 != canonical_sha256(
+        {key: value for key, value in pair.items() if key != "sha256"}
+    ):
+        raise VerificationContractError(
+            f"sealed representation pair {pair_index} SHA mismatch"
+        )
+    pair_arms = pair.get("arms")
+    if not isinstance(pair_arms, Mapping) or set(pair_arms) != {
+        PARENT_ARM,
+        CANDIDATE_ARM,
+    }:
+        raise VerificationContractError(
+            f"sealed representation pair {pair_index} lacks two arms"
+        )
+    for arm in (PARENT_ARM, CANDIDATE_ARM):
+        arm_manifest = pair_arms[arm]
+        if not isinstance(arm_manifest, Mapping):
+            raise VerificationContractError(
+                f"sealed representation pair {pair_index} {arm} is invalid"
+            )
+        arm_sha256 = arm_manifest.get("sha256")
+        if not _is_sha256(arm_sha256) or arm_sha256 != canonical_sha256(
+            {
+                key: value
+                for key, value in arm_manifest.items()
+                if key != "sha256"
+            }
+        ):
+            raise VerificationContractError(
+                f"sealed representation pair {pair_index} {arm} SHA mismatch"
+            )
+        _validate_raw_fingerprint_schema(
+            arm_manifest.get("representation_fingerprint"),
+            label=f"sealed pair {pair_index} {arm} representation",
+        )
+
+
 def validate_timed_common_boundary_receipt(
     receipt: Mapping[str, Any],
     expected_pairs: Sequence[Mapping[str, Any]],
@@ -2270,6 +2427,18 @@ def validate_timed_common_boundary_receipt(
     if not isinstance(receipt, Mapping):
         raise VerificationContractError(
             "timed common-boundary receipt must be a mapping"
+        )
+    if set(receipt) != {
+        "schema",
+        "protocol",
+        "pairs",
+        "all_timed_pairs_covered",
+        "parity",
+        "records",
+        "sha256",
+    }:
+        raise VerificationContractError(
+            "timed common-boundary receipt schema fields changed"
         )
     if receipt.get("schema") != REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA:
         raise VerificationContractError("timed common-boundary receipt schema changed")
@@ -2297,9 +2466,21 @@ def validate_timed_common_boundary_receipt(
             "timed common-boundary receipt/pair count differs"
         )
     for pair_index, (record, pair) in enumerate(zip(records, expected_pairs)):
+        _validate_sealed_representation_pair(pair, pair_index=pair_index)
         if not isinstance(record, Mapping):
             raise VerificationContractError(
                 "timed common-boundary record must be a mapping"
+            )
+        if set(record) != {
+            "pair_index",
+            "sealed_pair_sha256",
+            "sealed_pair_identity_sha256",
+            "semantic_sha256",
+            "arms",
+            "parity",
+        }:
+            raise VerificationContractError(
+                "timed common-boundary record schema changed"
             )
         if record.get("pair_index") != pair_index:
             raise VerificationContractError("timed common-boundary pair order changed")
@@ -2307,8 +2488,81 @@ def validate_timed_common_boundary_receipt(
             raise VerificationContractError(
                 "timed common-boundary semantic sequence changed"
             )
+        if record.get("sealed_pair_sha256") != pair.get("sha256"):
+            raise VerificationContractError(
+                "timed common-boundary sealed pair SHA changed"
+            )
+        if record.get("sealed_pair_identity_sha256") != canonical_sha256(
+            pair.get("sample_identities")
+        ):
+            raise VerificationContractError(
+                "timed common-boundary sealed pair identity changed"
+            )
         if record.get("parity") != "raw-bit exact":
             raise VerificationContractError("timed common-boundary pair parity changed")
+        record_arms = record.get("arms")
+        pair_arms = pair.get("arms")
+        if not isinstance(record_arms, Mapping) or set(record_arms) != {
+            PARENT_ARM,
+            CANDIDATE_ARM,
+        }:
+            raise VerificationContractError(
+                "timed common-boundary record does not store two arms"
+            )
+        if not isinstance(pair_arms, Mapping) or set(pair_arms) != {
+            PARENT_ARM,
+            CANDIDATE_ARM,
+        }:
+            raise VerificationContractError(
+                "timed common-boundary sealed pair lacks two arms"
+            )
+        boundaries = {}
+        for arm in (PARENT_ARM, CANDIDATE_ARM):
+            arm_record = record_arms[arm]
+            sealed_arm = pair_arms[arm]
+            if not isinstance(arm_record, Mapping):
+                raise VerificationContractError(
+                    "timed common-boundary arm record is invalid"
+                )
+            if set(arm_record) != {
+                "raw_boundary_fingerprint",
+                "live_arm_manifest_sha256",
+                "sealed_arm_manifest_sha256",
+                "live_representation_fingerprint",
+                "sealed_representation_fingerprint",
+            }:
+                raise VerificationContractError(
+                    "timed common-boundary arm record schema changed"
+                )
+            boundaries[arm] = _validate_raw_fingerprint_schema(
+                arm_record.get("raw_boundary_fingerprint"),
+                label=f"timed pair {pair_index} {arm} boundary",
+            )
+            if arm_record.get("live_arm_manifest_sha256") != sealed_arm.get(
+                "sha256"
+            ) or arm_record.get("sealed_arm_manifest_sha256") != sealed_arm.get(
+                "sha256"
+            ):
+                raise VerificationContractError(
+                    "timed common-boundary arm manifest SHA changed"
+                )
+            sealed_representation = sealed_arm.get("representation_fingerprint")
+            _validate_raw_fingerprint_schema(
+                sealed_representation,
+                label=f"sealed pair {pair_index} {arm} representation",
+            )
+            if arm_record.get("live_representation_fingerprint") != (
+                sealed_representation
+            ) or arm_record.get("sealed_representation_fingerprint") != (
+                sealed_representation
+            ):
+                raise VerificationContractError(
+                    "timed common-boundary arm representation is not sealed"
+                )
+        if boundaries[PARENT_ARM] != boundaries[CANDIDATE_ARM]:
+            raise VerificationContractError(
+                "timed common-boundary two-arm raw fingerprints differ"
+            )
     payload = {key: value for key, value in receipt.items() if key != "sha256"}
     if receipt.get("sha256") != canonical_sha256(payload):
         raise VerificationContractError("timed common-boundary receipt SHA mismatch")
@@ -2330,26 +2584,21 @@ def validate_pipeline_memory_baseline_receipt(
         raise VerificationContractError(
             "pipeline memory baseline receipt must be a mapping"
         )
-    if receipt.get("schema") != "rosa.pipeline_memory_baseline_receipt.v2":
+    if receipt.get("schema") != "rosa.pipeline_memory_baseline_receipt.v3":
         raise VerificationContractError(
             "pipeline memory baseline receipt schema changed"
         )
-    actions = receipt.get("release_actions")
-    expected_actions = {
-        "processed_cuda_batches_released": True,
-        "raw_captured_cpu_batches_released": True,
-        "full_models_released": True,
-        "preprocessors_preserved": True,
-        "gc_collect_called": True,
-        "cuda_empty_cache_called": True,
-        "cuda_synchronize_called": True,
-    }
-    if actions != expected_actions:
+    if "release_actions" in receipt:
         raise VerificationContractError(
-            "pipeline timing retained state across the release boundary"
+            "pipeline memory receipt must not trust self-reported release booleans"
         )
     snapshots = {}
-    for name in ("before_release", "after_release", "pipeline_baseline"):
+    for name in (
+        "clean_pipeline_baseline",
+        "before_release",
+        "after_release",
+        "pipeline_baseline",
+    ):
         snapshot = receipt.get(name)
         if not isinstance(snapshot, Mapping):
             raise VerificationContractError(f"pipeline memory receipt lacks {name}")
@@ -2365,22 +2614,127 @@ def validate_pipeline_memory_baseline_receipt(
         raise VerificationContractError(
             "pipeline CUDA baseline changed after the release receipt"
         )
+    for key in ("allocated_bytes", "reserved_bytes"):
+        if snapshots["after_release"][key] > snapshots[
+            "clean_pipeline_baseline"
+        ][key]:
+            raise VerificationContractError(
+                f"pipeline release did not return {key} to the clean baseline"
+            )
+
+    liveness = receipt.get("liveness")
+    if not isinstance(liveness, Mapping) or set(liveness) != {"before", "after"}:
+        raise VerificationContractError(
+            "pipeline memory receipt lacks measured object liveness"
+        )
+    expected_categories = {
+        "full_models",
+        "raw_cpu_batches",
+        "processed_cuda_batches",
+        "pipeline_preprocessors",
+    }
+    normalized_liveness = {}
+    for phase in ("before", "after"):
+        phase_value = liveness[phase]
+        if not isinstance(phase_value, Mapping) or set(phase_value) != (
+            expected_categories
+        ):
+            raise VerificationContractError(
+                f"pipeline liveness {phase} categories changed"
+            )
+        normalized_liveness[phase] = {}
+        for category in sorted(expected_categories):
+            value = phase_value[category]
+            if not isinstance(value, Mapping) or set(value) != {
+                "weakref_targets",
+                "weakref_alive",
+                "tracked_container_targets",
+                "tracked_container_alive",
+            }:
+                raise VerificationContractError(
+                    f"pipeline liveness {phase}.{category} schema changed"
+                )
+            normalized = {
+                key: _exact_integer(
+                    f"pipeline liveness {phase}.{category}.{key}",
+                    value.get(key),
+                    minimum=0,
+                )
+                for key in (
+                    "weakref_targets",
+                    "weakref_alive",
+                    "tracked_container_targets",
+                    "tracked_container_alive",
+                )
+            }
+            if normalized["weakref_alive"] > normalized["weakref_targets"] or (
+                normalized["tracked_container_alive"]
+                > normalized["tracked_container_targets"]
+            ):
+                raise VerificationContractError(
+                    "pipeline liveness alive count exceeds targets"
+                )
+            normalized_liveness[phase][category] = normalized
+
+    for category in ("full_models", "raw_cpu_batches", "processed_cuda_batches"):
+        before = normalized_liveness["before"][category]
+        after = normalized_liveness["after"][category]
+        if (
+            after["weakref_targets"] != before["weakref_targets"]
+            or after["tracked_container_targets"]
+            != before["tracked_container_targets"]
+        ):
+            raise VerificationContractError(
+                f"pipeline liveness target set changed for {category}"
+            )
+        if before["weakref_targets"] + before["tracked_container_targets"] < 1:
+            raise VerificationContractError(
+                f"pipeline liveness did not measure {category}"
+            )
+        if (
+            before["weakref_alive"] != before["weakref_targets"]
+            or before["tracked_container_alive"]
+            != before["tracked_container_targets"]
+        ):
+            raise VerificationContractError(
+                f"pipeline liveness before-release {category} was incomplete"
+            )
+        if after["weakref_alive"] or after["tracked_container_alive"]:
+            raise VerificationContractError(
+                f"pipeline release retained live {category} objects"
+            )
+    preprocessor_before = normalized_liveness["before"]["pipeline_preprocessors"]
+    preprocessor_after = normalized_liveness["after"]["pipeline_preprocessors"]
     if (
-        snapshots["after_release"]["allocated_bytes"]
-        > snapshots["before_release"]["allocated_bytes"]
+        preprocessor_after["weakref_targets"]
+        != preprocessor_before["weakref_targets"]
+        or preprocessor_after["tracked_container_targets"]
+        != preprocessor_before["tracked_container_targets"]
     ):
         raise VerificationContractError(
-            "pipeline release increased allocated CUDA memory"
+            "pipeline preprocessor liveness target set changed"
+        )
+    if preprocessor_before["weakref_targets"] != 2:
+        raise VerificationContractError(
+            "pipeline liveness must measure two independent preprocessors"
+        )
+    if (
+        preprocessor_before["weakref_alive"] != 2
+        or preprocessor_after["weakref_alive"] != 2
+    ):
+        raise VerificationContractError(
+            "pipeline preprocessors were not actually preserved"
         )
     payload = {key: value for key, value in receipt.items() if key != "sha256"}
     if receipt.get("sha256") != canonical_sha256(payload):
         raise VerificationContractError("pipeline memory baseline receipt SHA mismatch")
     return {
         "schema": receipt["schema"],
-        "release_actions": expected_actions,
+        "clean_pipeline_baseline": snapshots["clean_pipeline_baseline"],
         "before_release": snapshots["before_release"],
         "after_release": snapshots["after_release"],
         "pipeline_baseline": snapshots["pipeline_baseline"],
+        "liveness": normalized_liveness,
         "sha256": receipt["sha256"],
     }
 
@@ -2487,6 +2841,7 @@ __all__ = [
     "PARENT_ARM",
     "PCCP",
     "PHYSICAL_ROUND_ORDER",
+    "POINT_PAYLOAD_INPUT_KEYS",
     "REPRESENTATION_PROTOCOL",
     "REPRESENTATION_STREAM_POLICY",
     "REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import gc
 import importlib.util
 import json
 from pathlib import Path
@@ -9,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 from mmengine import Config
+import numpy as np
 import pytest
 import torch
 
@@ -37,6 +39,7 @@ from rosa.runtime_verification import (
     validate_representation_config_pair,
     validate_representation_ingress,
     validate_representation_protocol_freeze,
+    validate_representation_sequence_document,
     validate_representation_snapshot,
     validate_timed_common_boundary_receipt,
 )
@@ -140,17 +143,39 @@ def _timed_boundary_fixture():
     observations = {}
     for pair_index in range(REPRESENTATION_SEQUENCE_PAIRS_PER_ARM):
         semantic = f"{pair_index + 1:064x}"
-        pairs.append(
-            {
-                "schema": "rosa.representation_pair.v1",
+        identities = [
+            {"token": f"sample-{pair_index:03d}-{sample_index}"}
+            for sample_index in range(4)
+        ]
+        arms = {}
+        for arm, offset, image_bytes in (
+            (PARENT_ARM, 2000, 400),
+            (CANDIDATE_ARM, 3000, 100),
+        ):
+            arm_manifest = {
+                "arm": arm,
                 "batch_index": pair_index,
+                "input_keys": ["img"],
+                "sample_identities": identities,
                 "semantic_sha256": semantic,
-                "arms": {
-                    PARENT_ARM: {"ingress": {"image_bytes": 400}},
-                    CANDIDATE_ARM: {"ingress": {"image_bytes": 100}},
+                "representation_fingerprint": {
+                    "sha256": f"{pair_index + offset:064x}",
+                    "nodes": 1,
+                    "tensor_bytes": 1,
                 },
+                "ingress": {"image_bytes": image_bytes},
             }
-        )
+            arm_manifest["sha256"] = canonical_sha256(arm_manifest)
+            arms[arm] = arm_manifest
+        pair = {
+            "schema": "rosa.representation_pair.v1",
+            "batch_index": pair_index,
+            "sample_identities": identities,
+            "semantic_sha256": semantic,
+            "arms": arms,
+        }
+        pair["sha256"] = canonical_sha256(pair)
+        pairs.append(pair)
         boundary = {
             "sha256": f"{pair_index + 1000:064x}",
             "nodes": 10,
@@ -166,7 +191,7 @@ def _timed_boundary_fixture():
                     "nodes": 1,
                     "tensor_bytes": 1,
                 },
-                "observed_arm_manifest_sha256": f"{pair_index + offset:064x}",
+                "observed_arm_manifest_sha256": arms[arm]["sha256"],
                 "exact_arm_manifest_match": True,
                 "boundary_fingerprint": boundary,
             }
@@ -494,6 +519,33 @@ def test_timed_common_boundary_receipt_covers_every_360_pair():
     assert contract["parity"] == "raw-bit exact"
 
 
+def test_sequence_rejects_point_payload_key_and_arm_input_key_drift():
+    pairs, _observations, _receipt = _timed_boundary_fixture()
+    document = {
+        "schema": "rosa.live_representation_pair_sequence.v2",
+        "protocol": REPRESENTATION_PROTOCOL,
+        "pairs_per_arm": 360,
+        "pairs": pairs,
+        "sha256": canonical_sha256(pairs),
+    }
+    contract = validate_representation_sequence_document(document)
+    assert contract["input_keys"] == ["img"]
+
+    point_payload = copy.deepcopy(document)
+    arm = point_payload["pairs"][0]["arms"][CANDIDATE_ARM]
+    arm["input_keys"] = ["img", "semantic_lidar_points"]
+    arm["sha256"] = canonical_sha256(
+        {key: value for key, value in arm.items() if key != "sha256"}
+    )
+    pair = point_payload["pairs"][0]
+    pair["sha256"] = canonical_sha256(
+        {key: value for key, value in pair.items() if key != "sha256"}
+    )
+    point_payload["sha256"] = canonical_sha256(point_payload["pairs"])
+    with pytest.raises(VerificationContractError, match="LiDAR scope"):
+        validate_representation_sequence_document(point_payload)
+
+
 def test_timed_common_boundary_receipt_rejects_missing_or_changed_pair():
     pairs, observations, receipt = _timed_boundary_fixture()
     observations.pop(17)
@@ -501,26 +553,101 @@ def test_timed_common_boundary_receipt_rejects_missing_or_changed_pair():
         build_timed_common_boundary_receipt(observations, pairs)
 
     changed = copy.deepcopy(receipt)
-    changed["records"][17]["boundary_fingerprint"]["sha256"] = "f" * 64
-    with pytest.raises(VerificationContractError, match="SHA mismatch"):
+    changed["records"][17]["arms"][PARENT_ARM][
+        "raw_boundary_fingerprint"
+    ]["sha256"] = "f" * 64
+    with pytest.raises(VerificationContractError, match="fingerprints differ"):
         validate_timed_common_boundary_receipt(changed, pairs)
 
 
+def test_timed_common_boundary_receipt_rejects_garbage_raw_fingerprint():
+    pairs, _observations, receipt = _timed_boundary_fixture()
+    forged = copy.deepcopy(receipt)
+    forged["records"][0]["arms"][PARENT_ARM][
+        "raw_boundary_fingerprint"
+    ] = "one-common-garbage-value"
+    forged["sha256"] = canonical_sha256(
+        {key: value for key, value in forged.items() if key != "sha256"}
+    )
+
+    with pytest.raises(VerificationContractError, match="invalid raw schema"):
+        validate_timed_common_boundary_receipt(forged, pairs)
+
+
+def test_timed_common_boundary_receipt_rejects_single_common_forgery():
+    pairs, _observations, receipt = _timed_boundary_fixture()
+    forged = copy.deepcopy(receipt)
+    record = forged["records"][0]
+    common = record["arms"][PARENT_ARM]["raw_boundary_fingerprint"]
+    record.pop("arms")
+    record["boundary_fingerprint"] = common
+    forged["sha256"] = canonical_sha256(
+        {key: value for key, value in forged.items() if key != "sha256"}
+    )
+
+    with pytest.raises(VerificationContractError, match="record schema"):
+        validate_timed_common_boundary_receipt(forged, pairs)
+
+
+def test_timed_common_boundary_receipt_rejects_forged_live_arm_sha():
+    pairs, _observations, receipt = _timed_boundary_fixture()
+    forged = copy.deepcopy(receipt)
+    forged["records"][9]["arms"][CANDIDATE_ARM][
+        "live_arm_manifest_sha256"
+    ] = "f" * 64
+    forged["sha256"] = canonical_sha256(
+        {key: value for key, value in forged.items() if key != "sha256"}
+    )
+
+    with pytest.raises(VerificationContractError, match="arm manifest SHA"):
+        validate_timed_common_boundary_receipt(forged, pairs)
+
+
 def _pipeline_memory_receipt():
+    before = {
+        "full_models": {
+            "weakref_targets": 20,
+            "weakref_alive": 20,
+            "tracked_container_targets": 0,
+            "tracked_container_alive": 0,
+        },
+        "raw_cpu_batches": {
+            "weakref_targets": 8,
+            "weakref_alive": 8,
+            "tracked_container_targets": 12,
+            "tracked_container_alive": 12,
+        },
+        "processed_cuda_batches": {
+            "weakref_targets": 8,
+            "weakref_alive": 8,
+            "tracked_container_targets": 12,
+            "tracked_container_alive": 12,
+        },
+        "pipeline_preprocessors": {
+            "weakref_targets": 2,
+            "weakref_alive": 2,
+            "tracked_container_targets": 0,
+            "tracked_container_alive": 0,
+        },
+    }
+    after = copy.deepcopy(before)
+    for category in (
+        "full_models",
+        "raw_cpu_batches",
+        "processed_cuda_batches",
+    ):
+        after[category]["weakref_alive"] = 0
+        after[category]["tracked_container_alive"] = 0
     receipt = {
-        "schema": "rosa.pipeline_memory_baseline_receipt.v2",
+        "schema": "rosa.pipeline_memory_baseline_receipt.v3",
+        "clean_pipeline_baseline": {
+            "allocated_bytes": 100,
+            "reserved_bytes": 500,
+        },
         "before_release": {"allocated_bytes": 1000, "reserved_bytes": 2000},
         "after_release": {"allocated_bytes": 100, "reserved_bytes": 500},
         "pipeline_baseline": {"allocated_bytes": 100, "reserved_bytes": 500},
-        "release_actions": {
-            "processed_cuda_batches_released": True,
-            "raw_captured_cpu_batches_released": True,
-            "full_models_released": True,
-            "preprocessors_preserved": True,
-            "gc_collect_called": True,
-            "cuda_empty_cache_called": True,
-            "cuda_synchronize_called": True,
-        },
+        "liveness": {"before": before, "after": after},
     }
     receipt["sha256"] = canonical_sha256(receipt)
     return receipt
@@ -532,11 +659,11 @@ def test_pipeline_memory_release_receipt_is_required_and_closed():
     assert contract["pipeline_baseline"] == receipt["after_release"]
 
     retained = copy.deepcopy(receipt)
-    retained["release_actions"]["full_models_released"] = False
+    retained["liveness"]["after"]["full_models"]["weakref_alive"] = 1
     retained["sha256"] = canonical_sha256(
         {key: value for key, value in retained.items() if key != "sha256"}
     )
-    with pytest.raises(VerificationContractError, match="retained state"):
+    with pytest.raises(VerificationContractError, match="retained live"):
         validate_pipeline_memory_baseline_receipt(retained)
 
     changed_baseline = copy.deepcopy(receipt)
@@ -546,6 +673,90 @@ def test_pipeline_memory_release_receipt_is_required_and_closed():
     )
     with pytest.raises(VerificationContractError, match="baseline changed"):
         validate_pipeline_memory_baseline_receipt(changed_baseline)
+
+
+def test_pipeline_memory_receipt_rejects_reserved_growth_and_self_report():
+    reserved_growth = _pipeline_memory_receipt()
+    reserved_growth["after_release"]["reserved_bytes"] += 1
+    reserved_growth["pipeline_baseline"]["reserved_bytes"] += 1
+    reserved_growth["sha256"] = canonical_sha256(
+        {
+            key: value
+            for key, value in reserved_growth.items()
+            if key != "sha256"
+        }
+    )
+    with pytest.raises(VerificationContractError, match="reserved_bytes"):
+        validate_pipeline_memory_baseline_receipt(reserved_growth)
+
+    self_report = _pipeline_memory_receipt()
+    self_report["release_actions"] = {"full_models_released": True}
+    self_report["sha256"] = canonical_sha256(
+        {key: value for key, value in self_report.items() if key != "sha256"}
+    )
+    with pytest.raises(VerificationContractError, match="self-reported"):
+        validate_pipeline_memory_baseline_receipt(self_report)
+
+
+def _actual_cpu_release_probe():
+    models = {
+        PARENT_ARM: torch.nn.Linear(3, 2),
+        CANDIDATE_ARM: torch.nn.Linear(3, 2),
+    }
+    raw_batches = {
+        PARENT_ARM: [{"inputs": {"img": torch.ones(1, 3)}}],
+        CANDIDATE_ARM: [{"inputs": {"img": torch.ones(1, 3)}}],
+    }
+    processed_batches = {
+        PARENT_ARM: [{"inputs": {"img": torch.ones(1, 3)}}],
+        CANDIDATE_ARM: [{"inputs": {"img": torch.ones(1, 3)}}],
+    }
+    preprocessors = {
+        PARENT_ARM: torch.nn.Identity(),
+        CANDIDATE_ARM: torch.nn.Identity(),
+    }
+    probe = verify_tool._capture_release_liveness_probe(
+        models=models,
+        raw_cpu_batches=raw_batches,
+        processed_batches=processed_batches,
+        pipeline_preprocessors=preprocessors,
+        processed_tensor_device="cpu",
+    )
+    before = verify_tool._observe_release_liveness(probe)
+    return probe, preprocessors, before
+
+
+def test_cpu_release_probe_measures_real_object_liveness_without_cuda():
+    probe, preprocessors, before = _actual_cpu_release_probe()
+    gc.collect()
+    after = verify_tool._observe_release_liveness(probe)
+
+    assert before["full_models"]["weakref_alive"] >= 2
+    assert before["raw_cpu_batches"]["weakref_alive"] == 2
+    assert before["processed_cuda_batches"]["weakref_alive"] == 2
+    for category in (
+        "full_models",
+        "raw_cpu_batches",
+        "processed_cuda_batches",
+    ):
+        assert after[category]["weakref_alive"] == 0
+        assert after[category]["tracked_container_alive"] == 0
+    assert after["pipeline_preprocessors"]["weakref_alive"] == 2
+    assert set(preprocessors) == {PARENT_ARM, CANDIDATE_ARM}
+
+    receipt = {
+        "schema": "rosa.pipeline_memory_baseline_receipt.v3",
+        "clean_pipeline_baseline": {
+            "allocated_bytes": 0,
+            "reserved_bytes": 0,
+        },
+        "before_release": {"allocated_bytes": 0, "reserved_bytes": 0},
+        "after_release": {"allocated_bytes": 0, "reserved_bytes": 0},
+        "pipeline_baseline": {"allocated_bytes": 0, "reserved_bytes": 0},
+        "liveness": {"before": before, "after": after},
+    }
+    receipt["sha256"] = canonical_sha256(receipt)
+    validate_pipeline_memory_baseline_receipt(receipt)
 
 
 def test_semantic_pair_swap_is_rejected_before_bootstrap():
@@ -782,6 +993,74 @@ def test_final_receipt_closes_immutable_plan_summary_and_every_artifact(
         verify_tool._seal_final_artifact_receipt(output)
 
 
+def test_final_receipt_revalidates_live_closure_before_and_after_write(
+    tmp_path: Path,
+):
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "plan.json").write_text("{}\n", encoding="utf-8")
+    (output / "summary.json").write_text("{}\n", encoding="utf-8")
+    expected = {
+        "source_closures": {"rosa": "a" * 64},
+        "dataset_payload_closure": {"sha256": "b" * 64},
+        "git_snapshots": {"rosa": {"tree": "c" * 40}},
+    }
+    calls = []
+
+    def verify_live_closure():
+        calls.append(True)
+        return copy.deepcopy(expected)
+
+    sealed = verify_tool._seal_final_artifact_receipt(
+        output,
+        expected_live_closure=expected,
+        closure_verifier=verify_live_closure,
+    )
+
+    assert len(calls) == 2
+    names = {item["name"] for item in sealed["receipt"]["artifacts"]}
+    assert "content_closure_finalize.json" in names
+    assert sealed["receipt"]["live_content_closure_sha256"] == canonical_sha256(
+        expected
+    )
+    verify_tool._verify_final_receipt_live_closure(
+        sealed["receipt"],
+        expected,
+    )
+    changed = copy.deepcopy(expected)
+    changed["dataset_payload_closure"]["sha256"] = "d" * 64
+    with pytest.raises(VerificationContractError, match="changed after sealing"):
+        verify_tool._verify_final_receipt_live_closure(
+            sealed["receipt"],
+            changed,
+        )
+
+
+def test_final_receipt_fails_if_external_closure_changes_during_finalize(
+    tmp_path: Path,
+):
+    output = tmp_path / "run"
+    output.mkdir()
+    (output / "plan.json").write_text("{}\n", encoding="utf-8")
+    (output / "summary.json").write_text("{}\n", encoding="utf-8")
+    expected = {"checkpoint": "a" * 64}
+    calls = 0
+
+    def verify_live_closure():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return copy.deepcopy(expected)
+        return {"checkpoint": "b" * 64}
+
+    with pytest.raises(VerificationContractError, match="changed while"):
+        verify_tool._seal_final_artifact_receipt(
+            output,
+            expected_live_closure=expected,
+            closure_verifier=verify_live_closure,
+        )
+
+
 def test_exact_source_content_closure_detects_dirty_payload_mutation(tmp_path: Path):
     root = tmp_path / "external"
     root.mkdir()
@@ -813,6 +1092,215 @@ def test_exact_source_content_closure_detects_dirty_payload_mutation(tmp_path: P
             document,
             expected_root=root,
             label="external",
+        )
+
+
+def _mini_dataset_closure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    data_root = tmp_path / "dataset"
+    data_root.mkdir()
+    camera_names = (
+        "fisheye_camera_front",
+        "fisheye_camera_left",
+        "fisheye_camera_right",
+        "fisheye_camera_rear",
+    )
+    cameras = {}
+    for camera_index, camera_name in enumerate(camera_names):
+        relative = Path("images") / f"{camera_name}.png"
+        image = data_root / relative
+        image.parent.mkdir(exist_ok=True)
+        image.write_bytes(bytes([camera_index + 1]) * (camera_index + 2))
+        ocam = SimpleNamespace(
+            _pol=np.array([1.0, camera_index], dtype=np.float64),
+            _invpol=np.array([2.0, camera_index], dtype=np.float64),
+            _xc=400.0,
+            _yc=400.0,
+            _affine=np.array([1.0, 0.0, 0.0], dtype=np.float64),
+            _img_size=np.array([800, 800], dtype=np.int64),
+            _fov=220.0,
+        )
+        cameras[camera_name] = {
+            "cam_path": relative.as_posix(),
+            "image_size": [800, 800],
+            "cam2img": ocam,
+            "cam2lidar": np.eye(4, dtype=np.float64),
+            "lidar2cam": np.eye(4, dtype=np.float64),
+            "lidar2img": np.eye(4, dtype=np.float64),
+        }
+    annotation = data_root / "infos_val.pkl"
+    annotation.write_bytes(b"sealed-mini-annotation")
+    annotation_payload = {
+        "data_list": [
+            {
+                "token": "sample-0",
+                "pc_info": {
+                    "pts_path": "points/sample-0.bin",
+                    "semantic_pts_path": "points/sample-0.label",
+                },
+                "cam_info": {"cam_fisheye": cameras},
+            }
+        ]
+    }
+    pipeline_parent = [
+        {
+            "type": verify_tool.EXPECTED_LEAN_LOADER,
+            "cam_names": camera_names,
+            "to_float32": True,
+        },
+        {"type": "PackSparse4DInputs"},
+    ]
+    pipeline_candidate = copy.deepcopy(pipeline_parent)
+    pipeline_candidate[0]["to_float32"] = False
+    parent_path = tmp_path / "parent.py"
+    candidate_path = tmp_path / "candidate.py"
+    parent_path.write_text("# parent\n", encoding="utf-8")
+    candidate_path.write_text("# candidate\n", encoding="utf-8")
+    parent = Config(
+        {
+            "test_dataloader": {
+                "dataset": {
+                    "data_root": str(data_root),
+                    "ann_file": str(annotation),
+                    "pipeline": pipeline_parent,
+                }
+            }
+        },
+        filename=parent_path,
+    )
+    candidate = Config(
+        {
+            "test_dataloader": {
+                "dataset": {
+                    "data_root": str(data_root),
+                    "ann_file": str(annotation),
+                    "pipeline": pipeline_candidate,
+                }
+            }
+        },
+        filename=candidate_path,
+    )
+    sequence = {
+        "schema": "rosa.test-mini-sequence.v1",
+        "sha256": "e" * 64,
+        "pairs": [
+            {
+                "sample_identities": [{"token": "sample-0"}],
+                "arms": {
+                    PARENT_ARM: {"input_keys": ["img"]},
+                    CANDIDATE_ARM: {"input_keys": ["img"]},
+                },
+            }
+        ],
+    }
+    monkeypatch.setattr(verify_tool, "REPRESENTATION_SEQUENCE_PAIRS_PER_ARM", 1)
+    monkeypatch.setattr(verify_tool, "REPRESENTATION_EXPECTED_BATCH_SIZE", 1)
+    monkeypatch.setattr(
+        verify_tool,
+        "validate_representation_sequence_document",
+        lambda _sequence: {"sha256": "e" * 64},
+    )
+    monkeypatch.setattr(
+        verify_tool,
+        "validate_representation_config_pair",
+        lambda *_args, **_kwargs: {
+            "parent_normalized_config_sha256": "a" * 64,
+            "candidate_normalized_config_sha256": "b" * 64,
+        },
+    )
+    monkeypatch.setattr(verify_tool, "load", lambda _path: annotation_payload)
+    document = verify_tool._derive_dataset_payload_contract(
+        parent_config=parent,
+        candidate_config=candidate,
+        representation_sequence=sequence,
+    )
+    return document, parent, candidate, sequence, annotation_payload
+
+
+@pytest.mark.parametrize(
+    "attack",
+    ("missing_camera", "extra_unrelated", "substituted_camera", "unrelated_only"),
+)
+def test_dataset_closure_rejects_missing_extra_substitute_and_unrelated_files(
+    attack: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    document, parent, candidate, sequence, _payload = _mini_dataset_closure(
+        tmp_path,
+        monkeypatch,
+    )
+    assert document["camera_reference_count"] == 4
+    assert document["expected_file_count"] == 5
+    assert document["lidar_scope_proof"]["annotation_lidar_reference_count"] == 2
+    forged = copy.deepcopy(document)
+    unrelated = {
+        "root": document["annotation_binding"]["root"],
+        "path": "unrelated.bin",
+        "size": 0,
+        "sha256": "f" * 64,
+        "role": "unrelated",
+    }
+    if attack == "missing_camera":
+        forged["camera_references"].pop()
+        forged["camera_reference_count"] -= 1
+        forged["files"].pop()
+        forged["expected_file_count"] -= 1
+    elif attack == "extra_unrelated":
+        forged["files"].append(unrelated)
+        forged["expected_file_count"] += 1
+    elif attack == "substituted_camera":
+        forged["camera_references"][0]["path"] = forged["camera_references"][1][
+            "path"
+        ]
+        forged["camera_references"][0]["image_sha256"] = forged[
+            "camera_references"
+        ][1]["image_sha256"]
+    else:
+        forged["files"] = [unrelated]
+        forged["expected_file_count"] = 1
+    forged.pop("sha256")
+    forged["sha256"] = canonical_sha256(forged)
+
+    with pytest.raises(VerificationContractError, match="differs from the re-derived"):
+        verify_tool._validate_dataset_payload_closure(
+            forged,
+            parent_config=parent,
+            candidate_config=candidate,
+            representation_sequence=sequence,
+        )
+
+
+def test_dataset_closure_rederives_identity_order_and_ocam_calibration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    document, parent, candidate, sequence, payload = _mini_dataset_closure(
+        tmp_path,
+        monkeypatch,
+    )
+    changed_sequence = copy.deepcopy(sequence)
+    changed_sequence["pairs"][0]["sample_identities"][0]["token"] = "substitute"
+    with pytest.raises(VerificationContractError, match="identity/order changed"):
+        verify_tool._validate_dataset_payload_closure(
+            document,
+            parent_config=parent,
+            candidate_config=candidate,
+            representation_sequence=changed_sequence,
+        )
+
+    first_camera = payload["data_list"][0]["cam_info"]["cam_fisheye"][
+        "fisheye_camera_front"
+    ]
+    first_camera["cam2img"]._pol[0] += 0.5
+    with pytest.raises(VerificationContractError, match="differs from the re-derived"):
+        verify_tool._validate_dataset_payload_closure(
+            document,
+            parent_config=parent,
+            candidate_config=candidate,
+            representation_sequence=sequence,
         )
 
 
