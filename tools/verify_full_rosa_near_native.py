@@ -658,7 +658,8 @@ def prepare_plan(
             ],
             "memory": (
                 "three probes per arm with exactly one benchmark model resident; "
-                "maximum allocated/reserved and their increments"
+                "maximum allocated/reserved and their increments; documented "
+                "cuBLAS workspaces cleared only between isolated arm builds"
             ),
             "compiler_guard": (
                 "torch._dynamo counters must remain raw-exact across the entire "
@@ -1323,6 +1324,12 @@ def _cuda_allocator_snapshot(torch, device) -> dict[str, int]:
 def _stabilize_cuda_allocator(torch, device) -> dict[str, int]:
     torch.cuda.synchronize(device)
     gc.collect()
+    clear_cublas = getattr(
+        getattr(torch, "_C", None), "_cuda_clearCublasWorkspaces", None
+    )
+    if not callable(clear_cublas):
+        raise ProtocolError("Torch does not expose the documented cuBLAS cleanup API")
+    clear_cublas()
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
     return _cuda_allocator_snapshot(torch, device)
@@ -1402,6 +1409,26 @@ def _measure_isolated_memory(
             "peer_model_resident": False,
             "allocator_floor": allocator_floor,
             "probe_count_per_arm": 3,
+            "between_arm_cleanup": [
+                {
+                    "phase": "model_release",
+                    "steps": ["models.clear", "gc.collect"],
+                },
+                {
+                    "phase": "compiled_arm_only",
+                    "steps": ["torch._dynamo.reset"],
+                },
+                {
+                    "phase": "allocator_stabilization",
+                    "steps": [
+                        "torch.cuda.synchronize",
+                        "gc.collect",
+                        "torch._C._cuda_clearCublasWorkspaces",
+                        "torch.cuda.empty_cache",
+                        "torch.cuda.synchronize",
+                    ],
+                },
+            ],
         }
     }
     contracts: dict[str, Any] = {}
@@ -1451,6 +1478,10 @@ def _measure_isolated_memory(
             memory[arm] = record
         finally:
             models.clear()
+            # Module.compile can form Python cycles around the optimized call.
+            # Collect those objects before resetting global Dynamo/CUDA-graph
+            # caches; reversing this order leaves a small live graph allocation.
+            gc.collect()
             if compiler_cache_created:
                 _reset_compiler_cache(torch)
             after_cleanup = _stabilize_cuda_allocator(torch, device)

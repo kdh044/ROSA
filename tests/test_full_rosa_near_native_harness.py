@@ -360,6 +360,62 @@ def test_shared_native_state_projection_rejects_missing_key() -> None:
         tool._project_shared_native_state({"weight": object()}, {})
 
 
+def test_allocator_stabilization_clears_cublas_workspace_before_cache(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class FakeCuda:
+        @staticmethod
+        def synchronize(device):
+            calls.append(("synchronize", device))
+
+        @staticmethod
+        def empty_cache():
+            calls.append(("empty_cache", None))
+
+        @staticmethod
+        def memory_allocated(device):
+            calls.append(("memory_allocated", device))
+            return 0
+
+        @staticmethod
+        def memory_reserved(device):
+            calls.append(("memory_reserved", device))
+            return 0
+
+    fake_torch = SimpleNamespace(
+        cuda=FakeCuda(),
+        _C=SimpleNamespace(
+            _cuda_clearCublasWorkspaces=lambda: calls.append(
+                ("clear_cublas", None)
+            )
+        ),
+    )
+    monkeypatch.setattr(tool.gc, "collect", lambda: calls.append(("gc", None)))
+
+    assert tool._stabilize_cuda_allocator(fake_torch, "cuda:0") == {
+        "allocated_bytes": 0,
+        "reserved_bytes": 0,
+    }
+    assert calls[:5] == [
+        ("synchronize", "cuda:0"),
+        ("gc", None),
+        ("clear_cublas", None),
+        ("empty_cache", None),
+        ("synchronize", "cuda:0"),
+    ]
+
+
+def test_allocator_stabilization_requires_documented_cublas_cleanup() -> None:
+    fake_torch = SimpleNamespace(
+        cuda=SimpleNamespace(synchronize=lambda device: None), _C=SimpleNamespace()
+    )
+
+    with pytest.raises(tool.ProtocolError, match="cuBLAS cleanup API"):
+        tool._stabilize_cuda_allocator(fake_torch, "cuda:0")
+
+
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:
     class FakeCuda:
         @staticmethod
@@ -438,6 +494,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     build_calls = []
     compile_calls = []
     reset_calls = []
+    lifecycle = []
 
     class Model:
         pass
@@ -488,13 +545,17 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
             arm: {"raw_fingerprint": arm} for arm in models
         },
     )
+    def stabilize(torch, device):
+        del torch, device
+        lifecycle.append("stabilize")
+        return {"allocated_bytes": 0, "reserved_bytes": 0}
+
+    monkeypatch.setattr(tool, "_stabilize_cuda_allocator", stabilize)
+    monkeypatch.setattr(tool.gc, "collect", lambda: lifecycle.append("gc"))
     monkeypatch.setattr(
         tool,
-        "_stabilize_cuda_allocator",
-        lambda torch, device: {"allocated_bytes": 0, "reserved_bytes": 0},
-    )
-    monkeypatch.setattr(
-        tool, "_reset_compiler_cache", lambda torch: reset_calls.append(torch)
+        "_reset_compiler_cache",
+        lambda torch: (reset_calls.append(torch), lifecycle.append("reset")),
     )
 
     configs = {tool.NATIVE_ARM: object(), candidate: object()}
@@ -513,8 +574,40 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     assert build_calls == [(tool.NATIVE_ARM,), (candidate,)]
     assert len(compile_calls) == expected_compiles
     assert len(reset_calls) == expected_compiles
+    expected_lifecycle = [
+        "stabilize",
+        "stabilize",
+        "gc",
+        "stabilize",
+        "stabilize",
+        "gc",
+    ]
+    if expected_compiles:
+        expected_lifecycle.append("reset")
+    expected_lifecycle.append("stabilize")
+    assert lifecycle == expected_lifecycle
     assert set(contracts) == set(loads) == {tool.NATIVE_ARM, candidate}
     assert memory["contract"]["one_benchmark_model_resident_per_probe"] is True
+    assert memory["contract"]["between_arm_cleanup"] == [
+        {
+            "phase": "model_release",
+            "steps": ["models.clear", "gc.collect"],
+        },
+        {
+            "phase": "compiled_arm_only",
+            "steps": ["torch._dynamo.reset"],
+        },
+        {
+            "phase": "allocator_stabilization",
+            "steps": [
+                "torch.cuda.synchronize",
+                "gc.collect",
+                "torch._C._cuda_clearCublasWorkspaces",
+                "torch.cuda.empty_cache",
+                "torch.cuda.synchronize",
+            ],
+        },
+    ]
     for arm in (tool.NATIVE_ARM, candidate):
         assert memory[arm]["resident_benchmark_models"] == [arm]
         assert memory[arm]["peer_model_resident"] is False
