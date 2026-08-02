@@ -1,0 +1,45 @@
+{
+  "schema": "rosa.c32_inplace_uint8_flip.cpu_preflight.v2",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "gpu_used": false,
+  "parent_candidate_commit": "c5ddf96db4d54a5babddf2e2b3c49828b459f916",
+  "candidate_commit": "630c5bdd64ff3a29ba19ba8f6d0d0b2af14ac505",
+  "change": "replace the fixed BGR advanced-index permutation with torch.flip on the exact three-channel axis",
+  "ingress_contract": "prediction-only [B,camera,3,H,W] contiguous uint8",
+  "output_raw_bit_equal_to_parent": true,
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "cpu_channel_permutation_observation": {
+    "shape": "B4,C4,RGB,800,800",
+    "advanced_index_median_ms": 10.872824466787279,
+    "flip_median_ms": 1.4144250308163464,
+    "flip_over_advanced_index_ratio": 0.13008809579672018,
+    "output_bytes_equal": true,
+    "output_strides_equal": true
+  },
+  "cpu_full_preprocessor_observation": {
+    "shape": "B4,C4,RGB,800,800",
+    "parent_median_ms": 102.77480696095154,
+    "candidate_median_ms": 42.291879013646394,
+    "candidate_over_parent_ratio": 0.4115004470863648,
+    "parent_positive_self_allocation_bytes": 399360024,
+    "candidate_positive_self_allocation_bytes": 153600000,
+    "interpretation": "CPU-only region observation; not a CUDA or end-to-end speed claim"
+  },
+  "tests": {
+    "focused": "22 passed, 68 warnings",
+    "full_cpu_suite": "202 passed, 5 skipped, 68 warnings in 14.28s",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/integrations/fisheye3dod/model.py": "cc15438e2f844f5811b91cce0659d6b91fcfef6e1424ca0470d71ac301d99609",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer_pinned_inplace.py": "904d626a251b853b77646aac9038698f6e2f4f8f519d97de90fade6327a95c41",
+    "tests/test_inplace_uint8_preprocessor.py": "0a0567bafe29c7f7b43638c2a3e1b7e4adf033cca857d3bb69d7a05caff9eb7c"
+  },
+  "pending_gates": [
+    "CUDA raw-bit channel permutation and normalized model-boundary parity",
+    "paired CUDA transfer/preprocessor/test_step latency and memory",
+    "no adoption unless the preregistered strict gate passes"
+  ]
+}
