@@ -201,6 +201,37 @@ def test_inference_storage_reuse_preserves_invalid_sentinels():
     assert torch.equal(candidate[0, :, 0, :4], torch.full((4, 4, 2), 2.0))
 
 
+def test_inference_storage_reuse_preserves_mixed_dtype_promotion():
+    points, metas, image_wh = _projection_fixture(
+        torch.float32,
+        camera_conditioned=False,
+    )
+    # The generic projection API permits a wider image-extent tensor.  The
+    # parent promotes normalization to FP64; an FP32 in-place division would
+    # otherwise silently suppress that contract.
+    image_wh = image_wh.to(torch.float64)
+    with torch.no_grad():
+        parent = ocam_project_points(
+            points,
+            metas,
+            image_wh,
+            contract="full_fov",
+            camera_transform="affine_3x3",
+        )
+        candidate = ocam_project_points(
+            points,
+            metas,
+            image_wh,
+            contract="full_fov",
+            camera_transform="affine_3x3",
+            inference_storage_reuse=True,
+        )
+    assert parent.dtype == torch.float64
+    assert candidate.dtype == parent.dtype
+    assert torch.equal(candidate, parent)
+    assert candidate.stride() == parent.stride()
+
+
 def test_inference_reuse_class_is_registered_stateless_and_eval_only():
     module_type = (
         ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation

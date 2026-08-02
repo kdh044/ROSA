@@ -199,7 +199,10 @@ def ocam_project_points(
             theta_ocam,
         )
         rho.div_(planar_norm.clamp_min(1e-8))
-        rho.masked_fill_(~(planar_norm > 1e-8), 0.0)
+        # Spell the complementary predicate directly.  Materializing
+        # ``~(planar_norm > eps)`` creates a second full-size bool tensor in
+        # every decoder stage for no semantic benefit.
+        rho.masked_fill_(planar_norm <= 1e-8, 0.0)
         scale = rho
     else:
         rho = _horner(expanded_polynomial, theta_ocam)
@@ -247,7 +250,14 @@ def ocam_project_points(
         & pixel_v.ge(0)
         & pixel_v.lt(height)
     )
-    if inference_storage_reuse:
+    # In-place division is exact only when it does not suppress PyTorch's
+    # normal dtype promotion (for example FP32 pixels divided by FP64 image
+    # extents).  Preserve the generic parent semantics for mixed dtypes while
+    # retaining the allocation-free official homogeneous-dtype path.
+    reuse_normalization = inference_storage_reuse and (
+        pixel_u.dtype == width.dtype and pixel_v.dtype == height.dtype
+    )
+    if reuse_normalization:
         normalized_u = pixel_u.div_(width.clamp_min(1))
         normalized_v = pixel_v.div_(height.clamp_min(1))
         projected = normalized_u.new_empty((*normalized_u.shape, 2))
