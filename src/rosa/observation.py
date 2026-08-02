@@ -41,9 +41,46 @@ _RELEASED_OCAM_PROJECT_IMPL = _geometry._ocam_project_points_impl
 _RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
 _RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
+_RELEASED_PREPARED_STACKED = FusedBilinearSampler._sample_multiscale_prepared_stacked
 # CUDA raw-bit parity must be established before this candidate becomes the
 # production default.  CPU tests exercise the complete guarded implementation.
 _ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE = False
+
+
+def _override_mode_is_active_or_unknown() -> bool:
+    """Fail closed when PyTorch override-mode state cannot be trusted."""
+
+    torch_function_mode_state = getattr(
+        torch.overrides,
+        "_is_torch_function_mode_enabled",
+        None,
+    )
+    if not callable(torch_function_mode_state):
+        return True
+    try:
+        torch_function_mode_active = torch_function_mode_state()
+    except Exception:
+        return True
+    if type(torch_function_mode_active) is not bool:
+        return True
+
+    dispatch_mode_state = getattr(
+        _python_dispatch,
+        "_is_in_non_infra_torch_dispatch_mode",
+        None,
+    )
+    if type(dispatch_mode_state) is bool:
+        dispatch_mode_active = dispatch_mode_state
+    elif callable(dispatch_mode_state):
+        try:
+            dispatch_mode_active = dispatch_mode_state()
+        except Exception:
+            return True
+        if type(dispatch_mode_active) is not bool:
+            return True
+    else:
+        return True
+    return torch_function_mode_active or dispatch_mode_active
 
 
 def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
@@ -59,8 +96,7 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
         or _ocam_project_points_with_raw_camera_xyz
         is not _RELEASED_OCAM_PROJECT_WITH_XYZ
         or _geometry._camera_xyz is not _RELEASED_GEOMETRY_CAMERA_XYZ
-        or _geometry._ocam_project_points_impl
-        is not _RELEASED_OCAM_PROJECT_IMPL
+        or _geometry._ocam_project_points_impl is not _RELEASED_OCAM_PROJECT_IMPL
         or torch.jit.is_scripting()
         or torch.jit.is_tracing()
         or torch._dynamo.is_compiling()
@@ -77,10 +113,7 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
         all(type(value) is torch.Tensor for value in tensors)
         and all(value.layout == torch.strided for value in tensors)
         and all(not value.is_quantized for value in tensors)
-        and all(
-            all(name is None for name in value.names)
-            for value in tensors
-        )
+        and all(all(name is None for name in value.names) for value in tensors)
     )
 
 
@@ -109,8 +142,7 @@ def project_and_describe(
         raise KeyError(f"OCam camera metadata missing: {missing}")
 
     reuse_projection_storage = bool(
-        not torch.is_grad_enabled()
-        and not torch._dynamo.is_compiling()
+        not torch.is_grad_enabled() and not torch._dynamo.is_compiling()
     )
     if _can_reuse_camera_transform(keypoints, metadata):
         projected, camera_xyz = _ocam_project_points_with_raw_camera_xyz(
@@ -270,30 +302,11 @@ def _can_use_prepared_multiscale(
 
     compiling = torch._dynamo.is_compiling()
     if not compiling:
-        torch_function_mode_state = getattr(
-            torch.overrides,
-            "_is_torch_function_mode_enabled",
-            None,
-        )
-        if not callable(torch_function_mode_state):
-            return False
-        dispatch_mode_state = getattr(
-            _python_dispatch,
-            "_is_in_non_infra_torch_dispatch_mode",
-            None,
-        )
-        if type(dispatch_mode_state) is bool:
-            dispatch_mode_active = dispatch_mode_state
-        elif callable(dispatch_mode_state):
-            dispatch_mode_active = bool(dispatch_mode_state())
-        else:
-            return False
         if (
             not private_eager_inference
             or torch.jit.is_scripting()
             or torch.jit.is_tracing()
-            or torch_function_mode_state()
-            or dispatch_mode_active
+            or _override_mode_is_active_or_unknown()
         ):
             return False
 
@@ -324,6 +337,16 @@ def _can_use_prepared_multiscale(
         or sampler._forward_hooks
         or torch.nn.modules.module._global_forward_pre_hooks
         or torch.nn.modules.module._global_forward_hooks
+    ):
+        return False
+    if (
+        private_eager_inference
+        and not compiling
+        and (
+            "_sample_multiscale_prepared_stacked" in sampler.__dict__
+            or type(sampler)._sample_multiscale_prepared_stacked
+            is not _RELEASED_PREPARED_STACKED
+        )
     ):
         return False
 
@@ -360,23 +383,29 @@ def _sample_multiscale_features_impl(
             f"expected {level_head.out_features} FPN levels, " f"got {len(fpn)}"
         )
     sample_uv = uv.unsqueeze(4)
-    if _can_use_prepared_multiscale(
+    prepared = _can_use_prepared_multiscale(
         fpn,
         uv,
         sampler,
         private_eager_inference=private_prepared_inference,
-    ):
-        sampled = [
-            value.squeeze(4)
-            for value in sampler._sample_multiscale_prepared(fpn, sample_uv)
-        ]
+    )
+    if prepared and private_prepared_inference and not torch._dynamo.is_compiling():
+        # The final contiguous level tensor is private to this hook-free eager
+        # path.  Fill it level by level so four grid-sample outputs are not all
+        # retained until a later stack allocation.
+        levels = sampler._sample_multiscale_prepared_stacked(fpn, sample_uv)
     else:
-        sampled = [sampler(feature, sample_uv).squeeze(4) for feature in fpn]
-    levels = torch.stack(sampled, dim=2)
-    # ``stack`` owns the fused level storage.  Drop the four per-level outputs
-    # before allocating any subsequent tensor; keeping the Python list alive
-    # otherwise retains another full multiscale observation batch.
-    del sampled
+        if prepared:
+            sampled = [
+                value.squeeze(4)
+                for value in sampler._sample_multiscale_prepared(fpn, sample_uv)
+            ]
+        else:
+            sampled = [sampler(feature, sample_uv).squeeze(4) for feature in fpn]
+        levels = torch.stack(sampled, dim=2)
+        # ``stack`` owns the fused level storage.  Drop the four per-level
+        # outputs before allocating any subsequent tensor.
+        del sampled
     weights = torch.softmax(
         level_head(query).float(),
         dim=-1,
@@ -388,10 +417,7 @@ def _sample_multiscale_features_impl(
         and levels.layout == torch.strided
         and levels._base is None
         and not levels.is_quantized
-        and (
-            torch._dynamo.is_compiling()
-            or all(name is None for name in levels.names)
-        )
+        and (torch._dynamo.is_compiling() or all(name is None for name in levels.names))
     ):
         # ``levels`` is the private result of ``stack``.  Evaluation can reuse
         # that storage for the weighted reduction instead of materializing a

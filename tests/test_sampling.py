@@ -1,3 +1,6 @@
+import sys
+import weakref
+
 import pytest
 import torch
 from torch.overrides import TorchFunctionMode
@@ -31,8 +34,7 @@ def _raw_equal(left, right):
 def _prepared_fixture():
     generator = torch.Generator().manual_seed(3407)
     fpn = tuple(
-        torch.randn(1, 4, 8, size, size, generator=generator)
-        for size in (8, 4, 2, 1)
+        torch.randn(1, 4, 8, size, size, generator=generator) for size in (8, 4, 2, 1)
     )
     uv = torch.rand(1, 5, 4, 13, 2, generator=generator)
     query = torch.randn(1, 5, 8, generator=generator)
@@ -108,8 +110,7 @@ def test_fused_sampler_uses_deterministic_path_when_inputs_need_gradients():
 def test_eval_multiscale_storage_reuse_is_raw_exact():
     generator = torch.Generator().manual_seed(3407)
     fpn = [
-        torch.randn(1, 2, 3, size, size, generator=generator)
-        for size in (8, 4, 2, 1)
+        torch.randn(1, 2, 3, size, size, generator=generator) for size in (8, 4, 2, 1)
     ]
     uv = torch.rand(1, 5, 2, 3, 2, generator=generator)
     query = torch.randn(1, 5, 3, generator=generator)
@@ -132,8 +133,7 @@ def test_eval_multiscale_storage_reuse_is_raw_exact():
 def test_eval_multiscale_storage_reuse_supports_fullgraph_compile():
     generator = torch.Generator().manual_seed(7101080)
     fpn = tuple(
-        torch.randn(1, 2, 8, size, size, generator=generator)
-        for size in (8, 4, 2, 1)
+        torch.randn(1, 2, 8, size, size, generator=generator) for size in (8, 4, 2, 1)
     )
     uv = torch.rand(1, 3, 2, 13, 2, generator=generator)
     query = torch.randn(1, 3, 8, generator=generator)
@@ -171,9 +171,7 @@ def test_training_multiscale_path_preserves_output_and_gradients():
         )
         for size in (8, 4, 2, 1)
     ]
-    candidate_fpn = [
-        value.detach().clone().requires_grad_() for value in parent_fpn
-    ]
+    candidate_fpn = [value.detach().clone().requires_grad_() for value in parent_fpn]
     uv = torch.rand(1, 5, 2, 3, 2, generator=generator)
     parent_query = torch.randn(
         1,
@@ -264,8 +262,7 @@ def test_compiled_prepared_grid_is_raw_exact_and_only_reduces_grid_prep():
                 for node in nodes
             ),
             "sum": sum(
-                node.op == "call_method" and node.target == "sum"
-                for node in nodes
+                node.op == "call_method" and node.target == "sum" for node in nodes
             ),
         }
 
@@ -356,6 +353,171 @@ def test_private_eager_prepared_grid_is_raw_exact_and_fail_closed_on_hooks():
         handle.remove()
     assert calls == ["hook"] * 4
     assert _raw_equal(hooked, expected)
+
+
+def test_private_eager_fills_the_final_level_buffer_directly():
+    fpn, uv, query, level_head, sampler = _prepared_fixture()
+    codes = {
+        "prepare": type(sampler)._prepare_grid.__code__,
+        "prepared_tuple": type(sampler)._sample_multiscale_prepared.__code__,
+        "prepared_stacked": (
+            type(sampler)._sample_multiscale_prepared_stacked.__code__
+        ),
+    }
+    calls = {name: 0 for name in codes}
+
+    def profile(frame, event, _arg):
+        if event == "call":
+            for name, code in codes.items():
+                if frame.f_code is code:
+                    calls[name] += 1
+        return profile
+
+    previous_profile = sys.getprofile()
+    sys.setprofile(profile)
+    try:
+        with torch.no_grad():
+            actual = _sample_multiscale_features_prepared_inference(
+                fpn,
+                uv,
+                query,
+                sampler,
+                level_head,
+            )
+    finally:
+        sys.setprofile(previous_profile)
+
+    with torch.no_grad():
+        expected = _released_multiscale(fpn, uv, query, sampler, level_head)
+    assert calls == {
+        "prepare": 1,
+        "prepared_tuple": 0,
+        "prepared_stacked": 1,
+    }
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_direct_level_buffer_matches_stack_for_special_values():
+    fpn, uv, _query, _level_head, sampler = _prepared_fixture()
+    mutable_fpn = [feature.clone() for feature in fpn]
+    mutable_fpn[0][0, 0, 0, 0, 0] = -0.0
+    mutable_fpn[1][0, 1, 1, 0, 0] = float("nan")
+    mutable_fpn[2][0, 2, 2, 0, 0] = float("inf")
+    mutable_fpn[3][0, 3, 3, 0, 0] = float("-inf")
+    sample_uv = uv.unsqueeze(4)
+
+    with torch.no_grad():
+        expected = torch.stack(
+            [
+                value.squeeze(4)
+                for value in sampler._sample_multiscale_prepared(
+                    mutable_fpn,
+                    sample_uv,
+                )
+            ],
+            dim=2,
+        )
+        actual = sampler._sample_multiscale_prepared_stacked(
+            mutable_fpn,
+            sample_uv,
+        )
+
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_direct_level_buffer_matches_stack_under_cpu_autocast():
+    fpn, uv, _query, _level_head, sampler = _prepared_fixture()
+    fpn = tuple(feature.to(torch.bfloat16) for feature in fpn)
+    sample_uv = uv.to(torch.bfloat16).unsqueeze(4)
+
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        expected = torch.stack(
+            [
+                value.squeeze(4)
+                for value in sampler._sample_multiscale_prepared(
+                    fpn,
+                    sample_uv,
+                )
+            ],
+            dim=2,
+        )
+        actual = sampler._sample_multiscale_prepared_stacked(
+            fpn,
+            sample_uv,
+        )
+
+    assert expected.dtype == torch.float32
+    assert actual.dtype == expected.dtype
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_direct_level_buffer_releases_each_grid_result_before_the_next(
+    monkeypatch,
+):
+    fpn, uv, query, level_head, sampler = _prepared_fixture()
+    original_grid_sample = torch.nn.functional.grid_sample
+    prior_results = []
+
+    def tracked_grid_sample(*args, **kwargs):
+        assert all(reference() is None for reference in prior_results)
+        result = original_grid_sample(*args, **kwargs)
+        prior_results.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(
+        torch.nn.functional,
+        "grid_sample",
+        tracked_grid_sample,
+    )
+    with torch.no_grad():
+        _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+
+    assert len(prior_results) == 4
+    assert all(reference() is None for reference in prior_results)
+
+
+def test_private_eager_direct_level_method_override_falls_back(monkeypatch):
+    fpn, uv, query, level_head, sampler = _prepared_fixture()
+    with torch.no_grad():
+        expected = _released_multiscale(fpn, uv, query, sampler, level_head)
+
+    calls = []
+
+    def overridden(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise AssertionError("overridden private method must not run")
+
+    monkeypatch.setattr(
+        sampler,
+        "_sample_multiscale_prepared_stacked",
+        overridden,
+    )
+    with torch.no_grad():
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+
+    assert calls == []
+    assert _raw_equal(actual, expected)
 
 
 def test_private_eager_prepared_grid_requires_exact_bool_opt_in():
@@ -482,6 +644,66 @@ def test_prepared_guard_supports_torch_without_new_dispatch_mode_flag(
         )
         monkeypatch.setattr(torch._dynamo, "is_compiling", lambda: True)
         assert _can_use_prepared_multiscale(fpn, uv, sampler)
+
+
+@pytest.mark.parametrize(
+    ("owner", "attribute"),
+    (
+        (torch.overrides, "_is_torch_function_mode_enabled"),
+        (_python_dispatch, "_is_in_non_infra_torch_dispatch_mode"),
+    ),
+)
+def test_prepared_guard_fails_closed_for_unknown_override_mode_state(
+    monkeypatch,
+    owner,
+    attribute,
+):
+    fpn, uv, _query, _level_head, sampler = _prepared_fixture()
+
+    with torch.no_grad():
+        with monkeypatch.context() as patch:
+            patch.delattr(owner, attribute, raising=False)
+            assert not _can_use_prepared_multiscale(
+                fpn,
+                uv,
+                sampler,
+                private_eager_inference=True,
+            )
+        with monkeypatch.context() as patch:
+            patch.setattr(owner, attribute, lambda: 1)
+            assert not _can_use_prepared_multiscale(
+                fpn,
+                uv,
+                sampler,
+                private_eager_inference=True,
+            )
+
+
+@pytest.mark.parametrize(
+    ("owner", "attribute"),
+    (
+        (torch.overrides, "_is_torch_function_mode_enabled"),
+        (_python_dispatch, "_is_in_non_infra_torch_dispatch_mode"),
+    ),
+)
+def test_prepared_guard_fails_closed_when_override_mode_state_raises(
+    monkeypatch,
+    owner,
+    attribute,
+):
+    fpn, uv, _query, _level_head, sampler = _prepared_fixture()
+
+    def unavailable():
+        raise RuntimeError("override mode state unavailable")
+
+    monkeypatch.setattr(owner, attribute, unavailable)
+    with torch.no_grad():
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
 
 
 def test_compiled_sampler_state_falls_back_to_public_call(monkeypatch):

@@ -103,11 +103,7 @@ class FusedBilinearSampler(nn.Module):
             or uv.shape[-1] != 2
         ):
             raise ValueError("uv must be [B,N,C,S,P,2]")
-        if (
-            feature.dtype != uv.dtype
-            or feature.requires_grad
-            or uv.requires_grad
-        ):
+        if feature.dtype != uv.dtype or feature.requires_grad or uv.requires_grad:
             return self.fallback(feature, uv)
 
         grid, (queries, samples, patch) = self._prepare_grid(
@@ -166,6 +162,60 @@ class FusedBilinearSampler(nn.Module):
                 ).permute(0, 3, 1, 4, 5, 2)
             )
         return tuple(prepared)
+
+    def _sample_multiscale_prepared_stacked(
+        self,
+        features: Sequence[Tensor],
+        uv: Tensor,
+    ) -> Tensor:
+        """Copy one sampled level at a time into the final stacked buffer."""
+
+        batch, cameras, channels = features[0].shape[:3]
+        grid, (queries, samples, patch) = self._prepare_grid(
+            uv,
+            batch,
+            cameras,
+        )
+        if patch != 1:
+            raise ValueError("stacked multiscale sampling requires one patch point")
+        levels = None
+        for level_index, feature in enumerate(features):
+            height, width = feature.shape[-2:]
+            sampled = F.grid_sample(
+                feature.reshape(batch * cameras, channels, height, width),
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+            sampled = (
+                sampled.reshape(
+                    batch,
+                    cameras,
+                    channels,
+                    queries,
+                    samples,
+                    patch,
+                )
+                .permute(0, 3, 1, 4, 5, 2)
+                .squeeze(4)
+            )
+            if levels is None:
+                # Autocast may promote ``grid_sample`` independently of the
+                # feature dtype.  Match ``torch.stack`` by allocating from the
+                # actual sampled result instead of silently casting it back.
+                levels = sampled.new_empty(
+                    batch,
+                    queries,
+                    len(features),
+                    cameras,
+                    samples,
+                    channels,
+                )
+            levels[:, :, level_index].copy_(sampled)
+            del sampled
+        assert levels is not None
+        return levels
 
 
 __all__ = ["DeterministicBilinearSampler", "FusedBilinearSampler"]
