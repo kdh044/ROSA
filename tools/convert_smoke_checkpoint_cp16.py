@@ -30,6 +30,9 @@ from typing import Any
 import torch
 
 ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 DEFAULT_NATIVE_CONFIG = ROOT / (
     "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_"
     "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_"
