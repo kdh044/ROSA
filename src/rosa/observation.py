@@ -64,7 +64,6 @@ def _override_mode_is_active_or_unknown() -> bool:
         return True
     if type(torch_function_mode_active) is not bool:
         return True
-
     dispatch_mode_state = getattr(
         _python_dispatch,
         "_is_in_non_infra_torch_dispatch_mode",

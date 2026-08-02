@@ -175,6 +175,11 @@ def test_single_transform_candidate_is_raw_exact_end_to_end(
     anchor[..., 7] = 1.0
 
     with torch.no_grad():
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            False,
+        )
         expected = project_and_describe(
             keypoints,
             anchor,
@@ -499,6 +504,53 @@ def test_function_mode_guard_fails_closed_without_private_api(monkeypatch):
         )
 
     _assert_observation_raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize("invalid", (None, 1, "false"))
+@pytest.mark.parametrize("surface", ("function", "dispatch"))
+def test_override_mode_guard_fails_closed_for_non_bool_state(
+    monkeypatch,
+    surface,
+    invalid,
+):
+    if surface == "function":
+        monkeypatch.setattr(
+            observation_module.torch.overrides,
+            "_is_torch_function_mode_enabled",
+            lambda: invalid,
+        )
+    else:
+        monkeypatch.setattr(
+            observation_module._python_dispatch,
+            "_is_in_non_infra_torch_dispatch_mode",
+            lambda: invalid,
+        )
+
+    assert observation_module._override_mode_is_active_or_unknown() is True
+
+
+@pytest.mark.parametrize("surface", ("function", "dispatch"))
+def test_override_mode_guard_fails_closed_when_private_api_raises(
+    monkeypatch,
+    surface,
+):
+    def fail():
+        raise RuntimeError("injected private API failure")
+
+    if surface == "function":
+        monkeypatch.setattr(
+            observation_module.torch.overrides,
+            "_is_torch_function_mode_enabled",
+            fail,
+        )
+    else:
+        monkeypatch.setattr(
+            observation_module._python_dispatch,
+            "_is_in_non_infra_torch_dispatch_mode",
+            fail,
+        )
+
+    assert observation_module._override_mode_is_active_or_unknown() is True
 
 
 def test_single_transform_candidate_preserves_tensor_subclass_dispatch(monkeypatch):
