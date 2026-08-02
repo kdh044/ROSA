@@ -674,6 +674,19 @@ def _config_fingerprint(config: Any) -> str:
     return hashlib.sha256(config.pretty_text.encode("utf-8")).hexdigest()
 
 
+def _validate_checkpoint_contract(checkpoint: Path, config: Any) -> None:
+    """Apply the train/evaluate topology contract before MMEngine loading."""
+
+    try:
+        from tools.run import _validate_checkpoint_contract as validate
+    except ModuleNotFoundError as error:  # Direct ``python tools/...`` execution.
+        if error.name not in {"tools", "tools.run"}:
+            raise
+        from run import _validate_checkpoint_contract as validate
+
+    validate(checkpoint, config, allow_mismatch=False)
+
+
 def _dataset_metainfo(dataset: Any) -> Mapping[str, Any]:
     current = dataset
     for _ in range(8):
@@ -703,6 +716,7 @@ def dump_command(args: argparse.Namespace) -> None:
     checkpoint = args.checkpoint.resolve()
     if not checkpoint.is_file():
         raise FileNotFoundError(checkpoint)
+    _validate_checkpoint_contract(checkpoint, config)
     config.load_from = str(checkpoint)
     config.resume = False
     config.launcher = "none"

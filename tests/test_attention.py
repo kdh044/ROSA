@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from rosa.attention import PointwiseROSA, mean_pairwise_camera_cosine
 from rosa.config import ROSAConfig
 from rosa.rfl import SphericalRayFeatureLifting
+from rosa.runtime_verification import raw_fingerprint
 from rosa.types import RayFeatureRelation
 
 
@@ -103,6 +104,46 @@ def test_compact_rfl_step_zero_identity_dtype_and_first_backward():
         assert torch.count_nonzero(projection.weight.grad) == 0
 
 
+def test_compact_rfl_zero_output_initialization_unlocks_all_factors_on_step_two():
+    generator = torch.Generator().manual_seed(7_101_080)
+    module = SphericalRayFeatureLifting.for_compact_profile(embed_dims=8)
+    optimizer = torch.optim.SGD(module.parameters(), lr=1e-2)
+    features = torch.randn(2, 3, 4, 5, 8, generator=generator)
+    ray = F.normalize(torch.randn(2, 3, 4, 5, 3, generator=generator), dim=-1)
+    valid = torch.rand(2, 3, 4, 5, generator=generator) > 0.2
+    relation = RayFeatureRelation(ray=ray, valid=valid)
+    upstream = torch.randn(features.shape, generator=generator)
+
+    first = module(features, relation)
+    (first * upstream).sum().backward()
+    output_gradient = module.output_proj.weight.grad
+    assert output_gradient is not None
+    assert torch.isfinite(output_gradient).all()
+    assert torch.count_nonzero(output_gradient) > 0
+    for projection in (module.appearance_proj, module.ray_proj):
+        assert projection is not None
+        assert torch.equal(
+            projection.weight.grad,
+            torch.zeros_like(projection.weight.grad),
+        )
+    optimizer.step()
+    assert torch.count_nonzero(module.output_proj.weight) > 0
+
+    optimizer.zero_grad(set_to_none=True)
+    second = module(features, relation)
+    (second * upstream).sum().backward()
+    for projection in (
+        module.appearance_proj,
+        module.ray_proj,
+        module.output_proj,
+    ):
+        assert projection is not None
+        gradient = projection.weight.grad
+        assert gradient is not None
+        assert torch.isfinite(gradient).all()
+        assert torch.count_nonzero(gradient) > 0
+
+
 def test_compact_rfl_is_a_bias_free_appearance_ray_interaction():
     generator = torch.Generator().manual_seed(7101080)
     module = SphericalRayFeatureLifting.for_compact_profile(embed_dims=8)
@@ -157,6 +198,66 @@ def test_behavior_profiles_select_fixed_factorized_or_released_dense_rfl():
         "appearance_proj.weight",
         "output_proj.weight",
     )
+
+
+def test_released_dense_profiles_match_parent_raw_state_rng_and_output():
+    expected_state = {
+        "sha256": "94ba6a81695be9a1b80bbe3303f592e13c032c9641d69c879561d040c2912d5b",
+        "nodes": 37,
+        "tensor_bytes": 17_476,
+    }
+    expected_rng = {
+        "sha256": "057eea35e25fe222d8af0bccca7580d55d3077f7bf86dea275f7673f768046eb",
+        "nodes": 1,
+        "tensor_bytes": 5_056,
+    }
+    expected_output = {
+        "sha256": "aa02ccb700e4c25b50fd3ef45fc7b6f56e42e0c5f21fff6ccc626970b1dbbb1a",
+        "nodes": 8,
+        "tensor_bytes": 2_474,
+    }
+
+    # These raw fingerprints were recorded from the unchanged 2a7f1df parent.
+    for profile in ("published", "legacy_release"):
+        with torch.random.fork_rng(devices=[]):
+            torch.manual_seed(7_101_080)
+            module = PointwiseROSA(
+                ROSAConfig.from_mapping(
+                    {
+                        "profile": profile,
+                        "embed_dims": 16,
+                        "hidden_dims": 8,
+                    }
+                )
+            ).eval()
+            assert raw_fingerprint(module.state_dict()) == expected_state
+            assert raw_fingerprint(torch.random.get_rng_state()) == expected_rng
+
+            generator = torch.Generator().manual_seed(3_407)
+            features = torch.randn(1, 2, 4, 13, 16, generator=generator)
+            geometry = torch.randn(1, 2, 4, 13, 14, generator=generator)
+            ray = F.normalize(
+                torch.randn(1, 2, 4, 13, 3, generator=generator),
+                dim=-1,
+            )
+            valid = torch.rand(1, 2, 4, 13, generator=generator) > 0.2
+            relation_bncp = torch.zeros(1, 2, 4, 13, 19)
+            relation_bncp[..., 8:11] = ray
+            relation_bncp[..., 13] = valid
+            relation = relation_bncp.permute(0, 2, 1, 3, 4).contiguous()
+            query = torch.randn(1, 2, 16, generator=generator)
+            with torch.no_grad():
+                output = module(features, geometry, relation, valid, query)
+            output_values = (
+                output.object_feature,
+                output.point_features,
+                output.camera_weights,
+                output.supported,
+                output.cross_camera_consistency,
+                output.camera_weight_mean,
+                output.camera_geometry_summary,
+            )
+            assert raw_fingerprint(output_values) == expected_output
 
 
 def test_compact_observation_usages_keep_required_outputs_raw_exact():

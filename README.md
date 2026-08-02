@@ -149,6 +149,27 @@ refiner = ROSARefiner(config)
 See [`tests/test_refiner.py`](tests/test_refiner.py) for an executable tensor
 example.
 
+## Compact RFL and checkpoint compatibility
+
+The `balanced` and `fast` profiles use a signed rank-16 factorization of the
+appearance-by-degree-2-SH interaction. This reduces the RFL from 40,960 to
+8,336 learned weights while leaving the `published` and `legacy_release`
+profiles on the released dense outer-product topology. The compact output
+projection starts at zero: the first optimizer step trains that projection,
+and the resulting nonzero map unlocks finite gradients for the appearance and
+ray factors on the second step. This delayed unlock is intentional and covered
+by a two-step regression test.
+
+Factorized compact checkpoints use contract v3 and
+`rosa.rfl.signed_gated_cp16.v3`. Dense compact-v2 checkpoints are not
+shape-compatible and must be evaluated with their pinned v2 source or
+retrained; they are never silently converted. Evaluation, benchmarking,
+stage-route analysis, and explicit or automatic training resume validate the
+complete config-owned ROSA refiner key/shape schema before MMEngine loads the
+checkpoint. The mismatch override may relax audited projection metadata, but
+cannot bypass topology or state integrity failures. Historical
+`canonical_sixth_block` prefixes remain accepted through the released remap.
+
 ## Checkpoint and results
 
 Only the best Full checkpoint is retained locally:

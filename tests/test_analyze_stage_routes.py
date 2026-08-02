@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+from dataclasses import asdict
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -346,3 +347,57 @@ def test_cli_exposes_dump_and_evaluate_contracts(tmp_path):
     )
     assert evaluate.command == "evaluate"
     assert evaluate.matrix == stage_routes.MATRIX_SCORE_BUNDLE
+
+
+def test_dump_rejects_partial_factorized_checkpoint_before_runner_build(
+    tmp_path,
+    monkeypatch,
+):
+    pytest.importorskip("mmengine")
+    from mmengine.config import Config
+    from rosa import ROSAConfig
+
+    effective = ROSAConfig.from_mapping({"profile": "balanced"})
+    checkpoint = tmp_path / "partial.pth"
+    torch.save(
+        {
+            "state_dict": {
+                "head.rosa_refiner.rosa.rfl.output_proj.weight": torch.ones(1)
+            },
+            "meta": {
+                "rosa_contract_version": 3,
+                "rfl_topology_contract": effective.rfl_topology_contract,
+                "projection_contract": effective.projection_contract,
+                "rosa_config": asdict(effective),
+            },
+        },
+        checkpoint,
+    )
+    config = Config(
+        {
+            "model": {
+                "head": {
+                    "type": "ROSASparse4DHead",
+                    "rosa_cfg": {"profile": "balanced"},
+                }
+            }
+        }
+    )
+    monkeypatch.setattr(stage_routes, "_config_from_args", lambda _args: config)
+
+    from mmengine.runner import Runner
+
+    def must_not_build(*_args, **_kwargs):
+        raise AssertionError("invalid checkpoint reached Runner construction")
+
+    monkeypatch.setattr(Runner, "from_cfg", must_not_build)
+    args = SimpleNamespace(
+        config=tmp_path / "config.py",
+        checkpoint=checkpoint,
+        output=tmp_path / "routes.pt",
+        work_dir=None,
+        cfg_options=None,
+    )
+
+    with pytest.raises(ValueError, match="topology integrity.*missing keys"):
+        stage_routes.dump_command(args)

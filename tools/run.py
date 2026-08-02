@@ -39,6 +39,10 @@ _ROSA_TOPOLOGY_FIELDS = (
     "enable_quality_score",
 )
 _ROSA_GEOMETRY_FIELDS = ("anchor_z_is_bottom",)
+_ROSA_REFINER_STATE_PREFIXES = {
+    "modern": "head.rosa_refiner.",
+    "legacy": "head.canonical_sixth_block.",
+}
 _OBJECT_DEPTH_TRAIN_ONLY_KEYS = tuple(
     f"depth_branch.depth_layers.{level}.{field}"
     for level in range(3)
@@ -256,6 +260,134 @@ def _state_dict_has_rosa(state_dict: Mapping | None) -> bool | None:
         for key in state_dict
         if isinstance(key, str)
     )
+
+
+def _expected_rosa_refiner_state_shapes(effective) -> dict[str, tuple[int, ...]]:
+    """Build the config-owned refiner schema without advancing caller RNG."""
+
+    from rosa import ROSARefiner
+
+    with torch.random.fork_rng(devices=[]):
+        state_dict = ROSARefiner(
+            effective,
+            projection_type="ocam_fisheye",
+        ).state_dict()
+    return {
+        key: tuple(int(dimension) for dimension in value.shape)
+        for key, value in state_dict.items()
+    }
+
+
+def _split_rosa_refiner_state_key(key: str) -> tuple[str, str] | None:
+    """Return the loader-compatible namespace and relative refiner key."""
+
+    # MMEngine's checkpoint loader removes one leading ``module.`` before
+    # loading a DDP checkpoint. Mirror exactly that accepted spelling here.
+    normalized = key.removeprefix("module.")
+    for namespace, prefix in _ROSA_REFINER_STATE_PREFIXES.items():
+        if normalized.startswith(prefix):
+            return namespace, normalized[len(prefix) :]
+    return None
+
+
+def _summarize_state_names(names: list[str], *, limit: int = 4) -> str:
+    shown = ", ".join(repr(name) for name in names[:limit])
+    omitted = len(names) - limit
+    return f"{shown}, ... (+{omitted})" if omitted > 0 else shown
+
+
+def _factorized_refiner_state_mismatches(
+    state_dict: Mapping | None,
+    effective,
+) -> list[str]:
+    """Validate every compact ROSA refiner key and exact tensor shape."""
+
+    if not isinstance(state_dict, Mapping):
+        return ["factorized compact checkpoint has no state_dict mapping"]
+
+    expected = _expected_rosa_refiner_state_shapes(effective)
+    observed: dict[str, object] = {}
+    namespaces: set[str] = set()
+    duplicate_keys: set[str] = set()
+    unrecognized_rosa_keys: list[str] = []
+    for key, value in state_dict.items():
+        if not isinstance(key, str):
+            continue
+        split = _split_rosa_refiner_state_key(key)
+        if split is None:
+            if any(
+                part == "rosa" or part.startswith("rosa_") for part in key.split(".")
+            ):
+                unrecognized_rosa_keys.append(key)
+            continue
+        namespace, relative_key = split
+        namespaces.add(namespace)
+        if relative_key in observed:
+            duplicate_keys.add(relative_key)
+        else:
+            observed[relative_key] = value
+
+    mismatches: list[str] = []
+    if not observed:
+        mismatches.append("factorized compact checkpoint lacks ROSA refiner state")
+    if len(namespaces) > 1:
+        mismatches.append(
+            "factorized compact ROSA state mixes modern and legacy refiner prefixes"
+        )
+    if duplicate_keys:
+        names = sorted(duplicate_keys)
+        mismatches.append(
+            "factorized compact ROSA state duplicates keys "
+            f"[{_summarize_state_names(names)}]"
+        )
+    if unrecognized_rosa_keys:
+        names = sorted(unrecognized_rosa_keys)
+        mismatches.append(
+            "factorized compact checkpoint has unrecognized ROSA state keys "
+            f"[{_summarize_state_names(names)}]"
+        )
+
+    missing = sorted(set(expected) - set(observed))
+    unexpected = sorted(set(observed) - set(expected))
+    non_tensor = sorted(
+        key for key, value in observed.items() if not isinstance(value, torch.Tensor)
+    )
+    wrong_shape = sorted(
+        (
+            key,
+            tuple(int(dimension) for dimension in value.shape),
+            expected[key],
+        )
+        for key, value in observed.items()
+        if key in expected
+        and isinstance(value, torch.Tensor)
+        and tuple(value.shape) != expected[key]
+    )
+    if missing:
+        mismatches.append(
+            "factorized compact ROSA state is missing keys "
+            f"[{_summarize_state_names(missing)}]"
+        )
+    if unexpected:
+        mismatches.append(
+            "factorized compact ROSA state has unexpected keys "
+            f"[{_summarize_state_names(unexpected)}]"
+        )
+    if non_tensor:
+        mismatches.append(
+            "factorized compact ROSA state has non-tensor values at "
+            f"[{_summarize_state_names(non_tensor)}]"
+        )
+    if wrong_shape:
+        rendered = [
+            f"{key!r}: {observed_shape} != {expected_shape}"
+            for key, observed_shape, expected_shape in wrong_shape
+        ]
+        mismatches.append(
+            "factorized compact ROSA state has wrong shapes "
+            f"[{_summarize_state_names(rendered)}]"
+        )
+    return mismatches
 
 
 def _load_checkpoint_without_executing_code(checkpoint_path: Path):
@@ -686,14 +818,19 @@ def _validate_checkpoint_contract(
 
     checkpoint = _load_checkpoint_without_executing_code(checkpoint_path)
     if not isinstance(checkpoint, Mapping):
-        return
+        raise ValueError("checkpoint root must be a mapping")
     metadata = checkpoint.get("meta")
     metadata = metadata if isinstance(metadata, Mapping) else {}
     rosa_mapping = config.model.get("head", {}).get("rosa_cfg")
     effective = _effective_rosa_config(config)
     target_has_rosa = rosa_mapping is not None
-    checkpoint_has_rosa = _state_dict_has_rosa(_checkpoint_state_dict(checkpoint))
-    mismatches = []
+    checkpoint_state_dict = _checkpoint_state_dict(checkpoint)
+    checkpoint_has_rosa = _state_dict_has_rosa(checkpoint_state_dict)
+    compact_target = bool(
+        target_has_rosa and effective.architecture_profile == "compact"
+    )
+    mismatches: list[str] = []
+    integrity_mismatches: list[str] = []
 
     deploy_contract = metadata.get("deploy_contract")
     deploy_behavior = metadata.get("native_deploy_behavior")
@@ -706,11 +843,12 @@ def _validate_checkpoint_contract(
         mismatches.append("native deploy behavior is missing its deploy contract")
 
     if checkpoint_has_rosa is not None and checkpoint_has_rosa != target_has_rosa:
-        mismatches.append(
+        mismatch = (
             "topology "
             f"checkpoint ROSA={checkpoint_has_rosa} != "
             f"config ROSA={target_has_rosa}"
         )
+        (integrity_mismatches if compact_target else mismatches).append(mismatch)
 
     checkpoint_contract = metadata.get("projection_contract")
     if target_has_rosa and checkpoint_has_rosa is not False:
@@ -726,14 +864,14 @@ def _validate_checkpoint_contract(
         checkpoint_version = metadata.get("rosa_contract_version")
         checkpoint_rfl_topology = metadata.get("rfl_topology_contract")
         expected_rfl_topology = effective.rfl_topology_contract
-        if effective.architecture_profile == "compact":
+        if compact_target:
             if checkpoint_version != _ROSA_CONTRACT_VERSION:
-                mismatches.append(
+                integrity_mismatches.append(
                     "factorized compact RFL requires checkpoint contract "
                     f"v{_ROSA_CONTRACT_VERSION}, got {checkpoint_version!r}"
                 )
             if checkpoint_rfl_topology != expected_rfl_topology:
-                mismatches.append(
+                integrity_mismatches.append(
                     "RFL topology "
                     f"{checkpoint_rfl_topology!r} != {expected_rfl_topology!r}"
                 )
@@ -746,6 +884,14 @@ def _validate_checkpoint_contract(
                 f"{checkpoint_rfl_topology!r} != {expected_rfl_topology!r}"
             )
 
+    if compact_target:
+        integrity_mismatches.extend(
+            _factorized_refiner_state_mismatches(
+                checkpoint_state_dict,
+                effective,
+            )
+        )
+
     checkpoint_rosa_config = metadata.get("rosa_config")
     if target_has_rosa and isinstance(checkpoint_rosa_config, Mapping):
         from rosa import ROSAConfig
@@ -753,10 +899,14 @@ def _validate_checkpoint_contract(
         try:
             source_effective = ROSAConfig.from_mapping(checkpoint_rosa_config)
         except (TypeError, ValueError) as error:
-            mismatches.append(f"invalid checkpoint ROSA config ({error})")
+            mismatch = f"invalid checkpoint ROSA config ({error})"
+            (integrity_mismatches if compact_target else mismatches).append(mismatch)
         else:
             if _topology_signature(source_effective) != _topology_signature(effective):
-                mismatches.append("ROSA learned topology differs from the checkpoint")
+                mismatch = "ROSA learned topology differs from the checkpoint"
+                (integrity_mismatches if compact_target else mismatches).append(
+                    mismatch
+                )
             if _geometry_signature(source_effective) != _geometry_signature(effective):
                 mismatches.append(
                     "ROSA box-coordinate geometry differs from the checkpoint"
@@ -766,10 +916,15 @@ def _validate_checkpoint_contract(
         and metadata.get("architecture") == _KNOWN_RELEASE_ARCHITECTURE
         and effective.architecture_profile != "legacy"
     ):
-        mismatches.append(
+        integrity_mismatches.append(
             "published checkpoint cannot initialize compact ROSA topology"
         )
 
+    if integrity_mismatches:
+        message = "checkpoint/config topology integrity mismatch: " + "; ".join(
+            [*integrity_mismatches, *mismatches]
+        )
+        raise ValueError(message)
     if not mismatches:
         return
     message = "checkpoint/config contract mismatch: " + "; ".join(mismatches)
@@ -796,11 +951,39 @@ def _compile_fast_inference(runner, config: Config) -> bool:
     return True
 
 
+def _resolve_train_resume_checkpoint(
+    resume: str,
+    config: Config,
+) -> Path | None:
+    """Resolve the exact local checkpoint MMEngine will resume from."""
+
+    if resume != "auto":
+        return Path(resume).expanduser().resolve()
+
+    from mmengine.runner.checkpoint import find_latest_checkpoint
+
+    discovered = find_latest_checkpoint(
+        str(Path(config.work_dir).expanduser().resolve())
+    )
+    return None if discovered is None else Path(discovered).expanduser().resolve()
+
+
 def train(args: argparse.Namespace, config: Config) -> None:
     if args.resume:
         os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
-        config.resume = True
-        config.load_from = None if args.resume == "auto" else args.resume
+        resume_checkpoint = _resolve_train_resume_checkpoint(args.resume, config)
+        if resume_checkpoint is not None:
+            _validate_checkpoint_contract(
+                resume_checkpoint,
+                config,
+                allow_mismatch=False,
+            )
+        # A missing auto checkpoint means a fresh run. Disable Runner's second
+        # discovery pass so a file created after validation cannot be loaded.
+        config.resume = resume_checkpoint is not None
+        # Pin auto-discovery to the validated path. Otherwise a changed
+        # ``last_checkpoint`` file could make Runner load a different artifact.
+        config.load_from = None if resume_checkpoint is None else str(resume_checkpoint)
     if args.amp:
         if config.optim_wrapper.type != "OptimWrapper":
             raise ValueError("--amp requires a plain OptimWrapper")

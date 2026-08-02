@@ -15,6 +15,8 @@ pytest.importorskip("mmengine")
 from mmengine.config import Config
 from mmengine.logging.history_buffer import HistoryBuffer
 
+from rosa import ROSARefiner
+
 _SPEC = importlib.util.spec_from_file_location(
     "rosa_run_tool",
     Path(__file__).parents[1] / "tools" / "run.py",
@@ -78,6 +80,50 @@ def _save_checkpoint(
     )
 
 
+def _factorized_refiner_state(
+    *,
+    profile: str = "balanced",
+    namespace: str = "modern",
+    module_prefix: bool = False,
+) -> OrderedDict:
+    effective = run_tool._effective_rosa_config(_config(profile))
+    with torch.random.fork_rng(devices=[]):
+        refiner_state = ROSARefiner(effective).state_dict()
+    prefix = {
+        "modern": "head.rosa_refiner.",
+        "legacy": "head.canonical_sixth_block.",
+    }[namespace]
+    if module_prefix:
+        prefix = "module." + prefix
+    return OrderedDict(
+        (prefix + key, torch.zeros_like(value)) for key, value in refiner_state.items()
+    )
+
+
+def _save_factorized_checkpoint(
+    path: Path,
+    *,
+    profile: str = "balanced",
+    metadata: dict | None = None,
+    state_dict: OrderedDict | None = None,
+) -> None:
+    torch.save(
+        {
+            "state_dict": (
+                _factorized_refiner_state(profile=profile)
+                if state_dict is None
+                else state_dict
+            ),
+            "meta": (
+                run_tool._checkpoint_contract_metadata(_config(profile))
+                if metadata is None
+                else metadata
+            ),
+        },
+        path,
+    )
+
+
 def test_checkpoint_contract_accepts_matching_release(tmp_path: Path):
     checkpoint = tmp_path / "release.pth"
     _save_checkpoint(
@@ -98,10 +144,33 @@ def test_checkpoint_contract_accepts_matching_release(tmp_path: Path):
 
 def test_checkpoint_contract_accepts_matching_factorized_compact(tmp_path: Path):
     checkpoint = tmp_path / "factorized_v3.pth"
-    _save_checkpoint(
+    rng_before = torch.random.get_rng_state().clone()
+    _save_factorized_checkpoint(checkpoint)
+
+    run_tool._validate_checkpoint_contract(
         checkpoint,
-        has_rosa=True,
-        metadata=run_tool._checkpoint_contract_metadata(_config("balanced")),
+        _config("balanced"),
+        allow_mismatch=False,
+    )
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+
+
+@pytest.mark.parametrize(
+    ("namespace", "module_prefix"),
+    (("legacy", False), ("modern", True)),
+)
+def test_checkpoint_contract_accepts_loader_compatible_refiner_prefixes(
+    tmp_path: Path,
+    namespace: str,
+    module_prefix: bool,
+):
+    checkpoint = tmp_path / f"factorized_{namespace}_{module_prefix}.pth"
+    _save_factorized_checkpoint(
+        checkpoint,
+        state_dict=_factorized_refiner_state(
+            namespace=namespace,
+            module_prefix=module_prefix,
+        ),
     )
 
     run_tool._validate_checkpoint_contract(
@@ -117,12 +186,84 @@ def test_checkpoint_contract_rejects_dense_compact_v2(tmp_path: Path):
     assert metadata is not None
     metadata["rosa_contract_version"] = 2
     metadata.pop("rfl_topology_contract")
-    _save_checkpoint(checkpoint, has_rosa=True, metadata=metadata)
+    _save_factorized_checkpoint(checkpoint, metadata=metadata)
 
     with pytest.raises(
         ValueError,
         match="factorized compact RFL requires checkpoint contract v3",
     ):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _config("balanced"),
+            allow_mismatch=False,
+        )
+
+
+def test_checkpoint_contract_rejects_wrong_v3_topology_even_with_override(
+    tmp_path: Path,
+):
+    checkpoint = tmp_path / "wrong_v3_topology.pth"
+    metadata = run_tool._checkpoint_contract_metadata(_config("balanced"))
+    assert metadata is not None
+    metadata["rfl_topology_contract"] = "rosa.rfl.dense_outer_product.v2"
+    _save_factorized_checkpoint(checkpoint, metadata=metadata)
+
+    with pytest.raises(ValueError, match="topology integrity.*RFL topology"):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _config("balanced"),
+            allow_mismatch=True,
+        )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    (
+        ("missing_rfl", "missing keys.*ray_proj.weight"),
+        ("wrong_rfl_shape", "wrong shapes.*output_proj.weight"),
+        ("partial_refiner", "missing keys.*candidate_head.1.bias"),
+        ("extra_refiner", "unexpected keys.*unowned.weight"),
+        ("external_extra", "unrecognized ROSA state keys.*rosa_unowned.weight"),
+    ),
+)
+def test_checkpoint_contract_rejects_invalid_factorized_refiner_schema(
+    tmp_path: Path,
+    mutation: str,
+    message: str,
+):
+    checkpoint = tmp_path / f"{mutation}.pth"
+    state = _factorized_refiner_state()
+    if mutation == "missing_rfl":
+        state.pop("head.rosa_refiner.rosa.rfl.ray_proj.weight")
+    elif mutation == "wrong_rfl_shape":
+        state["head.rosa_refiner.rosa.rfl.output_proj.weight"] = torch.zeros(256, 144)
+    elif mutation == "partial_refiner":
+        state.pop("head.rosa_refiner.candidate_head.1.bias")
+    elif mutation == "extra_refiner":
+        state["head.rosa_refiner.unowned.weight"] = torch.ones(1)
+    else:
+        state["head.rosa_unowned.weight"] = torch.ones(1)
+    _save_factorized_checkpoint(checkpoint, state_dict=state)
+
+    with pytest.raises(ValueError, match=message):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _config("balanced"),
+            allow_mismatch=True,
+        )
+
+
+def test_checkpoint_contract_rejects_mixed_legacy_and_modern_refiner_state(
+    tmp_path: Path,
+):
+    checkpoint = tmp_path / "mixed_prefixes.pth"
+    state = _factorized_refiner_state()
+    state["head.canonical_sixth_block.level_head.weight"] = state[
+        "head.rosa_refiner.level_head.weight"
+    ].clone()
+    _save_factorized_checkpoint(checkpoint, state_dict=state)
+
+    with pytest.raises(ValueError, match="mixes modern and legacy"):
         run_tool._validate_checkpoint_contract(
             checkpoint,
             _config("balanced"),
@@ -160,24 +301,23 @@ def test_checkpoint_contract_reads_mmengine_history_without_unsafe_pickle(
 
 def test_checkpoint_contract_rejects_projection_and_topology(tmp_path: Path):
     checkpoint = tmp_path / "release.pth"
-    _save_checkpoint(
+    _save_factorized_checkpoint(
         checkpoint,
-        has_rosa=True,
         metadata={
             "architecture": "ROSA R18 Main126",
             "projection_contract": "legacy_front_only",
         },
     )
 
-    with pytest.raises(
-        ValueError,
-        match="projection.*published checkpoint.*compact",
-    ):
+    with pytest.raises(ValueError) as error:
         run_tool._validate_checkpoint_contract(
             checkpoint,
             _config("balanced"),
             allow_mismatch=False,
         )
+    message = str(error.value)
+    assert "published checkpoint cannot initialize compact" in message
+    assert "projection 'legacy_front_only' != 'full_fov'" in message
 
 
 def test_checkpoint_contract_rejects_box_coordinate_geometry(tmp_path: Path):
@@ -187,14 +327,10 @@ def test_checkpoint_contract_rejects_box_coordinate_geometry(tmp_path: Path):
         **source_config.__dict__,
         "anchor_z_is_bottom": True,
     }
-    _save_checkpoint(
-        checkpoint,
-        has_rosa=True,
-        metadata={
-            "projection_contract": "full_fov",
-            "rosa_config": source_mapping,
-        },
-    )
+    metadata = run_tool._checkpoint_contract_metadata(_config("balanced"))
+    assert metadata is not None
+    metadata["rosa_config"] = source_mapping
+    _save_factorized_checkpoint(checkpoint, metadata=metadata)
 
     with pytest.raises(ValueError, match="box-coordinate geometry"):
         run_tool._validate_checkpoint_contract(
@@ -411,6 +547,147 @@ def test_evaluate_enables_trusted_mmengine_checkpoint_load(
         ("load", None),
         ("test", None),
     ]
+
+
+@pytest.mark.parametrize("resume_mode", ("explicit", "auto"))
+def test_train_resume_rejects_partial_factorized_state_before_runner_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_mode: str,
+):
+    checkpoint = tmp_path / "partial.pth"
+    _save_checkpoint(
+        checkpoint,
+        has_rosa=True,
+        metadata=run_tool._checkpoint_contract_metadata(_config("balanced")),
+    )
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    if resume_mode == "auto":
+        (work_dir / "last_checkpoint").write_text(
+            str(checkpoint.resolve()),
+            encoding="utf-8",
+        )
+        resume = "auto"
+    else:
+        resume = str(checkpoint)
+
+    class MustNotBuild:
+        @classmethod
+        def from_cfg(cls, _config):
+            raise AssertionError("invalid resume reached Runner construction")
+
+    config = _config("balanced")
+    config.work_dir = str(work_dir)
+    monkeypatch.setattr(run_tool, "Runner", MustNotBuild)
+    with pytest.raises(ValueError, match="topology integrity.*missing keys"):
+        run_tool.train(
+            SimpleNamespace(resume=resume, amp=False),
+            config,
+        )
+
+
+@pytest.mark.parametrize("resume_mode", ("explicit", "auto"))
+def test_train_resume_validates_and_pins_checkpoint_before_runner_build(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    resume_mode: str,
+):
+    checkpoint = tmp_path / "valid.pth"
+    _save_factorized_checkpoint(checkpoint)
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    if resume_mode == "auto":
+        (work_dir / "last_checkpoint").write_text(
+            str(checkpoint.resolve()),
+            encoding="utf-8",
+        )
+        resume = "auto"
+    else:
+        resume = str(checkpoint)
+
+    events = []
+    validate = run_tool._validate_checkpoint_contract
+
+    def observed_validate(*args, **kwargs):
+        events.append(("validate", args[0], kwargs["allow_mismatch"]))
+        return validate(*args, **kwargs)
+
+    training_work_dir = work_dir
+
+    class FakeRunner:
+        rank = 1
+        work_dir = str(training_work_dir)
+
+        @classmethod
+        def from_cfg(cls, received_config):
+            assert events == [("validate", checkpoint.resolve(), False)]
+            assert received_config.resume is True
+            assert received_config.load_from == str(checkpoint.resolve())
+            events.append(("build", received_config.load_from))
+            return cls()
+
+        def register_hook(self, _hook, *, priority):
+            events.append(("hook", priority))
+
+        def train(self):
+            events.append(("train", None))
+
+    config = _config("balanced")
+    config.work_dir = str(work_dir)
+    monkeypatch.setattr(run_tool, "_validate_checkpoint_contract", observed_validate)
+    monkeypatch.setattr(run_tool, "Runner", FakeRunner)
+
+    run_tool.train(
+        SimpleNamespace(resume=resume, amp=False),
+        config,
+    )
+
+    assert events == [
+        ("validate", checkpoint.resolve(), False),
+        ("build", str(checkpoint.resolve())),
+        ("hook", "VERY_LOW"),
+        ("train", None),
+    ]
+
+
+def test_train_auto_without_checkpoint_pins_a_fresh_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    work_dir = tmp_path / "work"
+    work_dir.mkdir()
+    events = []
+    training_work_dir = work_dir
+
+    class FakeRunner:
+        rank = 1
+        work_dir = str(training_work_dir)
+
+        @classmethod
+        def from_cfg(cls, received_config):
+            assert received_config.resume is False
+            assert received_config.load_from is None
+            events.append("build")
+            return cls()
+
+        def register_hook(self, _hook, *, priority):
+            assert priority == "VERY_LOW"
+
+        def train(self):
+            events.append("train")
+
+    def must_not_validate(*_args, **_kwargs):
+        raise AssertionError("missing auto checkpoint reached validation")
+
+    config = _config("balanced")
+    config.work_dir = str(work_dir)
+    monkeypatch.setattr(run_tool, "_validate_checkpoint_contract", must_not_validate)
+    monkeypatch.setattr(run_tool, "Runner", FakeRunner)
+
+    run_tool.train(SimpleNamespace(resume="auto", amp=False), config)
+
+    assert events == ["build", "train"]
 
 
 def _object_depth_source_state() -> OrderedDict:
