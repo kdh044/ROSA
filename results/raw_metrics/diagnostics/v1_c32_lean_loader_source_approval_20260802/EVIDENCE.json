@@ -1,0 +1,49 @@
+{
+  "schema": "rosa.c32_lean_loader_source_approval.v1",
+  "date_utc": "2026-08-02",
+  "status": "CORRECTNESS_PARITY_APPROVED_RUNTIME_PENDING",
+  "base_commit": "068886e493a055c966a11940bbd840e875ea7a6b",
+  "branch": "optimize/c32-lean-loader",
+  "scientific_model": "C32 official Sparse4D self-attention residual",
+  "change": "skip unused inverse(lidar2cam) in an opt-in exact-pipeline loader",
+  "default_loader_contract_changed": false,
+  "ego_d4_c4_augmentation_supported_by_lean_loader": false,
+  "parameter_delta": 0,
+  "buffer_delta": 0,
+  "checkpoint_key_delta": 0,
+  "numeric_hyperparameter_delta": 0,
+  "model_input_delta": 0,
+  "main126_camera_records_audited": 12726,
+  "input_cam2ego_records": 0,
+  "real_packed_parity_splits": [
+    "train",
+    "validation",
+    "test"
+  ],
+  "real_packed_parity": "BITWISE_EQUAL",
+  "tests": {
+    "focused_passed": 11,
+    "full_passed": 172,
+    "full_skipped": 5
+  },
+  "independent_correctness_review": "APPROVE",
+  "mock_component_benchmark": {
+    "image_contract": "four 800x800 cameras",
+    "parent_median_ms": 3.9199215,
+    "candidate_median_ms": 3.8716255,
+    "candidate_over_parent_ratio": 0.987679,
+    "median_delta_us": -48.296,
+    "end_to_end_claim_authorized": false
+  },
+  "real_dataloader_benchmark": "PENDING",
+  "cuda_parity": "PENDING",
+  "cuda_profiler": "PENDING",
+  "paired_latency": "PENDING",
+  "speed_claim_authorized": false,
+  "file_sha256": {
+    "src/rosa/integrations/fisheye3dod/dataset.py": "24bb47a382c196682314a56f5b6730a7abee183537c0342c4a79ccb5dc227485",
+    "tests/test_fisheye3dod_integration.py": "41f9c3f98c7e9e028869dccc38e6e42c9d0103ffe62948973d613fedb89afdb7",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader.py": "fbdd5555c357b75727fe32a78e1aa38b484654cd2c79ec8e957b42370cd2625d",
+    "tests/test_lean_loader.py": "189ee7745913afad15c3be0314558d5c38364f8b6076e222645271117a2a6dbb"
+  }
+}

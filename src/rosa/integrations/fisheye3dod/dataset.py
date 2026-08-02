@@ -213,6 +213,8 @@ class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
 class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
     """Load four native 800×800 OCam images in the fixed released order."""
 
+    _EMIT_CAM2EGO = True
+
     def __init__(
         self,
         cam_names: tuple[str, ...] = CAMERAS,
@@ -272,13 +274,30 @@ class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
             pad_shape=shapes,
             ocam_lens_fov_deg=float(fovs[0]),
         )
-        results["cam2ego"] = np.linalg.inv(results["lidar2cam"]).astype(np.float32)
+        if self._EMIT_CAM2EGO:
+            results["cam2ego"] = np.linalg.inv(results["lidar2cam"]).astype(
+                np.float32
+            )
         return results
+
+
+@TRANSFORMS.register_module()
+class LoadOfficialFisheye3DODLeanForSparse4D(
+    LoadOfficialFisheye3DODForSparse4D
+):
+    """Exact native loader without the unused camera-pose inverse.
+
+    This variant is only for pipelines that do not consume ``cam2ego``.  Keep
+    the default loader for the optional ego D4/C4 augmentation branches.
+    """
+
+    _EMIT_CAM2EGO = False
 
 
 __all__ = [
     "Fisheye3DODEvaluatorRangeFilter",
     "Fisheye3DODSparse4DDataset",
+    "LoadOfficialFisheye3DODLeanForSparse4D",
     "LoadOfficialFisheye3DODForSparse4D",
     "OfficialFisheye3DODRangeFilter",
 ]
