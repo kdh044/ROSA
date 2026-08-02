@@ -212,12 +212,24 @@ class PointwiseROSA(nn.Module):
             and "_can_reuse_owned_rfl_delta" not in self.__dict__
             and type(self)._can_reuse_owned_rfl_delta
             is _RELEASED_POINTWISE_ROSA_REUSE_GUARD
+            and type(self.rfl) is SphericalRayFeatureLifting
+            and "_can_reuse_owned_delta" not in self.rfl.__dict__
+            and type(self.rfl)._can_reuse_owned_delta is _RELEASED_RFL_REUSE_GUARD
+            and _rfl._plain_eager_no_grad_execution is _RELEASED_PLAIN_EAGER_NO_GRAD
             and all(
                 type(value) is torch.Tensor
                 for value in (features, geometry, valid, query)
             )
             and type(relation) is RayFeatureRelation
             and all(not module.training for module in modules)
+            and all(
+                "__call__" not in module.__dict__
+                and type(module).__call__ is _RELEASED_MODULE_CALL
+                and "_call_impl" not in module.__dict__
+                and type(module)._call_impl is _RELEASED_MODULE_CALL_IMPL
+                and getattr(module, "_compiled_call_impl", None) is None
+                for module in modules
+            )
             and not any(
                 module._forward_pre_hooks
                 or module._forward_hooks
@@ -469,14 +481,7 @@ class PointwiseROSA(nn.Module):
         """Seal the non-bitwise dual form to released fast FP32 inference."""
 
         if (
-            not self._can_reuse_owned_rfl_delta(
-                features,
-                geometry,
-                relation,
-                valid,
-                query,
-                observation_usage,
-            )
+            type(self) is not PointwiseROSA
             or "_can_use_dual_camera_logits" in self.__dict__
             or type(self)._can_use_dual_camera_logits
             is not _RELEASED_POINTWISE_ROSA_DUAL_GUARD
@@ -486,8 +491,14 @@ class PointwiseROSA(nn.Module):
             or "_dual_camera_logits_inference" in self.__dict__
             or type(self)._dual_camera_logits_inference
             is not _RELEASED_POINTWISE_ROSA_DUAL_LOGITS
+            or "__call__" in self.__dict__
+            or type(self).__call__ is not _RELEASED_MODULE_CALL
             or "_call_impl" in self.__dict__
             or type(self)._call_impl is not _RELEASED_MODULE_CALL_IMPL
+            or F.linear is not _RELEASED_FUNCTIONAL_LINEAR
+            or torch.cat is not _RELEASED_TORCH_CAT
+            or torch.matmul is not _RELEASED_TORCH_MATMUL
+            or torch.einsum is not _RELEASED_TORCH_EINSUM
             or self.cfg.embed_dims != 256
             or self.cfg.hidden_dims != 64
             or self.cfg.num_cameras != 4
@@ -521,6 +532,14 @@ class PointwiseROSA(nn.Module):
             )
             or any(
                 value.device != features.device for value in (geometry, valid, query)
+            )
+            or not self._can_reuse_owned_rfl_delta(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage,
             )
         ):
             return False
@@ -560,6 +579,11 @@ class PointwiseROSA(nn.Module):
             or type(geometry_output) is not nn.Linear
             or type(geometry_output).forward is not _RELEASED_LINEAR_FORWARD
             or any("forward" in module.__dict__ for module in guarded_modules)
+            or any("__call__" in module.__dict__ for module in guarded_modules)
+            or any(
+                type(module).__call__ is not _RELEASED_MODULE_CALL
+                for module in guarded_modules
+            )
             or any("_call_impl" in module.__dict__ for module in guarded_modules)
             or any(
                 type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
@@ -914,6 +938,8 @@ _RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
 _RELEASED_OWNED_TENSOR_CHECK = _is_owned_plain_fp32_tensor
 _RELEASED_OWNED_CONSISTENCY = _mean_pairwise_camera_cosine_owned_inference
 _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE = mean_pairwise_camera_cosine
+_RELEASED_RFL_REUSE_GUARD = SphericalRayFeatureLifting._can_reuse_owned_delta
+_RELEASED_MODULE_CALL = nn.Module.__call__
 _RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
 _RELEASED_LINEAR_FORWARD = nn.Linear.forward
 _RELEASED_LAYER_NORM_FORWARD = nn.LayerNorm.forward
@@ -930,11 +956,10 @@ _RELEASED_POINTWISE_ROSA_STORAGE_GUARD = (
 _RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
 _RELEASED_POINTWISE_ROSA_DUAL_GUARD = PointwiseROSA._can_use_dual_camera_logits
 _RELEASED_POINTWISE_ROSA_DUAL_LOGITS = PointwiseROSA._dual_camera_logits_inference
-_RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
-_RELEASED_LINEAR_FORWARD = nn.Linear.forward
-_RELEASED_LAYER_NORM_FORWARD = nn.LayerNorm.forward
-_RELEASED_SEQUENTIAL_FORWARD = nn.Sequential.forward
-_RELEASED_SILU_FORWARD = nn.SiLU.forward
+_RELEASED_FUNCTIONAL_LINEAR = F.linear
+_RELEASED_TORCH_CAT = torch.cat
+_RELEASED_TORCH_MATMUL = torch.matmul
+_RELEASED_TORCH_EINSUM = torch.einsum
 
 
 __all__ = [

@@ -9,6 +9,7 @@ from torch.overrides import TorchFunctionMode
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils.benchmark import Timer
 
+import rosa.rfl as rfl_module
 from rosa.attention import PointwiseROSA
 from rosa.config import ROSAConfig
 from rosa.refiner import ROSARefiner
@@ -344,6 +345,198 @@ def test_private_entry_preserves_key_projection_hook_and_autocast_abi():
             observation_usage="base_support",
         )
     _assert_encoding_equal(actual_autocast, expected_autocast)
+
+
+def test_dual_guard_preserves_module_call_override(monkeypatch):
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+    with torch.no_grad():
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+
+    calls = []
+    released_call = torch.nn.Module.__call__
+
+    def custom_call(self, *args, **kwargs):
+        if self is module.key_proj:
+            calls.append(True)
+        return released_call(self, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.Module, "__call__", custom_call)
+    with torch.no_grad():
+        assert not _dual_guard(module, features, geometry, relation, valid, query)
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+    assert calls == [True]
+    _assert_encoding_equal(actual, expected)
+
+
+@pytest.mark.parametrize("helper_name", ("linear", "cat", "matmul", "einsum"))
+def test_dual_guard_preserves_bypassed_and_new_public_helpers(
+    helper_name,
+    monkeypatch,
+):
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+    with torch.no_grad():
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+
+    calls = []
+    if helper_name == "linear":
+        released = F.linear
+
+        def hooked_linear(value, weight, bias=None):
+            if weight is module.key_proj.weight:
+                calls.append(True)
+            return released(value, weight, bias)
+
+        monkeypatch.setattr(F, "linear", hooked_linear)
+    elif helper_name == "cat":
+        released = torch.cat
+
+        def hooked_cat(tensors, *args, **kwargs):
+            values = tuple(tensors)
+            if (
+                len(values) == 2
+                and values[0].shape[-1] == module.cfg.embed_dims
+                and values[1].shape[-1] == module.geometry_dims
+            ):
+                calls.append(True)
+            return released(values, *args, **kwargs)
+
+        monkeypatch.setattr(torch, "cat", hooked_cat)
+    else:
+
+        def must_not_run(*_args, **_kwargs):
+            raise AssertionError(f"overridden torch.{helper_name} executed")
+
+        monkeypatch.setattr(torch, helper_name, must_not_run)
+
+    with torch.no_grad():
+        assert not _dual_guard(module, features, geometry, relation, valid, query)
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+    if helper_name in ("linear", "cat"):
+        assert calls == [True]
+    _assert_encoding_equal(actual, expected)
+
+
+def test_private_entry_does_not_invoke_overridden_pointwise_reuse_guard():
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+    with torch.no_grad():
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden Pointwise reuse guard executed")
+
+    module._can_reuse_owned_rfl_delta = types.MethodType(must_not_run, module)
+    with torch.no_grad():
+        assert not _dual_guard(module, features, geometry, relation, valid, query)
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+    _assert_encoding_equal(actual, expected)
+
+
+def test_private_entry_seals_rfl_reuse_guard_before_invoking_it():
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+    with torch.no_grad():
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden RFL reuse guard executed")
+
+    module.rfl._can_reuse_owned_delta = types.MethodType(must_not_run, module.rfl)
+    with torch.no_grad():
+        assert not _dual_guard(module, features, geometry, relation, valid, query)
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+    _assert_encoding_equal(actual, expected)
+
+
+def test_private_entry_seals_plain_eager_predicate_and_preserves_autograd(
+    monkeypatch,
+):
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+
+    def must_not_run():
+        raise AssertionError("overridden plain-eager predicate executed")
+
+    monkeypatch.setattr(
+        rfl_module,
+        "_plain_eager_no_grad_execution",
+        must_not_run,
+    )
+    expected = module(
+        features,
+        geometry,
+        relation,
+        valid,
+        query,
+        observation_usage="base_support",
+    )
+    assert not _dual_guard(module, features, geometry, relation, valid, query)
+    actual = module._forward_compact_lean_inference(
+        features,
+        geometry,
+        relation,
+        valid,
+        query,
+        observation_usage="base_support",
+    )
+    _assert_encoding_equal(actual, expected)
+    assert actual.object_feature.requires_grad
+    actual.object_feature.square().mean().backward()
+    assert module.key_proj.weight.grad is not None
+    assert torch.isfinite(module.key_proj.weight.grad).all()
 
 
 def test_private_entry_rejects_overridden_dual_methods(monkeypatch):
