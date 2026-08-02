@@ -246,11 +246,15 @@ def ocam_project_points(
             rho / planar_norm.clamp_min(1e-8),
             0.0,
         )
-    if inference_storage_reuse:
+    reuse_image_xy = inference_storage_reuse and (
+        x.dtype == scale.dtype and y.dtype == scale.dtype
+    )
+    if reuse_image_xy:
         # ``safe_xyz`` is owned by this call in the reuse path.  Projection no
         # longer needs x/y after their planar norm and theta have been formed,
         # so retain the products in those two slots instead of allocating two
-        # additional full-size tensors.
+        # additional full-size tensors.  Mixed polynomial/point dtypes retain
+        # the parent's ordinary promotion through the fallback below.
         image_x = safe_xyz[..., 0].mul_(scale)
         image_y = safe_xyz[..., 1].mul_(scale)
     else:
