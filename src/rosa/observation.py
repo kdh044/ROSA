@@ -43,7 +43,8 @@ _RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
 _RELEASED_PREPARED_STACKED = FusedBilinearSampler._sample_multiscale_prepared_stacked
 # CUDA raw-bit parity must be established before this candidate becomes the
-# production default.  CPU tests exercise the complete guarded implementation.
+# production default.  CPU eager and Dynamo backend=eager tests exercise the
+# guarded implementation; production-backend lowering remains unverified.
 _ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE = False
 
 
@@ -87,6 +88,15 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
     if (
         not _ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE
         or torch.is_grad_enabled()
+        or torch.overrides._is_torch_function_mode_enabled()
+        or getattr(
+            _python_dispatch,
+            "_is_in_non_infra_torch_dispatch_mode",
+            # PyTorch 2.1/2.2 do not expose the infra-aware mode flag.  Keep
+            # this private candidate disabled there rather than miss a user
+            # TorchDispatchMode and change its observed operator sequence.
+            True,
+        )
         or type(metadata) is not dict
         or type(keypoints) is not torch.Tensor
         or keypoints.ndim != 4
@@ -99,7 +109,6 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
         or _geometry._ocam_project_points_impl is not _RELEASED_OCAM_PROJECT_IMPL
         or torch.jit.is_scripting()
         or torch.jit.is_tracing()
-        or torch._dynamo.is_compiling()
     ):
         return False
     tensors = (
@@ -109,12 +118,19 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
         metadata.get("ocam_intrinsic"),
         metadata.get("ocam_pol"),
     )
-    return bool(
-        all(type(value) is torch.Tensor for value in tensors)
-        and all(value.layout == torch.strided for value in tensors)
-        and all(not value.is_quantized for value in tensors)
-        and all(all(name is None for name in value.names) for value in tensors)
-    )
+    if (
+        not all(type(value) is torch.Tensor for value in tensors)
+        or not all(value.layout == torch.strided for value in tensors)
+        or not all(not value.is_quantized for value in tensors)
+    ):
+        return False
+    if torch._dynamo.is_compiling():
+        # Dynamo specializes exact Tensor inputs by layout and dispatch key.
+        # Named tensors are not accepted by torch.compile; keep their eager
+        # fallback below without attempting to inspect ``Tensor.names`` while
+        # a full graph is being captured.
+        return True
+    return bool(all(all(name is None for name in value.names) for value in tensors))
 
 
 def project_and_describe(
@@ -150,7 +166,7 @@ def project_and_describe(
             metadata,
             metadata["image_wh"],
             contract=projection_contract,
-            inference_storage_reuse=True,
+            inference_storage_reuse=reuse_projection_storage,
         )
     else:
         projected = ocam_project_points(

@@ -1,7 +1,10 @@
 import math
+import sys
 
 import pytest
 import torch
+from torch.overrides import TorchFunctionMode
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import rosa.observation as observation_module
 from rosa.geometry import (
@@ -49,6 +52,25 @@ def _raw_equal(left, right):
         left.contiguous().view(integer_dtype),
         right.contiguous().view(integer_dtype),
     )
+
+
+def _assert_observation_raw_equal(actual, expected):
+    assert type(actual) is type(expected) is tuple
+    assert len(actual) == len(expected) == 4
+    for candidate, parent in zip(actual, expected):
+        assert type(candidate) is type(parent)
+        if type(candidate) is RayFeatureRelation:
+            assert _raw_equal(candidate.ray, parent.ray)
+            assert torch.equal(candidate.valid, parent.valid)
+        elif candidate.is_floating_point():
+            assert candidate.dtype == parent.dtype
+            assert _raw_equal(candidate, parent)
+        else:
+            assert torch.equal(candidate, parent)
+
+
+def test_single_transform_candidate_stays_disabled_by_default():
+    assert observation_module._ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE is False
 
 
 @pytest.mark.parametrize(
@@ -167,16 +189,56 @@ def test_single_transform_candidate_is_raw_exact_end_to_end(
             compact_relation=compact_relation,
         )
 
-    for candidate, parent in zip(actual, expected):
-        if type(candidate) is RayFeatureRelation:
-            assert type(parent) is RayFeatureRelation
-            assert _raw_equal(candidate.ray, parent.ray)
-            assert torch.equal(candidate.valid, parent.valid)
-        elif candidate.is_floating_point():
-            assert candidate.dtype == parent.dtype
-            assert _raw_equal(candidate, parent)
-        else:
-            assert torch.equal(candidate, parent)
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_eager_single_transform_candidate_executes_one_camera_transform(monkeypatch):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+    transform_codes = {
+        "projection": observation_module._geometry._camera_xyz.__code__,
+        "descriptor": observation_module._camera_xyz.__code__,
+    }
+
+    def invoke(enabled):
+        calls = {name: 0 for name in transform_codes}
+
+        def profile(frame, event, _arg):
+            if event == "call":
+                for name, code in transform_codes.items():
+                    if frame.f_code is code:
+                        calls[name] += 1
+            return profile
+
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        previous_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            with torch.no_grad():
+                output = project_and_describe(
+                    keypoints,
+                    anchor,
+                    metas,
+                    "full_fov",
+                )
+        finally:
+            sys.setprofile(previous_profile)
+        return output, calls
+
+    expected, released_calls = invoke(False)
+    actual, candidate_calls = invoke(True)
+
+    assert released_calls == {"projection": 1, "descriptor": 1}
+    assert candidate_calls == {"projection": 1, "descriptor": 0}
+    _assert_observation_raw_equal(actual, expected)
 
 
 def test_single_transform_candidate_fails_closed_for_extension_surfaces(
@@ -234,6 +296,328 @@ def test_single_transform_candidate_fails_closed_for_extension_surfaces(
             keypoints,
             metas,
         )
+
+
+def test_single_transform_candidate_preserves_callable_hooks(monkeypatch):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+    surfaces = (
+        (observation_module, "_camera_xyz", 1),
+        (observation_module, "ocam_project_points", 1),
+        (observation_module, "_ocam_project_points_with_raw_camera_xyz", 0),
+        (observation_module._geometry, "_camera_xyz", 1),
+        (observation_module._geometry, "_ocam_project_points_impl", 1),
+    )
+
+    for owner, name, calls_per_fallback in surfaces:
+        original = getattr(owner, name)
+        calls = []
+
+        def hooked(*args, _original=original, **kwargs):
+            calls.append(None)
+            return _original(*args, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(owner, name, hooked)
+            patch.setattr(
+                observation_module,
+                "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+                False,
+            )
+            with torch.no_grad():
+                expected = project_and_describe(
+                    keypoints,
+                    anchor,
+                    metas,
+                    "full_fov",
+                )
+            assert len(calls) == calls_per_fallback
+
+            patch.setattr(
+                observation_module,
+                "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+                True,
+            )
+            with torch.no_grad():
+                actual = project_and_describe(
+                    keypoints,
+                    anchor,
+                    metas,
+                    "full_fov",
+                )
+            assert len(calls) == 2 * calls_per_fallback
+
+        _assert_observation_raw_equal(actual, expected)
+
+
+def test_single_transform_candidate_preserves_torch_override_modes(monkeypatch):
+    class RecordingFunctionMode(TorchFunctionMode):
+        def __init__(self):
+            self.calls = []
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            self.calls.append(func)
+            return func(*args, **(kwargs or {}))
+
+    class RecordingDispatchMode(TorchDispatchMode):
+        def __init__(self):
+            self.calls = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.calls.append(func)
+            return func(*args, **(kwargs or {}))
+
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+
+    def invoke(enabled, mode_type):
+        mode = mode_type()
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        with torch.no_grad(), mode:
+            assert not observation_module._can_reuse_camera_transform(
+                keypoints,
+                metas,
+            )
+            output = project_and_describe(
+                keypoints,
+                anchor,
+                metas,
+                "full_fov",
+            )
+        return output, mode.calls
+
+    for mode_type in (RecordingFunctionMode, RecordingDispatchMode):
+        expected, expected_calls = invoke(False, mode_type)
+        actual, actual_calls = invoke(True, mode_type)
+        assert actual_calls == expected_calls
+        _assert_observation_raw_equal(actual, expected)
+
+
+def test_dispatch_mode_guard_fails_closed_without_infra_api(monkeypatch):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        False,
+    )
+    with torch.no_grad():
+        expected = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        True,
+    )
+    monkeypatch.delattr(
+        observation_module._python_dispatch,
+        "_is_in_non_infra_torch_dispatch_mode",
+        raising=False,
+    )
+    with torch.no_grad():
+        assert not observation_module._can_reuse_camera_transform(
+            keypoints,
+            metas,
+        )
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_single_transform_candidate_preserves_tensor_subclass_dispatch(monkeypatch):
+    class TensorSubclass(torch.Tensor):
+        pass
+
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    ).as_subclass(TensorSubclass)
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        False,
+    )
+    with torch.no_grad():
+        expected = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        True,
+    )
+    with torch.no_grad():
+        assert not observation_module._can_reuse_camera_transform(
+            keypoints,
+            metas,
+        )
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_single_transform_candidate_preserves_metadata_container_hooks(monkeypatch):
+    class RecordingMetadata(dict):
+        def __init__(self, values):
+            super().__init__(values)
+            self.calls = []
+
+        def __contains__(self, key):
+            self.calls.append(("contains", key))
+            return super().__contains__(key)
+
+        def __getitem__(self, key):
+            self.calls.append(("getitem", key))
+            return super().__getitem__(key)
+
+        def get(self, key, default=None):
+            self.calls.append(("get", key))
+            return super().get(key, default)
+
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+
+    def invoke(enabled):
+        metadata = RecordingMetadata(_metas())
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        with torch.no_grad():
+            output = project_and_describe(
+                keypoints,
+                anchor,
+                metadata,
+                "full_fov",
+            )
+        return output, metadata.calls
+
+    expected, expected_calls = invoke(False)
+    actual, actual_calls = invoke(True)
+
+    assert actual_calls == expected_calls
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_single_transform_candidate_preserves_named_tensor_exception(monkeypatch):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    ).refine_names("batch", "query", "point", "xyz")
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+    errors = []
+
+    for enabled in (False, True):
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        with torch.no_grad(), pytest.raises(RuntimeError) as captured:
+            project_and_describe(
+                keypoints,
+                anchor,
+                metas,
+                "full_fov",
+            )
+        errors.append(captured.value)
+
+    assert type(errors[0]) is type(errors[1])
+    assert errors[0].args == errors[1].args
+
+
+def test_single_transform_candidate_training_fallback_is_raw_exact(monkeypatch):
+    def invoke(enabled):
+        metas = {
+            name: (
+                value.double().detach().clone().requires_grad_(True)
+                if torch.is_tensor(value)
+                else value
+            )
+            for name, value in _metas().items()
+        }
+        keypoints = torch.tensor(
+            [[[[0.2, -0.1, -2.0], [0.5, 0.25, -3.0]]]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        anchor = torch.zeros(1, 1, 11, dtype=torch.float64)
+        anchor[..., :3] = torch.tensor((0.1, -0.2, -2.5))
+        anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+        anchor[..., 7] = 1.0
+        anchor.requires_grad_()
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        output = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+        loss = output[0].sum() + output[1].sum() + output[2].sum()
+        leaves = (
+            keypoints,
+            anchor,
+            metas["lidar2cam"],
+            metas["image_wh"],
+            metas["ocam_intrinsic"],
+            metas["ocam_pol"],
+        )
+        gradients = torch.autograd.grad(loss, leaves)
+        return output, gradients
+
+    expected, expected_gradients = invoke(False)
+    actual, actual_gradients = invoke(True)
+
+    _assert_observation_raw_equal(actual, expected)
+    for candidate, parent in zip(actual_gradients, expected_gradients):
+        assert _raw_equal(candidate, parent)
 
 
 def test_single_transform_candidate_does_not_expand_conditioned_input_api(
@@ -312,6 +696,168 @@ def test_no_grad_descriptor_remains_fullgraph_compilable(
             assert _raw_equal(candidate, parent)
         else:
             assert torch.equal(candidate, parent)
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+)
+@pytest.mark.parametrize("compact_relation", (False, True))
+def test_compiled_single_transform_candidate_is_raw_exact_for_special_values(
+    dtype,
+    compact_relation,
+    monkeypatch,
+):
+    metas = {
+        name: value.to(dtype=dtype) if torch.is_tensor(value) else value
+        for name, value in _metas().items()
+    }
+    values = torch.tensor(
+        [
+            [
+                [
+                    [0.0, -0.0, -1.0],
+                    [0.5, -0.25, -2.0],
+                    [float("nan"), 0.0, -1.0],
+                    [float("inf"), float("-inf"), 0.0],
+                    [9999.0, 0.0, -1.0],
+                    [10000.0, 0.0, -1.0],
+                ]
+            ]
+        ],
+        dtype=dtype,
+    )
+    backing = torch.empty(1, 1, 6, 6, dtype=dtype)
+    backing[..., ::2] = values
+    keypoints = backing[..., ::2]
+    assert not keypoints.is_contiguous()
+    anchor = torch.zeros(1, 1, 11, dtype=dtype)
+    anchor[..., :3] = torch.tensor((0.25, -0.0, -1.0), dtype=dtype)
+    anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5), dtype=dtype).log()
+    anchor[..., 7] = 1.0
+
+    def describe(points, boxes, lidar2cam, intrinsic, polynomial, image_wh):
+        metadata = {
+            "lidar2cam": lidar2cam,
+            "ocam_intrinsic": intrinsic,
+            "ocam_pol": polynomial,
+            "image_wh": image_wh,
+        }
+        return project_and_describe(
+            points,
+            boxes,
+            metadata,
+            "full_fov",
+            compact_relation=compact_relation,
+        )
+
+    inputs = (
+        keypoints,
+        anchor,
+        metas["lidar2cam"],
+        metas["ocam_intrinsic"],
+        metas["ocam_pol"],
+        metas["image_wh"],
+    )
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        False,
+    )
+    with torch.no_grad():
+        expected = describe(*inputs)
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        True,
+    )
+
+    torch._dynamo.reset()
+    try:
+        compiled = torch.compile(describe, backend="eager", fullgraph=True)
+        with torch.no_grad():
+            actual = compiled(*inputs)
+    finally:
+        torch._dynamo.reset()
+
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_compiled_candidate_graph_contains_one_camera_transform(monkeypatch):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+    anchor[..., 7] = 1.0
+
+    def describe(points, boxes, lidar2cam, intrinsic, polynomial, image_wh):
+        metadata = {
+            "lidar2cam": lidar2cam,
+            "ocam_intrinsic": intrinsic,
+            "ocam_pol": polynomial,
+            "image_wh": image_wh,
+        }
+        return project_and_describe(
+            points,
+            boxes,
+            metadata,
+            "full_fov",
+            compact_relation=True,
+        )
+
+    inputs = (
+        keypoints,
+        anchor,
+        metas["lidar2cam"],
+        metas["ocam_intrinsic"],
+        metas["ocam_pol"],
+        metas["image_wh"],
+    )
+
+    def capture(enabled):
+        graphs = []
+
+        def eager_backend(graph_module, _example_inputs):
+            graphs.append(graph_module)
+            return graph_module.forward
+
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        torch._dynamo.reset()
+        compiled = torch.compile(
+            describe,
+            backend=eager_backend,
+            fullgraph=True,
+        )
+        with torch.no_grad():
+            output = compiled(*inputs)
+        assert len(graphs) == 1
+        return graphs[0], output
+
+    try:
+        released_graph, expected = capture(False)
+        candidate_graph, actual = capture(True)
+    finally:
+        torch._dynamo.reset()
+
+    def camera_transform_count(graph_module):
+        return sum(
+            node.op == "call_function" and node.target is torch.matmul
+            for node in graph_module.graph.nodes
+        )
+
+    assert camera_transform_count(released_graph) == 2
+    assert camera_transform_count(candidate_graph) == 1
+    assert not any(
+        node.op == "call_method" and node.target == "copy_"
+        for node in candidate_graph.graph.nodes
+    )
+    _assert_observation_raw_equal(actual, expected)
 
 
 def test_legacy_contract_reproduces_front_plane_clip():

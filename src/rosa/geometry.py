@@ -225,16 +225,22 @@ def _ocam_project_points_impl(
         raise ValueError(f"unknown OCam camera transform: {camera_transform}")
     raw_camera_xyz = None
     if preserve_raw_camera_xyz:
-        # The matmul result is an XYZ view over a four-wide homogeneous
-        # backing tensor.  Keep that stride so the later normalize reduction
-        # sees the same layout as the historical second transform.
-        raw_camera_xyz = torch.empty_strided(
-            camera_xyz.shape,
-            camera_xyz.stride(),
-            dtype=camera_xyz.dtype,
-            device=camera_xyz.device,
-        )
-        raw_camera_xyz.copy_(camera_xyz)
+        if inference_storage_reuse:
+            # The in-place inference sanitizer below consumes the transform
+            # output.  Preserve its raw values in an identically strided owned
+            # buffer before that mutation.
+            raw_camera_xyz = torch.empty_strided(
+                camera_xyz.shape,
+                camera_xyz.stride(),
+                dtype=camera_xyz.dtype,
+                device=camera_xyz.device,
+            )
+            raw_camera_xyz.copy_(camera_xyz)
+        else:
+            # The ordinary projection sanitizer is out of place, so compiled
+            # inference can feed this exact transform view straight to the ray
+            # descriptor without another full-size copy.
+            raw_camera_xyz = camera_xyz
     if inference_storage_reuse:
         safe_xyz, geometry_valid = _sanitize_camera_xyz_inference_storage_reuse(
             camera_xyz
