@@ -285,7 +285,10 @@ def test_logical_device_identity_accepts_torch_cuuid_wrapper() -> None:
             return SimpleNamespace(uuid=TorchCUuuid(), name="NVIDIA GPU")
 
     device = SimpleNamespace(index=0)
-    identity = tool._logical_device_identity(SimpleNamespace(cuda=FakeCuda()), device)
+    fake_torch = SimpleNamespace(
+        cuda=FakeCuda(), _C=SimpleNamespace(_CUuuid=TorchCUuuid)
+    )
+    identity = tool._logical_device_identity(fake_torch, device)
 
     assert identity["gpu_uuid"] == "GPU-e79e0304-d240-431b-f05f-7f3a67933b97"
 
@@ -305,6 +308,32 @@ def test_logical_device_identity_rejects_arbitrary_stringable_uuid() -> None:
         tool._logical_device_identity(
             SimpleNamespace(cuda=FakeCuda()), SimpleNamespace(index=0)
         )
+
+
+def test_logical_device_identity_rejects_same_named_cuuid_impostor() -> None:
+    ExpectedTorchCUuuid = type(
+        "_CUuuid", (), {"__module__": "torch._C"}
+    )
+    ImpostorTorchCUuuid = type(
+        "_CUuuid",
+        (),
+        {
+            "__module__": "torch._C",
+            "__str__": lambda self: "e79e0304-d240-431b-f05f-7f3a67933b97",
+        },
+    )
+
+    class FakeCuda:
+        @staticmethod
+        def get_device_properties(device):
+            del device
+            return SimpleNamespace(uuid=ImpostorTorchCUuuid(), name="NVIDIA GPU")
+
+    fake_torch = SimpleNamespace(
+        cuda=FakeCuda(), _C=SimpleNamespace(_CUuuid=ExpectedTorchCUuuid)
+    )
+    with pytest.raises(tool.ProtocolError, match="did not expose a GPU UUID"):
+        tool._logical_device_identity(fake_torch, SimpleNamespace(index=0))
 
 
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:

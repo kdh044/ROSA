@@ -801,11 +801,8 @@ def _logical_device_identity(torch, device) -> dict[str, Any]:
     properties = torch.cuda.get_device_properties(device)
     raw_uuid = getattr(properties, "uuid", None)
     if not isinstance(raw_uuid, (str, bytes)):
-        uuid_type = type(raw_uuid)
-        if (uuid_type.__module__, uuid_type.__name__) != (
-            "torch._C",
-            "_CUuuid",
-        ):
+        torch_cuuid = getattr(getattr(torch, "_C", None), "_CUuuid", None)
+        if torch_cuuid is None or type(raw_uuid) is not torch_cuuid:
             raise ProtocolError("Torch device properties did not expose a GPU UUID")
         # PyTorch 2.11 exposes UUID as a private immutable ``_CUuuid`` value.
         # Its string representation is the CUDA UUID suffix printed in the
