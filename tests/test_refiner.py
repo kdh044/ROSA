@@ -1,9 +1,12 @@
+from collections import Counter
+import sys
 import types
 
 import pytest
 import torch
 
 import rosa.refiner as refiner_module
+import rosa.rfl as rfl_module
 from rosa.refiner import (
     _CandidateEvidence,
     _candidate_confidence,
@@ -122,6 +125,47 @@ def test_compact_lean_refiner_uses_only_private_prepared_sampling(monkeypatch):
     stage(anchor, query, fpn, metas, generator)
     assert private_calls == []
     assert len(public_calls) == 2
+
+
+def test_compact_lean_refiner_reuses_exactly_two_rfl_delta_buffers():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    observed_calls = Counter()
+    private_code = type(stage.rosa.rfl)._forward_lifted_owned_delta_inference.__code__
+    finish_code = rfl_module._mask_cast_and_add_owned_delta.__code__
+
+    def count_private_rfl(frame, event, _arg):
+        if event == "call" and frame.f_code is private_code:
+            observed_calls["private_rfl"] += 1
+        elif event == "call" and frame.f_code is finish_code:
+            observed_calls["owned_finish"] += 1
+
+    with torch.no_grad():
+        stage.rosa.rfl.output_proj.weight.normal_()
+        previous_profile = sys.getprofile()
+        sys.setprofile(count_private_rfl)
+        try:
+            stage(
+                anchor,
+                query,
+                fpn,
+                metas,
+                generator,
+                materialize_diagnostics=False,
+                return_final_anchor_only=True,
+            )
+        finally:
+            sys.setprofile(previous_profile)
+    # Fast refinement observes the base anchors once and all three candidates
+    # once, and each observation must consume exactly one owned delta.
+    assert observed_calls == Counter({"private_rfl": 2, "owned_finish": 2})
 
 
 def test_closed_loop_is_exact_native_identity_at_initialization():

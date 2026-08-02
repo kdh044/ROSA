@@ -116,6 +116,116 @@ class PointwiseROSA(nn.Module):
         *,
         observation_usage: str = "full",
     ) -> ObservationEncoding:
+        return self._forward_impl(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage=observation_usage,
+            reuse_owned_rfl_delta=False,
+        )
+
+    def _can_reuse_owned_rfl_delta(
+        self,
+        features: Tensor,
+        geometry: Tensor,
+        relation: Tensor | RayFeatureRelation,
+        valid: Tensor,
+        query: Tensor,
+        observation_usage: str,
+    ) -> bool:
+        """Recognize the hook-free compact no-grad eager observation edge."""
+
+        modules = tuple(self.modules())
+        return bool(
+            type(self) is PointwiseROSA
+            and not self.training
+            and getattr(self, "_compiled_call_impl", None) is None
+            and self.cfg.architecture_profile == "compact"
+            and self.cfg.enable_rfl
+            and observation_usage in ("base_support", "candidate")
+            and "forward" not in self.__dict__
+            and type(self).forward is _RELEASED_POINTWISE_ROSA_FORWARD
+            and "_forward_compact_lean_inference" not in self.__dict__
+            and type(self)._forward_compact_lean_inference
+            is _RELEASED_POINTWISE_ROSA_LEAN_FORWARD
+            and "_forward_impl" not in self.__dict__
+            and type(self)._forward_impl is _RELEASED_POINTWISE_ROSA_IMPL
+            and "_can_reuse_owned_rfl_delta" not in self.__dict__
+            and type(self)._can_reuse_owned_rfl_delta
+            is _RELEASED_POINTWISE_ROSA_REUSE_GUARD
+            and all(
+                type(value) is torch.Tensor
+                for value in (features, geometry, valid, query)
+            )
+            and type(relation) is RayFeatureRelation
+            and all(not module.training for module in modules)
+            and not any(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+                for module in modules
+            )
+            and not torch.nn.modules.module._global_forward_pre_hooks
+            and not torch.nn.modules.module._global_forward_hooks
+            and not torch.nn.modules.module._global_backward_pre_hooks
+            and not torch.nn.modules.module._global_backward_hooks
+            and self.rfl._can_reuse_owned_delta(features, relation)
+        )
+
+    def _forward_compact_lean_inference(
+        self,
+        features: Tensor,
+        geometry: Tensor,
+        relation: Tensor | RayFeatureRelation,
+        valid: Tensor,
+        query: Tensor,
+        *,
+        observation_usage: str,
+    ) -> ObservationEncoding:
+        """Fuse a lean observation while reusing only RFL-owned storage."""
+
+        if not self._can_reuse_owned_rfl_delta(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage,
+        ):
+            # Use Module.__call__ so every public hook and interception surface
+            # remains observable whenever any private precondition is absent.
+            return self(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage=observation_usage,
+            )
+        return self._forward_impl(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage=observation_usage,
+            reuse_owned_rfl_delta=True,
+        )
+
+    def _forward_impl(
+        self,
+        features: Tensor,
+        geometry: Tensor,
+        relation: Tensor | RayFeatureRelation,
+        valid: Tensor,
+        query: Tensor,
+        *,
+        observation_usage: str,
+        reuse_owned_rfl_delta: bool,
+    ) -> ObservationEncoding:
         if observation_usage not in ("full", "base_support", "candidate"):
             raise ValueError(f"invalid observation usage: {observation_usage!r}")
         if (
@@ -128,8 +238,14 @@ class PointwiseROSA(nn.Module):
 
         retain_auxiliary = observation_usage == "full"
         need_consistency = observation_usage in ("full", "candidate")
-        rfl_scale = 1.0 if self.cfg.enable_rfl else 0.0
-        lifted = features + rfl_scale * self.rfl(features, relation)
+        if reuse_owned_rfl_delta:
+            lifted = self.rfl._forward_lifted_owned_delta_inference(
+                features,
+                relation,
+            )
+        else:
+            rfl_scale = 1.0 if self.cfg.enable_rfl else 0.0
+            lifted = features + rfl_scale * self.rfl(features, relation)
         normalized = self.feature_norm(lifted)
         query_key = self.query_proj(query)[:, :, None, None, :]
         scoring_geometry = (
@@ -264,6 +380,12 @@ class PointwiseROSA(nn.Module):
                 else None
             ),
         )
+
+
+_RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
+_RELEASED_POINTWISE_ROSA_IMPL = PointwiseROSA._forward_impl
+_RELEASED_POINTWISE_ROSA_REUSE_GUARD = PointwiseROSA._can_reuse_owned_rfl_delta
+_RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
 
 
 __all__ = [

@@ -36,7 +36,11 @@ _LEGACY_SIGMA_POINTS = (-2.0, -1.0, 0.0, 1.0, 2.0)
 _COMPACT_SIGMA_POINTS = (-2.0, 0.0, 2.0)
 KeypointGenerator = Callable[[Tensor, Tensor], Tensor]
 _RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
+_RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
 _RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
+_RELEASED_RFL_OWNED_DELTA_FORWARD = (
+    SphericalRayFeatureLifting._forward_lifted_owned_delta_inference
+)
 
 
 @dataclass
@@ -410,9 +414,15 @@ class ROSARefiner(nn.Module):
             type(self.rosa) is PointwiseROSA
             and "forward" not in self.rosa.__dict__
             and type(self.rosa).forward is _RELEASED_POINTWISE_ROSA_FORWARD
+            and "_forward_compact_lean_inference" not in self.rosa.__dict__
+            and type(self.rosa)._forward_compact_lean_inference
+            is _RELEASED_POINTWISE_ROSA_LEAN_FORWARD
             and type(rfl) is SphericalRayFeatureLifting
             and "forward" not in rfl.__dict__
             and type(rfl).forward is _RELEASED_RFL_FORWARD
+            and "_forward_lifted_owned_delta_inference" not in rfl.__dict__
+            and type(rfl)._forward_lifted_owned_delta_inference
+            is _RELEASED_RFL_OWNED_DELTA_FORWARD
         )
         relation_modules = tuple(self.rosa.modules())
         relation_hooks_active = bool(
@@ -446,6 +456,12 @@ class ROSARefiner(nn.Module):
             and released_relation_surface
             and not relation_hooks_active
         )
+        private_rfl_buffer_inference = bool(
+            private_prepared_inference
+            and not torch.jit.is_scripting()
+            and not torch.jit.is_tracing()
+            and not torch._dynamo.is_compiling()
+        )
         sample_features = (
             _sample_multiscale_features_prepared_inference
             if private_prepared_inference
@@ -458,6 +474,15 @@ class ROSARefiner(nn.Module):
             self.sampler,
             self.level_head,
         )
+        if private_rfl_buffer_inference:
+            return self.rosa._forward_compact_lean_inference(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage=observation_usage,
+            )
         if released_relation_surface and not relation_hooks_active:
             return self.rosa(
                 features,
