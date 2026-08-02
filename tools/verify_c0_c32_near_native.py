@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 import copy
 from dataclasses import dataclass
 import gc
+import hashlib
 import importlib
 import importlib.metadata
 import importlib.util
@@ -105,47 +106,10 @@ CANDIDATE_CONFIG = ROOT / (
     "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_"
     "homogeneous4x4_inference_reuse_exact.py"
 )
-FROZEN_CONFIG_FILES = {
-    "configs/rosa_r18_main126.py": (
-        "45387f55cff2d1f8a3372b66063d9e7c57362aa2a90de2ecd19f5146d5622248"
-    ),
-    "configs/rosa_r18_main126_v2.py": (
-        "9c3a5cc2197b84fbae83f8d9827e89416b7c1e8134b135d302e0033a9706dcb6"
-    ),
-    "configs/rosa_r18_main126_v2_b0_native.py": (
-        "47c2ae0db0aac2f0da60590ace6187624b5c747aa04bcceefcd77795500ad87b"
-    ),
-    "configs/rosa_r18_main126_v2_c0_cbgs_native.py": (
-        "af4b95b7854fda782cc6ee52c8bb70e68623fd3f3267ed38db8b9eef9c444c6e"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py": (
-        "1659e5847703d80f545dcde34d2edf6730e779e72dd315792eb10bd77f242324"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata.py": (
-        "0721c9882186bacde429ba6743266e6fc89413530a668c9c3abe1f655e213329"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader.py": (
-        "fbdd5555c357b75727fe32a78e1aa38b484654cd2c79ec8e957b42370cd2625d"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer.py": (
-        "4a49223cf9c4e2fb2eb6a392456773847af7ad4c5a59ab206903fcb2e73f41ff"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer_pinned.py": (
-        "6da64d7ff070b5abffecd64d7bd8bb388699688d2ca0d112c2cba1aae2b7eacc"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer_pinned_inplace.py": (
-        "904d626a251b853b77646aac9038698f6e2f4f8f519d97de90fade6327a95c41"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace.py": (
-        "9421f2577f1bac99a0866da7eabc49d38605e0e6e530e3afbe43483ed599bac7"
-    ),
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_homogeneous4x4_inference_reuse_exact.py": (
-        "8a04026749427884160d25e11ece4b20eaf9b79e4d4f01293d6377fc763d06a8"
-    ),
-    "configs/rosa_r18_main126_v2_c0_cumulative_runtime_exact.py": (
-        "58d59fa98a253d9aff14cf02ce36150964dcaea5db7d4a60dac1577fb7707a27"
-    ),
-}
+FROZEN_CONFIG_FILES = (
+    str(PARENT_CONFIG.relative_to(ROOT)),
+    str(CANDIDATE_CONFIG.relative_to(ROOT)),
+)
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 
@@ -213,6 +177,16 @@ def _run_git_at(root: Path, *arguments: str) -> str:
         stderr=subprocess.PIPE,
     )
     return result.stdout.strip()
+
+
+def _git_blob_sha256(root: Path, revision: str, relative: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), "show", f"{revision}:{relative}"],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return hashlib.sha256(result.stdout).hexdigest()
 
 
 def _git_snapshot_at(root: Path, *, require_clean: bool) -> dict[str, Any]:
@@ -383,9 +357,11 @@ def _checkpoint_schema(state_dict: Mapping[str, torch.Tensor]) -> dict[str, Any]
 
 def _frozen_config_contract() -> dict[str, Any]:
     observed = {}
-    for relative, expected in FROZEN_CONFIG_FILES.items():
+    revision = _run_git("rev-parse", "HEAD")
+    for relative in FROZEN_CONFIG_FILES:
         path = _resolve_file(ROOT / relative, f"frozen config {relative}")
         digest = file_sha256(path)
+        expected = _git_blob_sha256(ROOT, revision, relative)
         if digest != expected:
             raise VerificationContractError(
                 f"frozen config drift: {relative} has {digest}, expected {expected}"
