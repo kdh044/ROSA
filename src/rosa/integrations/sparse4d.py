@@ -1049,7 +1049,10 @@ def _can_use_inplace_official_residual(
 
     fc_after = head.fc_after
     return bool(
-        type(head) is ROSAOfficialResidualNativeBaselineHead
+        type(head) in (
+            ROSAOfficialResidualNativeBaselineHead,
+            ROSAOfficialResidualRefinementHead,
+        )
         and head.decouple_attn is True
         and not head.training
         and not torch.is_grad_enabled()
@@ -1168,6 +1171,23 @@ class ROSAOfficialResidualNativeBaselineHead(ROSANativeBaselineHead):
         return self.fc_after(query + attention)
 
 
+@MODELS.register_module()
+class ROSAOfficialResidualRefinementHead(ROSARefinementHead):
+    """Run ROSA after the released Sparse4D attention-residual contract.
+
+    C32 established that the detector host had dropped the identity and
+    output-dropout wrapper around each native query self-attention block.
+    A ROSA comparison must retain that corrected detector rather than quietly
+    falling back to the weaker C0 port.  Reusing the already-audited method
+    adds no module, parameter, buffer, or numeric setting and keeps the ROSA
+    sidecar itself unchanged.
+    """
+
+    # Share one implementation so the native C32 and C32+ROSA arms cannot
+    # drift in residual ordering, dropout RNG consumption, or mask handling.
+    graph_model = ROSAOfficialResidualNativeBaselineHead.graph_model
+
+
 # The released configs used this type string.  It resolves to the same direct
 # Sparse4DHead subclass and does not reintroduce the V15/V17 inheritance tree.
 MODELS.register_module(name="ClosedLoopROSAHead", module=ROSARefinementHead)
@@ -1183,6 +1203,7 @@ __all__ = [
     "ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation",
     "ROSANativeBaselineHead",
     "ROSAOfficialResidualNativeBaselineHead",
+    "ROSAOfficialResidualRefinementHead",
     "ROSANormalizedKeyPointsGenerator",
     "ROSARefinementHead",
 ]

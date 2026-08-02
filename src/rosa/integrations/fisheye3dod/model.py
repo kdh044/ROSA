@@ -15,6 +15,7 @@ from projects.mmdet3d_plugin.models.sparse4d import Sparse4D
 from rosa.integrations.sparse4d import (
     ROSANativeBaselineHead,
     ROSAOfficialResidualNativeBaselineHead,
+    ROSAOfficialResidualRefinementHead,
     ROSARefinementHead,
 )
 
@@ -102,9 +103,7 @@ class Fisheye3DODSingleFrameInplaceDataPreprocessor(
         if not isinstance(img, torch.Tensor):
             raise TypeError("in-place uint8 preprocessing requires a tensor")
         if img.dtype != torch.uint8:
-            raise TypeError(
-                "in-place uint8 preprocessing requires torch.uint8 ingress"
-            )
+            raise TypeError("in-place uint8 preprocessing requires torch.uint8 ingress")
         if img.requires_grad:
             raise ValueError("image ingress must not require gradients")
         if img.ndim != 5 or img.shape[-3] != 3:
@@ -141,6 +140,7 @@ def _require_temporal_free_metadata_path(head) -> None:
     if type(head) not in (
         ROSANativeBaselineHead,
         ROSAOfficialResidualNativeBaselineHead,
+        ROSAOfficialResidualRefinementHead,
         ROSARefinementHead,
     ):
         raise TypeError(
