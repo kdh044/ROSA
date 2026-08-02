@@ -1,0 +1,86 @@
+{
+  "schema": "rosa.c32_affine_ocam_inference_storage_reuse.cpu_preflight.v1",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "parent_commit": "a0df4686573e033725d1216d73540eb883208b9b",
+  "candidate_commit": "8f208240cf75644d71db3b5adca498380b897602",
+  "change": "reuse owned Horner, pixel, normalization, and projected-output storage during no-grad affine OCam evaluation",
+  "training": "fail closed",
+  "grad_enabled_evaluation": "fail closed",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "gpu_execution": false,
+  "official_metric_execution": false,
+  "exactness": {
+    "immediate_parent": "affine_3x3 metric-gated evaluation arm",
+    "dtypes": ["torch.float16", "torch.float32", "torch.float64", "torch.bfloat16"],
+    "point_layouts": ["shared [B,N,P,3]", "camera-conditioned [B,C,N,P,3]"],
+    "horner_coefficient_counts": [1, 2, 5, 10],
+    "projection_output_raw_bit_equal": true,
+    "output_stride_equal": true,
+    "caller_inputs_unchanged": ["points", "lidar2cam", "ocam_intrinsic", "ocam_pol", "image_wh"],
+    "invalid_cases": ["NaN", "Inf", "camera origin", "absolute coordinate at least 1e4"],
+    "invalid_sentinel_raw_bit_equal": true,
+    "strict_default_path_changed": false
+  },
+  "model_identity": {
+    "state_keys": 595,
+    "parameters": 29667109,
+    "buffers": 10097,
+    "all_state_tensor_bytes_equal": true,
+    "final_rng_state_equal": true,
+    "parent_deformable_stages": 6,
+    "candidate_deformable_stages": 6,
+    "only_resolved_config_change_after_normalization": "model.head.deformable_model.type"
+  },
+  "cpu_projection_observation": {
+    "scope": "one affine CPU OCam projection; no loader, H2D, CUDA, detector, or end-to-end claim",
+    "shape": [4, 4, 300, 13],
+    "torch_threads": 1,
+    "warmup_per_arm": 60,
+    "physical_round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
+    "measured_per_arm_per_round": 300,
+    "rounds": [
+      {"round": 1, "order": "PC", "parent_median_ms": 2.3241965, "candidate_median_ms": 2.033078, "median_ratio": 0.8747444546964941, "parent_p95_ms": 2.4137281, "candidate_p95_ms": 2.09241555, "p95_ratio": 0.8668812158254279},
+      {"round": 2, "order": "CP", "parent_median_ms": 2.3273615, "candidate_median_ms": 2.0360975, "median_ratio": 0.8748522737013567, "parent_p95_ms": 2.46458525, "candidate_p95_ms": 2.09323255, "p95_ratio": 0.8493244654450479},
+      {"round": 3, "order": "PC", "parent_median_ms": 2.325844, "candidate_median_ms": 2.033183, "median_ratio": 0.8741699787260022, "parent_p95_ms": 3.57471895, "candidate_p95_ms": 3.08761805, "p95_ratio": 0.8637372876544601},
+      {"round": 4, "order": "CP", "parent_median_ms": 2.315038, "candidate_median_ms": 2.026318, "median_ratio": 0.8752849845229322, "parent_p95_ms": 2.4018236, "candidate_p95_ms": 2.0766681, "p95_ratio": 0.8646214068343737},
+      {"round": 5, "order": "PC", "parent_median_ms": 2.314232, "candidate_median_ms": 2.0261925, "median_ratio": 0.8755355988509363, "parent_p95_ms": 2.37322655, "candidate_p95_ms": 2.0676965, "p95_ratio": 0.8712596359584803},
+      {"round": 6, "order": "CP", "parent_median_ms": 2.3155785, "candidate_median_ms": 2.026348, "median_ratio": 0.8750936321096434, "parent_p95_ms": 2.51576385, "candidate_p95_ms": 2.15582895, "p95_ratio": 0.8569281850520271}
+    ],
+    "median_of_round_median_ratios": 0.8749729529055,
+    "median_of_round_p95_ratios": 0.8641793472444169,
+    "worst_round_p95_ratio": 0.8712596359584803
+  },
+  "cpu_storage_inventory": {
+    "method": "TorchDispatchMode retaining every operator output and counting unique non-input storages",
+    "parent_output_storage_bytes": 18845656,
+    "candidate_output_storage_bytes": 12106448,
+    "reduction_bytes": 6739208,
+    "reduction_fraction": 0.3576000750517785,
+    "parent_storage_count": 93,
+    "candidate_storage_count": 64,
+    "measurement_kind": "retained-output allocation inventory, not process or CUDA peak"
+  },
+  "tests": {
+    "candidate_contracts": "28 passed, 68 warnings in 3.10s",
+    "focused_projection": "85 passed, 68 warnings in 3.37s",
+    "full_cpu_suite": "278 passed, 5 skipped, 68 warnings in 16.48s",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/geometry.py": "ca3bab08d578c06d22a3f007e09680f81834dede5822a2cae17b76c708fb54cc",
+    "src/rosa/integrations/sparse4d.py": "27153a767a4af1bda93a1c5756036aaaa0ff1f1e044b7b053e40539bc21c6f3b",
+    "tests/test_ocam_inference_storage_reuse.py": "6040c1d5ce9ca90b66dd3aefa7da75a3af6e50e9a580568df02d9a09b680c015",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_affine3x3_inference_reuse_metric_gate.py": "9a7f3156de81484a4e0ef074fd2f870383844578eea7d92529164be196f25466"
+  },
+  "pending_gates": [
+    "fresh strict immediate-parent primary and replay official Main126 evaluation",
+    "fresh combined candidate primary and replay official Main126 evaluation",
+    "full validation payload, command, checkpoint, config, and result receipt closure",
+    "CUDA FP32/BF16 storage-reuse raw-bit equality",
+    "real D0-D5 mask and decoded-prediction equality",
+    "paired CUDA projection and full-test-step latency plus allocated/reserved peak-memory non-regression"
+  ]
+}
