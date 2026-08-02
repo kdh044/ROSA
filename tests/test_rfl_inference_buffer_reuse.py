@@ -67,11 +67,17 @@ def _inject_special_values(value: torch.Tensor) -> None:
     integer_view[: len(patterns)].copy_(torch.tensor(patterns, dtype=integer_dtype))
 
 
-def _rfl_fixture(dtype: torch.dtype):
+def _rfl_fixture(dtype: torch.dtype, *, factorized: bool = False):
     generator = torch.Generator().manual_seed(7101080)
-    module = SphericalRayFeatureLifting(embed_dims=8, hidden_dims=4).eval()
+    module = (
+        SphericalRayFeatureLifting.for_compact_profile(embed_dims=8)
+        if factorized
+        else SphericalRayFeatureLifting(embed_dims=8, hidden_dims=4)
+    ).eval()
     with torch.no_grad():
         module.appearance_proj.weight.normal_(generator=generator)
+        if module.ray_proj is not None:
+            module.ray_proj.weight.normal_(generator=generator)
         module.output_proj.weight.normal_(generator=generator)
     assert torch.count_nonzero(module.output_proj.weight) == (
         module.output_proj.weight.numel()
@@ -109,10 +115,12 @@ def _rfl_fixture(dtype: torch.dtype):
     "dtype",
     (torch.float16, torch.bfloat16, torch.float32, torch.float64),
 )
+@pytest.mark.parametrize("factorized", (False, True))
 def test_owned_delta_rfl_is_raw_exact_for_nonzero_weights_and_special_values(
     dtype,
+    factorized,
 ):
-    module, features, relation = _rfl_fixture(dtype)
+    module, features, relation = _rfl_fixture(dtype, factorized=factorized)
     features_before = features.clone()
     ray_before = relation.ray.clone()
     valid_before = relation.valid.clone()

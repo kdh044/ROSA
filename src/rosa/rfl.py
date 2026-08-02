@@ -392,9 +392,17 @@ class SphericalRayFeatureLifting(nn.Module):
         ) or any(tensor.device != keypoint_features.device for tensor in tensors):
             return False
 
-        modules = (self, self.feature_norm, self.appearance_proj, self.output_proj)
+        ray_projection = self.ray_proj
+        modules = (
+            self,
+            self.feature_norm,
+            self.appearance_proj,
+            self.output_proj,
+            *((ray_projection,) if ray_projection is not None else ()),
+        )
         if (
-            type(self.feature_norm) is not nn.LayerNorm
+            type(self.factorized) is not bool
+            or type(self.feature_norm) is not nn.LayerNorm
             or "forward" in self.feature_norm.__dict__
             or type(self.feature_norm).forward is not _RELEASED_LAYER_NORM_FORWARD
             or self.feature_norm.elementwise_affine
@@ -406,6 +414,16 @@ class SphericalRayFeatureLifting(nn.Module):
             or "forward" in self.output_proj.__dict__
             or type(self.output_proj).forward is not _RELEASED_LINEAR_FORWARD
             or self.output_proj.bias is not None
+            or (
+                self.factorized
+                and (
+                    type(ray_projection) is not nn.Linear
+                    or "forward" in ray_projection.__dict__
+                    or type(ray_projection).forward is not _RELEASED_LINEAR_FORWARD
+                    or ray_projection.bias is not None
+                )
+            )
+            or (not self.factorized and ray_projection is not None)
             or any(module.training for module in modules)
             or any(
                 module._forward_pre_hooks
@@ -421,7 +439,11 @@ class SphericalRayFeatureLifting(nn.Module):
         ):
             return False
 
-        weights = (self.appearance_proj.weight, self.output_proj.weight)
+        weights = (
+            self.appearance_proj.weight,
+            self.output_proj.weight,
+            *((ray_projection.weight,) if ray_projection is not None else ()),
+        )
         return bool(
             all(type(weight) is torch.nn.Parameter for weight in weights)
             and all(weight.layout == torch.strided for weight in weights)
@@ -430,8 +452,20 @@ class SphericalRayFeatureLifting(nn.Module):
             and all(weight.device == keypoint_features.device for weight in weights)
             and all(weight.dtype == torch.float32 for weight in weights)
             and self.appearance_proj.weight.shape == (self.hidden_dims, self.embed_dims)
-            and self.output_proj.weight.shape
-            == (self.embed_dims, self.num_sh_basis * self.hidden_dims)
+            and (
+                (
+                    self.factorized
+                    and ray_projection.weight.shape
+                    == (self.hidden_dims, self.num_sh_basis)
+                    and self.output_proj.weight.shape
+                    == (self.embed_dims, self.hidden_dims)
+                )
+                or (
+                    not self.factorized
+                    and self.output_proj.weight.shape
+                    == (self.embed_dims, self.num_sh_basis * self.hidden_dims)
+                )
+            )
         )
 
     def _forward_lifted_owned_delta_inference(
@@ -462,10 +496,14 @@ class SphericalRayFeatureLifting(nn.Module):
         )
         basis, valid = self.compact_basis_and_valid(relation)
         appearance = self.appearance_proj(self.feature_norm(features))
-        lifted = basis[..., :, None] * appearance[..., None, :]
-        delta = self.output_proj(lifted.flatten(start_dim=-2))
+        if self.ray_proj is None:
+            lifted = basis[..., :, None] * appearance[..., None, :]
+            lifted = lifted.flatten(start_dim=-2)
+        else:
+            lifted = appearance * self.ray_proj(basis)
+        delta = self.output_proj(lifted)
 
-        # Linear returns fresh row-major storage on the released dense path.
+        # Linear returns fresh row-major storage on either released topology.
         # Recheck that runtime fact before mutating; an unfamiliar backend
         # falls back instead of risking an alias or layout-visible change.
         if (
