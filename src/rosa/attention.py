@@ -180,6 +180,7 @@ class PointwiseROSA(nn.Module):
             observation_usage=observation_usage,
             reuse_owned_rfl_delta=False,
             reuse_owned_pointwise_storage=False,
+            use_dual_camera_logits=False,
         )
 
     def _can_reuse_owned_rfl_delta(
@@ -438,7 +439,197 @@ class PointwiseROSA(nn.Module):
             observation_usage=observation_usage,
             reuse_owned_rfl_delta=True,
             reuse_owned_pointwise_storage=pointwise_storage_reuse,
+            use_dual_camera_logits=(
+                "_can_use_dual_camera_logits" not in self.__dict__
+                and type(self)._can_use_dual_camera_logits
+                is _RELEASED_POINTWISE_ROSA_DUAL_GUARD
+                and "_dual_camera_logits_inference" not in self.__dict__
+                and type(self)._dual_camera_logits_inference
+                is _RELEASED_POINTWISE_ROSA_DUAL_LOGITS
+                and self._can_use_dual_camera_logits(
+                    features,
+                    geometry,
+                    relation,
+                    valid,
+                    query,
+                    observation_usage,
+                )
+            ),
         )
+
+    def _can_use_dual_camera_logits(
+        self,
+        features: Tensor,
+        geometry: Tensor,
+        relation: Tensor | RayFeatureRelation,
+        valid: Tensor,
+        query: Tensor,
+        observation_usage: str,
+    ) -> bool:
+        """Seal the non-bitwise dual form to released fast FP32 inference."""
+
+        if (
+            not self._can_reuse_owned_rfl_delta(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage,
+            )
+            or "_can_use_dual_camera_logits" in self.__dict__
+            or type(self)._can_use_dual_camera_logits
+            is not _RELEASED_POINTWISE_ROSA_DUAL_GUARD
+            or "_can_reuse_owned_rfl_delta" in self.__dict__
+            or type(self)._can_reuse_owned_rfl_delta
+            is not _RELEASED_POINTWISE_ROSA_REUSE_GUARD
+            or "_dual_camera_logits_inference" in self.__dict__
+            or type(self)._dual_camera_logits_inference
+            is not _RELEASED_POINTWISE_ROSA_DUAL_LOGITS
+            or "_call_impl" in self.__dict__
+            or type(self)._call_impl is not _RELEASED_MODULE_CALL_IMPL
+            or self.cfg.embed_dims != 256
+            or self.cfg.hidden_dims != 64
+            or self.cfg.num_cameras != 4
+            or self.cfg.num_keypoints != 13
+            or self.cfg.refine_topk != 50
+            or self.cfg.num_refinement_steps != 1
+            or not self.cfg.enable_rosa_geometry
+            or self.cfg.uniform_camera_fusion
+            or any(
+                type(value) is not torch.Tensor
+                for value in (features, geometry, valid, query)
+            )
+            or any(
+                value.dtype is not torch.float32
+                for value in (features, geometry, query)
+            )
+            or valid.dtype is not torch.bool
+            or features.ndim != 5
+            or features.shape[-1] != 256
+            or geometry.shape != features.shape[:-1] + (self.geometry_dims,)
+            or valid.shape != features.shape[:-1]
+            or query.shape != features.shape[:2] + (256,)
+            or any(
+                value.layout != torch.strided
+                or value.is_quantized
+                or value.device.type not in ("cpu", "cuda")
+                or not value.is_contiguous()
+                or value.requires_grad
+                or any(name is not None for name in value.names)
+                for value in (features, geometry, valid, query)
+            )
+            or any(
+                value.device != features.device for value in (geometry, valid, query)
+            )
+        ):
+            return False
+
+        if (
+            type(self.geometry_bias) is not nn.Sequential
+            or len(self.geometry_bias) != 3
+        ):
+            return False
+        geometry_hidden = self.geometry_bias[0]
+        geometry_output = self.geometry_bias[2]
+        guarded_modules = (
+            self.feature_norm,
+            self.query_proj,
+            self.key_proj,
+            self.geometry_bias,
+            geometry_hidden,
+            self.geometry_bias[1],
+            geometry_output,
+        )
+        if (
+            type(self.feature_norm) is not nn.LayerNorm
+            or type(self.feature_norm).forward is not _RELEASED_LAYER_NORM_FORWARD
+            or self.feature_norm.normalized_shape != (256,)
+            or not self.feature_norm.elementwise_affine
+            or type(self.query_proj) is not nn.Linear
+            or type(self.query_proj).forward is not _RELEASED_LINEAR_FORWARD
+            or self.query_proj.bias is not None
+            or type(self.key_proj) is not nn.Linear
+            or type(self.key_proj).forward is not _RELEASED_LINEAR_FORWARD
+            or self.key_proj.bias is not None
+            or type(self.geometry_bias).forward is not _RELEASED_SEQUENTIAL_FORWARD
+            or type(geometry_hidden) is not nn.Linear
+            or type(geometry_hidden).forward is not _RELEASED_LINEAR_FORWARD
+            or type(self.geometry_bias[1]) is not nn.SiLU
+            or type(self.geometry_bias[1]).forward is not _RELEASED_SILU_FORWARD
+            or type(geometry_output) is not nn.Linear
+            or type(geometry_output).forward is not _RELEASED_LINEAR_FORWARD
+            or any("forward" in module.__dict__ for module in guarded_modules)
+            or any("_call_impl" in module.__dict__ for module in guarded_modules)
+            or any(
+                type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
+                for module in guarded_modules
+            )
+            or any(
+                getattr(module, "_compiled_call_impl", None) is not None
+                for module in guarded_modules
+            )
+        ):
+            return False
+
+        parameters = (
+            self.feature_norm.weight,
+            self.feature_norm.bias,
+            self.query_proj.weight,
+            self.key_proj.weight,
+            geometry_hidden.weight,
+            geometry_hidden.bias,
+            geometry_output.weight,
+            geometry_output.bias,
+        )
+        return bool(
+            all(type(parameter) is torch.nn.Parameter for parameter in parameters)
+            and all(parameter.layout == torch.strided for parameter in parameters)
+            and all(not parameter.is_quantized for parameter in parameters)
+            and all(parameter.is_contiguous() for parameter in parameters)
+            and all(parameter.device == features.device for parameter in parameters)
+            and all(parameter.dtype is torch.float32 for parameter in parameters)
+            and all(
+                all(name is None for name in parameter.names)
+                for parameter in parameters
+            )
+            and self.feature_norm.weight.shape == (256,)
+            and self.feature_norm.bias.shape == (256,)
+            and self.query_proj.weight.shape == (64, 256)
+            and self.key_proj.weight.shape == (64, 270)
+            and geometry_hidden.weight.shape == (64, 14)
+            and geometry_hidden.bias.shape == (64,)
+            and geometry_output.weight.shape == (1, 64)
+            and geometry_output.bias.shape == (1,)
+        )
+
+    def _dual_camera_logits_inference(
+        self,
+        normalized: Tensor,
+        scoring_geometry: Tensor,
+        query_key: Tensor,
+    ) -> Tensor:
+        """Evaluate ``q @ W @ x`` without one projected key per observation.
+
+        This changes floating-point reduction order and is intentionally not a
+        bit-exact rewrite.  Its caller admits only the sealed FP32 fast-eager
+        edge; every public or interceptable execution keeps the released form.
+        """
+
+        dual_query = torch.matmul(query_key, self.key_proj.weight)
+        appearance_query = dual_query[..., : self.cfg.embed_dims]
+        geometry_query = dual_query[..., self.cfg.embed_dims :]
+        appearance_logits = torch.einsum(
+            "bncpd,bnd->bncp",
+            normalized,
+            appearance_query,
+        )
+        geometry_logits = torch.einsum(
+            "bncpg,bng->bncp",
+            scoring_geometry,
+            geometry_query,
+        )
+        return appearance_logits + geometry_logits
 
     def _forward_impl(
         self,
@@ -451,7 +642,28 @@ class PointwiseROSA(nn.Module):
         observation_usage: str,
         reuse_owned_rfl_delta: bool,
         reuse_owned_pointwise_storage: bool,
+        use_dual_camera_logits: bool,
     ) -> ObservationEncoding:
+        if not isinstance(use_dual_camera_logits, bool):
+            raise TypeError("use_dual_camera_logits must be a bool")
+        if use_dual_camera_logits:
+            released_dual_surface = bool(
+                "_can_use_dual_camera_logits" not in self.__dict__
+                and type(self)._can_use_dual_camera_logits
+                is _RELEASED_POINTWISE_ROSA_DUAL_GUARD
+                and "_dual_camera_logits_inference" not in self.__dict__
+                and type(self)._dual_camera_logits_inference
+                is _RELEASED_POINTWISE_ROSA_DUAL_LOGITS
+            )
+            if not released_dual_surface or not self._can_use_dual_camera_logits(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage,
+            ):
+                use_dual_camera_logits = False
         if observation_usage not in ("full", "base_support", "candidate"):
             raise ValueError(f"invalid observation usage: {observation_usage!r}")
         if (
@@ -493,18 +705,25 @@ class PointwiseROSA(nn.Module):
         scoring_geometry = (
             geometry if self.cfg.enable_rosa_geometry else torch.zeros_like(geometry)
         )
-        camera_key = self.key_proj(torch.cat((normalized, scoring_geometry), dim=-1))
-        if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
-            camera_key,
-            shape=features.shape[:-1] + (self.cfg.hidden_dims,),
-            device=features.device,
-            protected=(lifted, normalized, scoring_geometry, query_key),
-        ):
-            torch.mul(query_key, camera_key, out=camera_key)
-            logits = camera_key.sum(dim=-1)
+        if use_dual_camera_logits:
+            logits = self._dual_camera_logits_inference(
+                normalized,
+                scoring_geometry,
+                query_key.squeeze(2).squeeze(2),
+            )
         else:
-            reuse_owned_pointwise_storage = False
-            logits = (query_key * camera_key).sum(dim=-1)
+            camera_key = self.key_proj(torch.cat((normalized, scoring_geometry), dim=-1))
+            if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
+                camera_key,
+                shape=features.shape[:-1] + (self.cfg.hidden_dims,),
+                device=features.device,
+                protected=(lifted, normalized, scoring_geometry, query_key),
+            ):
+                torch.mul(query_key, camera_key, out=camera_key)
+                logits = camera_key.sum(dim=-1)
+            else:
+                reuse_owned_pointwise_storage = False
+                logits = (query_key * camera_key).sum(dim=-1)
         logits = logits / math.sqrt(self.cfg.hidden_dims)
         logits = logits + self.geometry_bias(scoring_geometry).squeeze(-1)
         if self.cfg.uniform_camera_fusion:
@@ -709,6 +928,13 @@ _RELEASED_POINTWISE_ROSA_STORAGE_GUARD = (
     PointwiseROSA._can_reuse_owned_pointwise_storage
 )
 _RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
+_RELEASED_POINTWISE_ROSA_DUAL_GUARD = PointwiseROSA._can_use_dual_camera_logits
+_RELEASED_POINTWISE_ROSA_DUAL_LOGITS = PointwiseROSA._dual_camera_logits_inference
+_RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
+_RELEASED_LINEAR_FORWARD = nn.Linear.forward
+_RELEASED_LAYER_NORM_FORWARD = nn.LayerNorm.forward
+_RELEASED_SEQUENTIAL_FORWARD = nn.Sequential.forward
+_RELEASED_SILU_FORWARD = nn.SiLU.forward
 
 
 __all__ = [
