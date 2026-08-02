@@ -175,6 +175,78 @@ def test_c32_matches_the_released_mmcv_wrapper_and_preserves_state() -> None:
         )
         assert actual_eval.shape == query_feature.shape
 
+        import rosa.integrations.sparse4d as rosa_sparse4d
+        original_inplace_guard = (
+            rosa_sparse4d._can_use_inplace_official_residual
+        )
+        inplace_guard_results = []
+
+        def recorded_inplace_guard(*args, **kwargs):
+            result = original_inplace_guard(*args, **kwargs)
+            inplace_guard_results.append(result)
+            return result
+
+        rosa_sparse4d._can_use_inplace_official_residual = (
+            recorded_inplace_guard
+        )
+        try:
+            with torch.inference_mode():
+                expected_inference = candidate.head.fc_after(
+                    released(
+                        decoupled_query,
+                        value=decoupled_value,
+                        attn_mask=None,
+                    )
+                )
+                actual_inference = candidate.head.graph_model(
+                    index,
+                    query_feature,
+                    value=query_feature,
+                    query_pos=query_position,
+                    attn_mask=None,
+                )
+        finally:
+            rosa_sparse4d._can_use_inplace_official_residual = (
+                original_inplace_guard
+            )
+        torch.testing.assert_close(
+            actual_inference,
+            expected_inference,
+            rtol=0,
+            atol=0,
+        )
+        assert inplace_guard_results == [True]
+
+        with torch.inference_mode():
+            owned_query = decoupled_query.clone()
+            attention = torch.zeros_like(owned_query)
+            assert original_inplace_guard(
+                candidate.head,
+                layer,
+                owned_query,
+                attention,
+            ) is True
+            hook = layer.register_forward_hook(lambda *args: None)
+            try:
+                assert original_inplace_guard(
+                    candidate.head,
+                    layer,
+                    owned_query,
+                    attention,
+                ) is False
+            finally:
+                hook.remove()
+            layer.forward = lambda *args, **kwargs: (owned_query, None)
+            try:
+                assert original_inplace_guard(
+                    candidate.head,
+                    layer,
+                    owned_query,
+                    attention,
+                ) is False
+            finally:
+                del layer.forward
+
         baseline.eval()
         current_port = baseline.head.graph_model(
             index,

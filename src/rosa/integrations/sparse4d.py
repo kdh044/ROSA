@@ -61,6 +61,7 @@ from .sparse4d_scores import (
 _NATIVE_DECODERS = 6
 _NATIVE_FINAL = 5
 _ROSA_OUTPUT = 6
+_RELEASED_MHA_FORWARD = torch.nn.MultiheadAttention.forward
 _HOST_CONTROL_DEFAULTS = {
     "max_temporal_gnn_interactions": 0,
     "cache_decoder_index": _NATIVE_FINAL,
@@ -868,6 +869,47 @@ class ROSANativeBaselineHead(Sparse4DHead):
         super().__init__(**kwargs)
 
 
+def _can_use_inplace_official_residual(
+    head,
+    layer,
+    query: Tensor,
+    attention: Tensor,
+) -> bool:
+    """Match the exact no-grad surface where the decoupled query is owned."""
+
+    return bool(
+        type(head) is ROSAOfficialResidualNativeBaselineHead
+        and head.decouple_attn is True
+        and not head.training
+        and not torch.is_grad_enabled()
+        and type(layer) is torch.nn.MultiheadAttention
+        and "forward" not in layer.__dict__
+        and type(layer).forward is _RELEASED_MHA_FORWARD
+        and not layer.training
+        and not layer._forward_hooks
+        and not layer._forward_pre_hooks
+        and not layer._backward_hooks
+        and not layer._backward_pre_hooks
+        and not torch.nn.modules.module._global_forward_hooks
+        and not torch.nn.modules.module._global_forward_pre_hooks
+        and not torch.nn.modules.module._global_backward_hooks
+        and not torch.nn.modules.module._global_backward_pre_hooks
+        and type(query) is torch.Tensor
+        and type(attention) is torch.Tensor
+        and query.layout == torch.strided
+        and attention.layout == torch.strided
+        and not query.is_quantized
+        and not attention.is_quantized
+        and query.device.type != "meta"
+        and query.device == attention.device
+        and query.dtype == attention.dtype
+        and query.shape == attention.shape
+        and query._base is None
+        and all(name is None for name in query.names)
+        and all(name is None for name in attention.names)
+    )
+
+
 @MODELS.register_module()
 class ROSAOfficialResidualNativeBaselineHead(ROSANativeBaselineHead):
     """Restore Sparse4D's released residual around query self-attention.
@@ -937,6 +979,13 @@ class ROSAOfficialResidualNativeBaselineHead(ROSANativeBaselineHead):
             p=float(layer.dropout),
             training=self.training,
         )
+        if _can_use_inplace_official_residual(self, layer, query, attention):
+            # ``query`` is the owned result of ``torch.cat`` on the sealed
+            # decoupled-attention path.  Reusing it removes one [B,N,2D]
+            # allocation per GNN stage without touching training/autograd or
+            # hook-observable execution.
+            query.add_(attention)
+            return self.fc_after(query)
         return self.fc_after(query + attention)
 
 
