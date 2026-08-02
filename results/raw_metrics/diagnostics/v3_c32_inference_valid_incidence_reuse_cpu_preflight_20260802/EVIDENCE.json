@@ -1,0 +1,100 @@
+{
+  "schema": "rosa.c32_inference_valid_incidence_reuse.cpu_preflight.v3",
+  "status": "AUTHOR_CPU_PREFLIGHT_NOT_ADOPTED",
+  "semantic_parent_commit": "d3e7982b72fa42f6cc7dbfaa8e1733f4fd49d146",
+  "candidate_code_commit": "fc3eef9b47a22c3b74e9ee1a05933fa9a472ba1a",
+  "candidate_code_tree": "137b07e966fe88637077daaf534f11e3c6e20f06",
+  "change": "reuse dead owned theta storage for incidence and accumulate validity predicates into the owned geometry-valid mask",
+  "training": "unchanged; inference-reuse module remains evaluation-only",
+  "grad_enabled_evaluation": "fail closed",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "gpu_execution": false,
+  "official_metric_execution": false,
+  "exactness": {
+    "randomized_mixed_cases": 512,
+    "dtypes": ["float16", "float32", "float64", "bfloat16"],
+    "point_layouts": ["shared", "camera_conditioned"],
+    "transforms": ["homogeneous_4x4", "affine_3x3"],
+    "contracts": ["legacy_front_only", "full_fov"],
+    "noncontiguous_empty_mixed_dtype_invalid_inputs_covered": true,
+    "output_dtype_shape_stride_and_raw_bit_equal": true,
+    "caller_values_version_counters_and_storage_identity_unchanged": true
+  },
+  "model_identity": {
+    "state_keys": 595,
+    "parameter_tensors": 535,
+    "parameters": 29667109,
+    "buffer_tensors": 99,
+    "buffer_elements": 10097,
+    "state_sha256": "56a5e11a119922ed4946501cd13ded1f92e4d138a72ab9aafc7ada738cbe78de",
+    "all_state_tensor_bytes_equal": true,
+    "python_numpy_torch_rng_equal": true,
+    "strict_load_equal": true
+  },
+  "operator_contract": {
+    "parent_atan2_default": 2,
+    "candidate_atan2_default": 1,
+    "candidate_atan2_out": 1,
+    "candidate_full_fov_logical_and_inplace": 7,
+    "candidate_legacy_logical_and_inplace": 8
+  },
+  "cpu_storage_inventory": {
+    "shape": [4, 4, 300, 13],
+    "method": "TorchDispatchMode retaining every operator output and counting unique non-input storages",
+    "parent_output_storage_bytes": 10047240,
+    "candidate_output_storage_bytes": 9360840,
+    "incremental_reduction_bytes": 686400,
+    "incremental_reduction_fraction": 0.06831726922020376,
+    "parent_storage_count": 57,
+    "candidate_storage_count": 49,
+    "cumulative_reduction_vs_unreused_affine_bytes": 9484816,
+    "cumulative_reduction_vs_unreused_affine_fraction": 0.5032892460734718,
+    "measurement_kind": "retained-output allocation inventory, not process or CUDA peak"
+  },
+  "author_cpu_component_observation": {
+    "scope": "one affine CPU OCam projection only",
+    "torch_threads": 1,
+    "warmup_per_arm": 60,
+    "measurements_per_arm_per_round": 300,
+    "round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
+    "round_median_ratios": [
+      0.995787291921234,
+      0.994138974247029,
+      0.9947317240950218,
+      0.9950158473637404,
+      0.9907046702105207,
+      0.9972558766028303
+    ],
+    "round_p95_ratios": [
+      0.9888076061804364,
+      0.9901873271875062,
+      0.9765923127576326,
+      0.994425640666622,
+      0.9894555862810402,
+      0.998928340088335
+    ],
+    "median_of_round_median_ratios": 0.994873785729381,
+    "median_of_round_p95_ratios": 0.9898214567342732,
+    "worst_round_p95_ratio": 0.998928340088335,
+    "whole_detector_speed_claim": false
+  },
+  "tests": {
+    "focused_geometry": "108 passed",
+    "full_cpu_suite": "296 passed, 5 optional-host skipped",
+    "cuda_queried": false
+  },
+  "source_sha256": {
+    "src/rosa/geometry.py": "d35b51d60bb38ed1de06e1719614e16b7f230743144d4e9ef3697a04759ba610",
+    "tests/test_ocam_inference_storage_reuse.py": "4f92ad9aa8f60f76149fee9f7a95f22f89f8fa88b64a0d520f53df0e3182da1a"
+  },
+  "pending_gates": [
+    "independent CPU source, exactness, allocation, state, and evidence audit",
+    "CUDA FP32/BF16 raw-bit projection equality",
+    "real D0-D5 and decoded-output parity",
+    "official Main126 primary/replay metric closure",
+    "paired full-test-step CUDA median, p95, allocated, and reserved memory"
+  ]
+}
