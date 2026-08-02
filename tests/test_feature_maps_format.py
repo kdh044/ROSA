@@ -92,10 +92,14 @@ def test_single_copy_layout_is_raw_exact(dtype, noncontiguous):
     expected = _historical_feature_maps_format(features)
     actual = feature_maps_format(features)
 
-    for candidate, parent in zip(actual, expected):
-        assert torch.equal(candidate, parent)
+    assert torch.equal(actual[0], expected[0])
+    assert actual[0].shape == expected[0].shape
+    assert actual[0].dtype == expected[0].dtype
+    assert actual[0].stride() == expected[0].stride()
+    for candidate, parent in zip(actual[1:], expected[1:]):
+        assert candidate.dtype == torch.int32
+        assert torch.equal(candidate, parent.to(torch.int32))
         assert candidate.shape == parent.shape
-        assert candidate.dtype == parent.dtype
         assert candidate.stride() == parent.stride()
     assert actual[0].is_contiguous()
 
@@ -127,8 +131,10 @@ def test_single_copy_layout_preserves_nested_feature_groups():
     second = [value.mul(0.5) for value in _features()]
     expected = _historical_feature_maps_format([first, second])
     actual = feature_maps_format([first, second])
-    for candidate, parent in zip(actual, expected):
-        assert torch.equal(candidate, parent)
+    assert torch.equal(actual[0], expected[0])
+    for candidate, parent in zip(actual[1:], expected[1:]):
+        assert candidate.dtype == torch.int32
+        assert torch.equal(candidate, parent.to(torch.int32))
         assert candidate.stride() == parent.stride()
 
 
@@ -198,3 +204,15 @@ def test_single_copy_layout_removes_one_full_feature_storage():
     assert counts == [2, 1]
     production_bytes = 4 * 4 * 256 * 53_125 * 4
     assert production_bytes == 870_400_000
+
+
+def test_fused_daf_int32_conversion_reuses_preformatted_metadata_storage():
+    formatted = feature_maps_format(_features())
+    _, spatial_shapes, starts = formatted
+    assert spatial_shapes.dtype == starts.dtype == torch.int32
+    assert spatial_shapes.is_contiguous() and starts.is_contiguous()
+    # These are the exact conversions at every fused-DAF boundary.  When the
+    # formatter already emits contiguous int32, both operations are aliases
+    # instead of allocating and launching dtype-conversion work.
+    assert spatial_shapes.contiguous().int() is spatial_shapes
+    assert starts.contiguous().int() is starts
