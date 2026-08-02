@@ -268,6 +268,45 @@ def test_nvidia_smi_snapshot_uses_canonical_lower_selector(monkeypatch) -> None:
     assert all(command[1] == f"--id={canonical}" for command in commands)
 
 
+def test_logical_device_identity_accepts_torch_cuuid_wrapper() -> None:
+    TorchCUuuid = type(
+        "_CUuuid",
+        (),
+        {
+            "__module__": "torch._C",
+            "__str__": lambda self: "E79E0304-D240-431B-F05F-7F3A67933B97",
+        },
+    )
+
+    class FakeCuda:
+        @staticmethod
+        def get_device_properties(device):
+            del device
+            return SimpleNamespace(uuid=TorchCUuuid(), name="NVIDIA GPU")
+
+    device = SimpleNamespace(index=0)
+    identity = tool._logical_device_identity(SimpleNamespace(cuda=FakeCuda()), device)
+
+    assert identity["gpu_uuid"] == "GPU-e79e0304-d240-431b-f05f-7f3a67933b97"
+
+
+def test_logical_device_identity_rejects_arbitrary_stringable_uuid() -> None:
+    class StringableUuid:
+        def __str__(self):
+            return "e79e0304-d240-431b-f05f-7f3a67933b97"
+
+    class FakeCuda:
+        @staticmethod
+        def get_device_properties(device):
+            del device
+            return SimpleNamespace(uuid=StringableUuid(), name="NVIDIA GPU")
+
+    with pytest.raises(tool.ProtocolError, match="did not expose a GPU UUID"):
+        tool._logical_device_identity(
+            SimpleNamespace(cuda=FakeCuda()), SimpleNamespace(index=0)
+        )
+
+
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:
     class FakeCuda:
         @staticmethod

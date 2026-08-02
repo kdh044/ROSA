@@ -799,10 +799,23 @@ def _normalize_gpu_uuid(value: Any) -> str:
 
 def _logical_device_identity(torch, device) -> dict[str, Any]:
     properties = torch.cuda.get_device_properties(device)
+    raw_uuid = getattr(properties, "uuid", None)
+    if not isinstance(raw_uuid, (str, bytes)):
+        uuid_type = type(raw_uuid)
+        if (uuid_type.__module__, uuid_type.__name__) != (
+            "torch._C",
+            "_CUuuid",
+        ):
+            raise ProtocolError("Torch device properties did not expose a GPU UUID")
+        # PyTorch 2.11 exposes UUID as a private immutable ``_CUuuid`` value.
+        # Its string representation is the CUDA UUID suffix printed in the
+        # device-properties repr.  Convert only that exact Torch-owned type;
+        # accepting arbitrary ``__str__`` objects would weaken attestation.
+        raw_uuid = str(raw_uuid)
     return {
         "logical_device": str(device),
         "logical_index": device.index,
-        "gpu_uuid": _normalize_gpu_uuid(getattr(properties, "uuid", None)),
+        "gpu_uuid": _normalize_gpu_uuid(raw_uuid),
         "torch_name": properties.name,
     }
 
