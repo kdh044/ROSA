@@ -1194,7 +1194,13 @@ def _ephemeral_id_counter_contract(
     *,
     expected_invocations: int,
 ) -> dict[str, Any]:
-    """Attest the expected non-temporal ID counter separately from caches."""
+    """Attest the latest non-temporal invocation separately from caches.
+
+    With ``num_temp_instances == 0``, ``InstanceBank.get`` enters its empty-
+    cache branch and calls ``reset`` at the start of every detector invocation.
+    Consequently ``prev_id`` describes the latest batch, not a cumulative
+    count across repeated benchmark invocations.
+    """
 
     bank = getattr(getattr(model, "head", None), "instance_bank", None)
     if bank is None or getattr(bank, "num_temp_instances", None) != 0:
@@ -1204,7 +1210,15 @@ def _ephemeral_id_counter_contract(
     num_anchor = getattr(bank, "num_anchor", None)
     if type(num_anchor) is not int or num_anchor <= 0:
         raise VerificationContractError("instance bank has an invalid anchor count")
-    expected = expected_invocations * EXPECTED_BATCH_SIZE * num_anchor
+    if type(expected_invocations) is not int or expected_invocations < 0:
+        raise VerificationContractError(
+            "expected invocations must be a non-negative exact integer"
+        )
+    expected = (
+        0
+        if expected_invocations == 0
+        else EXPECTED_BATCH_SIZE * num_anchor
+    )
     value = getattr(bank, "prev_id", None)
     if expected == 0:
         if type(value) is not int or value != 0:
@@ -1238,6 +1252,11 @@ def _ephemeral_id_counter_contract(
         "observed_value": observed,
         "value_type": value_type,
         "value_device": value_device,
+        "counter_scope": (
+            "reset_state_before_any_invocation"
+            if expected_invocations == 0
+            else "latest_invocation_after_internal_reset"
+        ),
         "persistent_temporal_state": False,
     }
 

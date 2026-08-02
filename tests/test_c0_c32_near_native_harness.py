@@ -447,14 +447,25 @@ def test_ephemeral_id_counter_is_attested_outside_persistent_state() -> None:
         expected_invocations=0,
     )
     assert reset["observed_value"] == 0
+    assert reset["counter_scope"] == "reset_state_before_any_invocation"
     bank.prev_id = torch.tensor(1200, dtype=torch.long)
     advanced = verify_tool._ephemeral_id_counter_contract(
         model,
         expected_invocations=1,
     )
     assert advanced["observed_value"] == 1200
-    assert "prev_id" not in verify_tool._runtime_state_snapshot(model)
-    with pytest.raises(VerificationContractError, match="expected 2400"):
+    assert advanced["counter_scope"] == "latest_invocation_after_internal_reset"
+    assert all(
+        not key.endswith(".prev_id")
+        for key in verify_tool._runtime_state_snapshot(model)
+    )
+    repeated = verify_tool._ephemeral_id_counter_contract(
+        model,
+        expected_invocations=2,
+    )
+    assert repeated["observed_value"] == 1200
+    bank.prev_id = torch.tensor(2400, dtype=torch.long)
+    with pytest.raises(VerificationContractError, match="expected 1200"):
         verify_tool._ephemeral_id_counter_contract(
             model,
             expected_invocations=2,
@@ -496,8 +507,13 @@ def test_runtime_state_snapshot_tracks_instance_bank_cache_diagnostics() -> None
         f"head.instance_bank.{name}"
         for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS
     }
+    expected_key_order = tuple(
+        f"head.instance_bank.{name}"
+        for name in verify_tool.PERSISTENT_RUNTIME_STATE_FIELDS
+    )
+    assert tuple(before) == expected_key_order
+    assert tuple(after) == expected_key_order
     assert set(before) == expected_keys
-    assert set(after) == expected_keys
     assert after != before
 
 
