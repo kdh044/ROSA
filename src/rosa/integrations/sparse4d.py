@@ -156,6 +156,8 @@ class ROSANormalizedKeyPointsGenerator(SparseBox3DKeyPointsGenerator):
 class ROSAFullFOVDeformableFeatureAggregation(DeformableFeatureAggregation):
     """Use the declared OCam lens cone in every native decoder block."""
 
+    camera_transform = "homogeneous_4x4"
+
     def __init__(self, *args, projection_type: str = "ocam_fisheye", **kwargs):
         if projection_type != "ocam_fisheye":
             raise ValueError(
@@ -182,6 +184,35 @@ class ROSAFullFOVDeformableFeatureAggregation(DeformableFeatureAggregation):
             metas,
             image_wh,
             contract="full_fov",
+            camera_transform=self.camera_transform,
+        )
+
+
+@MODELS.register_module()
+class ROSAMetricGatedAffine3x3FullFOVDeformableFeatureAggregation(
+    ROSAFullFOVDeformableFeatureAggregation
+):
+    """Evaluation-only affine port pending official Main126 metric parity."""
+
+    camera_transform = "affine_3x3"
+
+    def project_points(
+        self,
+        key_points: Tensor,
+        projection_mat: Tensor,
+        image_wh: Tensor | None = None,
+        metas: dict | None = None,
+    ) -> Tensor:
+        if self.training:
+            raise RuntimeError(
+                "the affine 3x3 OCam port is evaluation-only until official "
+                "Main126 metric parity is proven"
+            )
+        return super().project_points(
+            key_points,
+            projection_mat,
+            image_wh=image_wh,
+            metas=metas,
         )
 
 
@@ -876,6 +907,7 @@ __all__ = [
     "ClosedLoopROSAHead",
     "ROSAEvaluatorAlignedSparseBox3DLoss",
     "ROSAFullFOVDeformableFeatureAggregation",
+    "ROSAMetricGatedAffine3x3FullFOVDeformableFeatureAggregation",
     "ROSANativeBaselineHead",
     "ROSAOfficialResidualNativeBaselineHead",
     "ROSANormalizedKeyPointsGenerator",

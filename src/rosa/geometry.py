@@ -35,9 +35,7 @@ def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
                 "camera-conditioned points must be [B,C,N,P,3] with the "
                 "same camera count as lidar2cam"
             )
-        # Preserve the historical 4x4 matmul shape and arithmetic exactly,
-        # while constructing the constant homogeneous coordinate in one
-        # allocation instead of allocating ``ones_like`` and then ``cat``.
+        # Keep the historical reduction order as the default exact path.
         homogeneous = F.pad(points, (0, 1), mode="constant", value=1.0)
         return torch.matmul(
             lidar2cam[:, :, None, None],
@@ -50,6 +48,43 @@ def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
         lidar2cam[:, :, None, None],
         homogeneous[:, None, ..., None],
     ).squeeze(-1)[..., :3]
+
+
+def _camera_xyz_affine(points: Tensor, lidar2cam: Tensor) -> Tensor:
+    """Evaluate the same rigid transform with a tolerance-gated 3x3 path."""
+
+    if lidar2cam.ndim != 4 or lidar2cam.shape[-2:] != (4, 4):
+        raise ValueError("lidar2cam must be [B,C,4,4]")
+    if points.shape[-1] != 3:
+        raise ValueError("points must end in XYZ coordinates")
+    batch, cameras = lidar2cam.shape[:2]
+    rotation = lidar2cam[..., :3, :3]
+    if points.ndim == 5:
+        if points.shape[1] != cameras:
+            raise ValueError(
+                "camera-conditioned points must be [B,C,N,P,3] with the "
+                "same camera count as lidar2cam"
+            )
+        rotated = torch.bmm(
+            rotation.reshape(batch * cameras, 3, 3),
+            points.reshape(batch * cameras, -1, 3).transpose(1, 2),
+        )
+    else:
+        if points.ndim != 4:
+            raise ValueError("points must be [B,N,P,3] or [B,C,N,P,3]")
+        rotated = torch.bmm(
+            rotation.reshape(batch, cameras * 3, 3),
+            points.reshape(batch, -1, 3).transpose(1, 2),
+        )
+    camera_xyz = rotated.reshape(
+        batch,
+        cameras,
+        3,
+        points.shape[-3],
+        points.shape[-2],
+    ).movedim(2, -1)
+    # ``camera_xyz`` owns fresh bmm storage, so translation needs no new output.
+    return camera_xyz.add_(lidar2cam[..., :3, 3][:, :, None, None, :])
 
 
 def _sanitize_camera_xyz(camera_xyz: Tensor) -> tuple[Tensor, Tensor]:
@@ -96,6 +131,7 @@ def ocam_project_points(
     image_wh: Tensor,
     *,
     contract: str = "legacy_front_only",
+    camera_transform: str = "homogeneous_4x4",
 ) -> Tensor:
     """Project lidar-frame points to normalized native-fisheye pixels.
 
@@ -117,7 +153,12 @@ def ocam_project_points(
     if image_wh.shape != lidar2cam.shape[:2] + (2,):
         raise ValueError("image_wh must be [B,C,2]")
 
-    camera_xyz = _camera_xyz(points, lidar2cam)
+    if camera_transform == "homogeneous_4x4":
+        camera_xyz = _camera_xyz(points, lidar2cam)
+    elif camera_transform == "affine_3x3":
+        camera_xyz = _camera_xyz_affine(points, lidar2cam)
+    else:
+        raise ValueError(f"unknown OCam camera transform: {camera_transform}")
     safe_xyz, geometry_valid = _sanitize_camera_xyz(camera_xyz)
     x, y, z = safe_xyz.unbind(dim=-1)
     planar_norm = torch.sqrt(x.square() + y.square() + 1e-12)
