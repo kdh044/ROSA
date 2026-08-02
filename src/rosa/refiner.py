@@ -1060,11 +1060,15 @@ class ROSARefiner(nn.Module):
                 "final-anchor-only inference cannot materialize diagnostics"
             )
         if return_final_anchor_only and (
-            self.training or torch.is_grad_enabled() or self.cfg.enable_quality_score
+            self.training
+            or torch.is_grad_enabled()
+            or self.cfg.architecture_profile != "compact"
+            or self.cfg.enable_quality_score
+            or self.quality_head is not None
         ):
             raise RuntimeError(
-                "final-anchor-only output requires no-grad eval with quality "
-                "refinement disabled"
+                "final-anchor-only output requires compact no-grad eval with "
+                "no quality head"
             )
         base = baseline_anchor.detach()
         query_sidecar = query.detach()
@@ -1235,6 +1239,11 @@ class ROSARefiner(nn.Module):
             ),
         )
 
+
+# Capture the released call surface in the defining module.  Importers can
+# therefore detect a class-level forward override even when it happened before
+# the optional Sparse4D integration itself was imported.
+_RELEASED_ROSA_REFINER_FORWARD = ROSARefiner.forward
 
 ClosedLoopROSAConfig = ROSAConfig
 ClosedLoopROSAStage = ROSARefiner

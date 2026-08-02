@@ -12,6 +12,17 @@ from rosa.refiner import (
 )
 
 
+def _raw_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+    return bool(
+        left.dtype == right.dtype
+        and left.shape == right.shape
+        and torch.equal(
+            left.detach().contiguous().view(torch.uint8),
+            right.detach().contiguous().view(torch.uint8),
+        )
+    )
+
+
 def _fixture(cfg=None):
     cfg = cfg or ROSAConfig(embed_dims=16, hidden_dims=8)
     stage = ROSARefiner(cfg, "ocam_fisheye")
@@ -558,7 +569,7 @@ def test_fast_final_anchor_only_is_raw_exact_and_skips_return_postprocessing(
         minimal_call_count = len(calls) - full_call_count
 
     assert torch.is_tensor(final_anchor)
-    assert torch.equal(final_anchor, full.final_anchor)
+    assert _raw_equal(final_anchor, full.final_anchor)
     assert torch.equal(torch.get_rng_state(), rng_before)
     assert minimal_call_count + 1 == full_call_count
 
@@ -596,6 +607,31 @@ def test_final_anchor_only_rejects_training_or_full_diagnostics():
         )
 
 
+def test_final_anchor_only_rejects_legacy_quality_head_even_when_score_is_disabled():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "published",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "enable_quality_score": False,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    assert stage.quality_head is not None
+    stage.eval()
+
+    with torch.no_grad(), pytest.raises(RuntimeError, match="no quality head"):
+        stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+
 def test_fast_final_anchor_only_is_one_full_compiled_graph():
     cfg = ROSAConfig.from_mapping(
         {
@@ -606,29 +642,36 @@ def test_fast_final_anchor_only_is_one_full_compiled_graph():
     )
     stage, anchor, query, fpn, metas, generator = _fixture(cfg)
     stage.eval()
-    compiled = torch.compile(stage, backend="eager", fullgraph=True)
+    parameter_generator = torch.Generator().manual_seed(271828)
+    with torch.no_grad():
+        for parameter in stage.parameters():
+            parameter.uniform_(-0.05, 0.05, generator=parameter_generator)
+
+    def full_anchor(*args):
+        return stage(*args, materialize_diagnostics=False).final_anchor
+
+    def minimal_anchor(*args):
+        return stage(
+            *args,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+    compiled_full = torch.compile(full_anchor, backend="eager", fullgraph=True)
+    compiled_minimal = torch.compile(minimal_anchor, backend="eager", fullgraph=True)
+    inputs = (anchor, query, fpn, metas, generator)
 
     with torch.no_grad():
-        expected = stage(
-            anchor,
-            query,
-            fpn,
-            metas,
-            generator,
-            materialize_diagnostics=False,
-            return_final_anchor_only=True,
-        )
-        actual = compiled(
-            anchor,
-            query,
-            fpn,
-            metas,
-            generator,
-            materialize_diagnostics=False,
-            return_final_anchor_only=True,
-        )
+        eager_full = full_anchor(*inputs)
+        eager_minimal = minimal_anchor(*inputs)
+        actual_full = compiled_full(*inputs)
+        actual_minimal = compiled_minimal(*inputs)
 
-    assert torch.equal(actual, expected)
+    assert _raw_equal(eager_full, eager_minimal)
+    assert torch.count_nonzero(eager_full - anchor) > 0
+    assert _raw_equal(actual_full, eager_full)
+    assert _raw_equal(actual_minimal, eager_minimal)
+    assert _raw_equal(actual_full, actual_minimal)
 
 
 def test_lean_inference_hook_keeps_full_observation_abi():

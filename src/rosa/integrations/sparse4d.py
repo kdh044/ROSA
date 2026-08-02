@@ -39,7 +39,11 @@ except ImportError as exc:  # pragma: no cover - exercised in host environment
     ) from exc
 
 from ..geometry import ocam_project_points
-from ..refiner import ROSAConfig, ROSARefiner
+from ..refiner import (
+    _RELEASED_ROSA_REFINER_FORWARD,
+    ROSAConfig,
+    ROSARefiner,
+)
 from .sparse4d_losses import (
     evaluator_aligned_centerness_target,
     rosa_losses,
@@ -623,6 +627,14 @@ class ROSARefinementHead(Sparse4DHead):
         native_identity_rank = bool(
             lean_inference and not self.rosa_cfg.enable_quality_score
         )
+        return_final_anchor_only = bool(
+            native_identity_rank
+            and self.rosa_cfg.architecture_profile == "compact"
+            and type(self.rosa_refiner) is ROSARefiner
+            and "forward" not in self.rosa_refiner.__dict__
+            and type(self.rosa_refiner).forward is _RELEASED_ROSA_REFINER_FORWARD
+            and self.rosa_refiner.quality_head is None
+        )
         baseline_anchor, baseline_cls, baseline_quality = self._native_output(output)
         num_free = int(baseline_anchor.shape[1])
         if (
@@ -675,16 +687,21 @@ class ROSARefinementHead(Sparse4DHead):
             rosa_metadata["ocam_lens_fov_deg"] = metas[
                 "ocam_lens_fov_deg"
             ]
+        refiner_kwargs = {"materialize_diagnostics": not lean_inference}
+        if return_final_anchor_only:
+            # Keep the historical call ABI byte-for-byte on training,
+            # diagnostics, hooks, legacy profiles, and quality-refining paths.
+            # The private keyword exists only at this sealed production edge.
+            refiner_kwargs["return_final_anchor_only"] = True
         result = self.rosa_refiner(
             stage_anchor,
             stage_query,
             live_fpn,
             rosa_metadata,
             deformable.kps_generator,
-            materialize_diagnostics=not lean_inference,
-            return_final_anchor_only=native_identity_rank,
+            **refiner_kwargs,
         )
-        if native_identity_rank:
+        if return_final_anchor_only:
             if not torch.is_tensor(result):
                 raise RuntimeError("lean ROSA refiner did not return its final anchor")
             refined_anchor = result

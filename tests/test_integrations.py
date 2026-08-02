@@ -355,6 +355,441 @@ def test_rosa_query_capture_observes_replacing_hooks_and_cleans_up():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_minimal_refiner_return_is_sealed_behind_released_inference_abi():
+    host = _detector_host()
+    if not host.is_dir():
+        pytest.skip("optional Sparse4D detector host is not available")
+    code = textwrap.dedent(
+        """
+        import types
+
+        import torch
+
+        import rosa.refiner as refiner_module
+        from rosa.refiner import ROSAConfig, ROSARefiner
+
+
+        released_forward = ROSARefiner.forward
+        pre_import_calls = []
+
+
+        def pre_import_forward(
+            self,
+            baseline_anchor,
+            query,
+            fpn,
+            metas,
+            keypoint_generator,
+            *,
+            materialize_diagnostics=True,
+        ):
+            pre_import_calls.append({
+                "materialize_diagnostics": materialize_diagnostics,
+            })
+            return released_forward(
+                self,
+                baseline_anchor,
+                query,
+                fpn,
+                metas,
+                keypoint_generator,
+                materialize_diagnostics=materialize_diagnostics,
+            )
+
+
+        # Import-order compatibility is the hardest case: an application may
+        # patch the public refiner before importing the optional detector bind.
+        ROSARefiner.forward = pre_import_forward
+        from rosa.integrations import sparse4d as integration
+        from rosa.integrations.sparse4d_scores import (
+            compose_native_identity_rank,
+        )
+
+        assert integration._RELEASED_ROSA_REFINER_FORWARD is released_forward
+        assert ROSARefiner.forward is pre_import_forward
+
+
+        def raw_equal(left, right):
+            return bool(
+                left.dtype == right.dtype
+                and left.shape == right.shape
+                and torch.equal(
+                    left.detach().contiguous().view(torch.uint8),
+                    right.detach().contiguous().view(torch.uint8),
+                )
+            )
+
+
+        class DummyDeformable(torch.nn.Module):
+            @staticmethod
+            def kps_generator(box, _query):
+                scale = box.new_tensor(
+                    (
+                        (0, 0, 0),
+                        (0.45, 0, 0),
+                        (-0.45, 0, 0),
+                        (0, 0.45, 0),
+                        (0, -0.45, 0),
+                        (0, 0, 0.45),
+                        (0, 0, -0.45),
+                        (0.2, 0.2, 0.2),
+                        (-0.2, 0.2, 0.2),
+                        (0.2, -0.2, 0.2),
+                        (-0.2, -0.2, 0.2),
+                        (0.2, 0.2, -0.2),
+                        (-0.2, -0.2, -0.2),
+                    )
+                )
+                return (
+                    box[..., :3, None].transpose(-1, -2)
+                    + scale[None, None]
+                    * box[..., 3:6].exp()[..., None, :]
+                )
+
+
+        batch, queries, cameras, dims = 1, 2, 4, 16
+        anchor = torch.zeros(batch, queries, 11)
+        anchor[..., 0] = torch.tensor((1.0, 2.0))
+        anchor[..., 2] = -5.0
+        anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+        anchor[..., 7] = 1.0
+        query = torch.randn(batch, queries, dims)
+        fpn = [
+            torch.randn(batch, cameras, dims, size, size)
+            for size in (8, 4, 2, 1)
+        ]
+        lidar2cam = (
+            torch.eye(4)
+            .reshape(1, 1, 4, 4)
+            .repeat(batch, cameras, 1, 1)
+        )
+        intrinsic = (
+            torch.eye(3)
+            .reshape(1, 1, 3, 3)
+            .repeat(batch, cameras, 1, 1)
+        )
+        intrinsic[..., 0, 2] = 400.0
+        intrinsic[..., 1, 2] = 400.0
+        polynomial = torch.zeros(batch, cameras, 5)
+        polynomial[..., 1] = -150.0
+        metas = {
+            "lidar2cam": lidar2cam,
+            "ocam_intrinsic": intrinsic,
+            "ocam_pol": polynomial,
+            "image_wh": torch.full((batch, cameras, 2), 800.0),
+            "ocam_lens_fov_deg": 205.0,
+        }
+
+
+        def config(profile):
+            return ROSAConfig.from_mapping(
+                {
+                    "profile": profile,
+                    "embed_dims": dims,
+                    "hidden_dims": 8,
+                    "refine_topk": queries,
+                }
+            )
+
+
+        def make_head(cfg):
+            head = object.__new__(integration.ROSARefinementHead)
+            torch.nn.Module.__init__(head)
+            head.rosa_cfg = cfg
+            head.rosa_refiner = ROSARefiner(cfg, "ocam_fisheye")
+            head.layers = torch.nn.ModuleList([DummyDeformable()])
+            head._rosa_deformable_layer_index = 0
+            head.eval()
+            parameter_generator = torch.Generator().manual_seed(20260803)
+            with torch.no_grad():
+                for parameter in head.rosa_refiner.parameters():
+                    parameter.uniform_(
+                        -0.05,
+                        0.05,
+                        generator=parameter_generator,
+                    )
+            return head
+
+
+        def native_output():
+            classification = torch.tensor(
+                (((0.35, -0.4, 0.1), (-0.2, 0.6, 0.25)),),
+                dtype=anchor.dtype,
+            )
+            quality = torch.tensor(
+                (((0.2, -0.1), (0.45, 0.3)),),
+                dtype=anchor.dtype,
+            )
+            return {
+                "prediction": [anchor.clone() for _ in range(6)],
+                "classification": [classification.clone() for _ in range(6)],
+                "quality": [quality.clone() for _ in range(6)],
+            }
+
+
+        def run(head):
+            output = native_output()
+            baseline_classification = output["classification"][5]
+            baseline_quality = output["quality"][5]
+            with torch.no_grad():
+                head._append_rosa(output, query, fpn, metas)
+            return output, baseline_classification, baseline_quality
+
+
+        rank_keys = {
+            "frozen_native_label",
+            "native_selected_probability",
+            "emitted_joint_score",
+        }
+
+
+        def assert_native_identity(head, output, classification, quality):
+            record = output[head.aux_record_key]
+            assert set(record) == rank_keys
+            expected = compose_native_identity_rank(
+                classification,
+                quality,
+                centerness_index=integration.CNS,
+            )
+            assert raw_equal(
+                record["frozen_native_label"],
+                expected["frozen_label"],
+            )
+            assert raw_equal(
+                record["native_selected_probability"],
+                expected["native_selected_probability"],
+            )
+            assert raw_equal(
+                record["emitted_joint_score"],
+                expected["emitted_joint_score"],
+            )
+
+
+        # The pre-import old-signature override must never receive the new
+        # private keyword, while identity ranking remains byte-exact.
+        pre_import_head = make_head(config("fast"))
+        pre_output, pre_cls, pre_quality = run(pre_import_head)
+        assert pre_import_calls == [{"materialize_diagnostics": False}]
+        assert_native_identity(
+            pre_import_head,
+            pre_output,
+            pre_cls,
+            pre_quality,
+        )
+        ROSARefiner.forward = released_forward
+
+        # An instance-level legacy override receives the historical ABI only.
+        # Poisoning its quality delta proves that quality-off ranking ignores
+        # the carrier and stays native-identity rather than merely comparing a
+        # convenient all-zero result.
+        instance_head = make_head(config("fast"))
+        instance_calls = []
+
+        def instance_forward(
+            self,
+            baseline_anchor,
+            sidecar_query,
+            feature_maps,
+            metadata,
+            keypoint_generator,
+            *,
+            materialize_diagnostics=True,
+        ):
+            instance_calls.append({
+                "materialize_diagnostics": materialize_diagnostics,
+            })
+            result = released_forward(
+                self,
+                baseline_anchor,
+                sidecar_query,
+                feature_maps,
+                metadata,
+                keypoint_generator,
+                materialize_diagnostics=materialize_diagnostics,
+            )
+            result.quality_delta = torch.full_like(result.quality_delta, 31.0)
+            assert torch.count_nonzero(result.quality_delta) == (
+                result.quality_delta.numel()
+            )
+            return result
+
+        instance_head.rosa_refiner.forward = types.MethodType(
+            instance_forward,
+            instance_head.rosa_refiner,
+        )
+        instance_output, instance_cls, instance_quality = run(instance_head)
+        assert instance_calls == [{"materialize_diagnostics": False}]
+        assert_native_identity(
+            instance_head,
+            instance_output,
+            instance_cls,
+            instance_quality,
+        )
+
+        # A hook on the refiner itself opts into the historical observable
+        # full record and must not see the private return keyword.
+        hooked_head = make_head(config("fast"))
+        hooked_kwargs = []
+
+        def observe_refiner(_module, _args, kwargs):
+            hooked_kwargs.append(dict(kwargs))
+
+        handle = hooked_head.rosa_refiner.register_forward_pre_hook(
+            observe_refiner,
+            with_kwargs=True,
+        )
+        try:
+            hooked_output, _, _ = run(hooked_head)
+        finally:
+            handle.remove()
+        assert hooked_kwargs == [{"materialize_diagnostics": True}]
+        assert "native_route" in hooked_output[hooked_head.aux_record_key]
+        assert set(hooked_output[hooked_head.aux_record_key]) != rank_keys
+
+        # Descendant observation hooks preserve their Tensor relation ABI but
+        # do not force the large public carrier back into production output.
+        rfl_head = make_head(config("fast"))
+        observed_relations = []
+        rfl_kwargs = []
+        rfl_call_impl = rfl_head.rosa_refiner._call_impl
+
+        def observe_rfl_call(*args, **kwargs):
+            rfl_kwargs.append(dict(kwargs))
+            return rfl_call_impl(*args, **kwargs)
+
+        rfl_head.rosa_refiner._call_impl = observe_rfl_call
+
+        def observe_relation(_module, args):
+            relation = args[1]
+            assert torch.is_tensor(relation)
+            assert relation.shape[-1] == 19
+            observed_relations.append(relation)
+
+        handle = rfl_head.rosa_refiner.rosa.rfl.register_forward_pre_hook(
+            observe_relation
+        )
+        try:
+            rfl_output, rfl_cls, rfl_quality = run(rfl_head)
+        finally:
+            handle.remove()
+        assert observed_relations
+        assert rfl_kwargs == [
+            {
+                "materialize_diagnostics": False,
+                "return_final_anchor_only": True,
+            }
+        ]
+        assert_native_identity(rfl_head, rfl_output, rfl_cls, rfl_quality)
+
+        # Released quality-off checkpoints still own a legacy quality head.
+        # It must execute exactly once even though its result cannot alter the
+        # native identity rank.
+        legacy_cfg = config("published")
+        legacy_cfg = ROSAConfig.from_mapping(
+            {
+                **legacy_cfg.__dict__,
+                "enable_quality_score": False,
+            }
+        )
+        legacy_head = make_head(legacy_cfg)
+        assert legacy_head.rosa_refiner.quality_head is not None
+        quality_calls = []
+        handle = legacy_head.rosa_refiner.quality_head.register_forward_hook(
+            lambda _module, _args, _output: quality_calls.append(True)
+        )
+        try:
+            legacy_output, legacy_cls, legacy_quality = run(legacy_head)
+        finally:
+            handle.remove()
+        assert quality_calls == [True]
+        assert_native_identity(
+            legacy_head,
+            legacy_output,
+            legacy_cls,
+            legacy_quality,
+        )
+
+        # Released eager and in-place Module.compile keep the exact public
+        # type/forward surface and both delegate the sealed two-key request.
+        eager_head = make_head(config("fast"))
+        eager_kwargs = []
+        eager_call_impl = eager_head.rosa_refiner._call_impl
+
+        def observe_eager_call(*args, **kwargs):
+            eager_kwargs.append(dict(kwargs))
+            return eager_call_impl(*args, **kwargs)
+
+        eager_head.rosa_refiner._call_impl = observe_eager_call
+        eager_output, eager_cls, eager_quality = run(eager_head)
+        assert eager_kwargs == [
+            {
+                "materialize_diagnostics": False,
+                "return_final_anchor_only": True,
+            }
+        ]
+        assert_native_identity(
+            eager_head,
+            eager_output,
+            eager_cls,
+            eager_quality,
+        )
+
+        compiled_head = make_head(config("fast"))
+        compiled_head.rosa_refiner.load_state_dict(
+            eager_head.rosa_refiner.state_dict()
+        )
+        assert type(compiled_head.rosa_refiner) is ROSARefiner
+        assert "forward" not in compiled_head.rosa_refiner.__dict__
+        assert ROSARefiner.forward is released_forward
+        compiled_head.rosa_refiner.compile(backend="eager", fullgraph=True)
+        assert type(compiled_head.rosa_refiner) is ROSARefiner
+        assert "forward" not in compiled_head.rosa_refiner.__dict__
+        assert ROSARefiner.forward is released_forward
+        compiled_call_impl = compiled_head.rosa_refiner._compiled_call_impl
+        compiled_kwargs = []
+
+        def observe_compiled_call(*args, **kwargs):
+            compiled_kwargs.append(dict(kwargs))
+            return compiled_call_impl(*args, **kwargs)
+
+        compiled_head.rosa_refiner._compiled_call_impl = (
+            observe_compiled_call
+        )
+        compiled_output, compiled_cls, compiled_quality = run(compiled_head)
+        assert compiled_kwargs == [
+            {
+                "materialize_diagnostics": False,
+                "return_final_anchor_only": True,
+            }
+        ]
+        assert_native_identity(
+            compiled_head,
+            compiled_output,
+            compiled_cls,
+            compiled_quality,
+        )
+        assert raw_equal(
+            eager_output["prediction"][-1],
+            compiled_output["prediction"][-1],
+        )
+        """
+    )
+    environment = os.environ.copy()
+    pythonpath = [str(ROOT / "src"), str(host)]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_released_config_aliases_keep_legacy_projection_default():
     config = ROSAConfig.from_mapping(
         {
