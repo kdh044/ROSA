@@ -336,6 +336,30 @@ def test_logical_device_identity_rejects_same_named_cuuid_impostor() -> None:
         tool._logical_device_identity(fake_torch, SimpleNamespace(index=0))
 
 
+def test_shared_native_state_projection_preserves_ordered_mapping_type() -> None:
+    from collections import OrderedDict
+
+    native = OrderedDict(
+        (("backbone.weight", object()), ("head.weight", object()))
+    )
+    candidate_values = {
+        "head.weight": object(),
+        "rosa.weight": object(),
+        "backbone.weight": object(),
+    }
+
+    projected = tool._project_shared_native_state(native, candidate_values)
+
+    assert type(projected) is OrderedDict
+    assert tuple(projected) == tuple(native)
+    assert all(projected[name] is candidate_values[name] for name in native)
+
+
+def test_shared_native_state_projection_rejects_missing_key() -> None:
+    with pytest.raises(tool.ProtocolError, match="misses native state key"):
+        tool._project_shared_native_state({"weight": object()}, {})
+
+
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:
     class FakeCuda:
         @staticmethod

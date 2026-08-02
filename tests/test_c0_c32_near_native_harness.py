@@ -264,6 +264,16 @@ def test_finite_output_schema_allows_value_delta_but_rejects_nonfinite() -> None
         finite_output_schema([{"scores": torch.tensor([float("nan")])}])
 
 
+def test_finite_output_schema_supports_box_constructor_metadata() -> None:
+    class_schema = finite_output_schema([{"box_type_3d": dict}])
+
+    assert class_schema == finite_output_schema([{"box_type_3d": dict}])
+    assert class_schema != finite_output_schema([{"box_type_3d": list}])
+    assert class_schema != finite_output_schema(
+        [{"box_type_3d": "builtins.dict"}]
+    )
+
+
 class _FakeBoxes:
     def __init__(self, value: torch.Tensor) -> None:
         self.tensor = value

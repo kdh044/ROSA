@@ -464,6 +464,15 @@ def test_raw_fingerprints_compare_tensor_and_array_bits():
         require_same_fingerprint("test", value, clone)
 
 
+def test_raw_fingerprint_supports_zero_dimensional_state_buffers():
+    value = torch.tensor(7, dtype=torch.int64)
+
+    observed = raw_fingerprint(value)
+    assert observed == raw_fingerprint(value.clone())
+    assert observed["tensor_bytes"] == value.element_size()
+    assert observed != raw_fingerprint(torch.tensor(8, dtype=torch.int64))
+
+
 def test_raw_fingerprint_uses_python_class_import_identity():
     value = {"box_type_3d": dict}
 

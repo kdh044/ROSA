@@ -1252,15 +1252,31 @@ def _build_models(verifier, configs, state_dict, arms, device):
             if arm == NATIVE_ARM:
                 continue
             candidate_state = models[arm].state_dict()
-            candidate_native_state = {
-                name: candidate_state[name] for name in native_state
-            }
+            candidate_native_state = _project_shared_native_state(
+                native_state, candidate_state
+            )
             verifier.require_same_fingerprint(
                 f"{arm} shared native checkpoint state",
                 native_state,
                 candidate_native_state,
             )
     return models, contracts, load_contracts
+
+
+def _project_shared_native_state(native_state, candidate_state):
+    """Project candidate tensors without changing the state container ABI."""
+
+    missing = [name for name in native_state if name not in candidate_state]
+    if missing:
+        raise ProtocolError(f"candidate misses native state key: {missing[0]}")
+    projected = copy.copy(native_state)
+    if type(projected) is not type(native_state):
+        raise ProtocolError("native state copy changed the mapping container type")
+    for name in native_state:
+        projected[name] = candidate_state[name]
+    if tuple(projected) != tuple(native_state):
+        raise ProtocolError("candidate native-state projection changed key order")
+    return projected
 
 
 def _require_current_default_stream(torch, device) -> dict[str, Any]:

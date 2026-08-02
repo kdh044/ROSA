@@ -1942,7 +1942,10 @@ class _RawFingerprinter:
             self._tag(str(tuple(value.shape)))
             self._tag(str(tuple(value.stride())))
             cpu = value.detach().to(device="cpu").contiguous()
-            raw = cpu.view(torch.uint8).reshape(-1).numpy().tobytes()
+            # Reinterpret after flattening: PyTorch rejects a dtype-changing
+            # view directly on zero-dimensional state buffers such as
+            # BatchNorm's scalar ``num_batches_tracked``.
+            raw = cpu.reshape(-1).view(torch.uint8).numpy().tobytes()
             self.tensor_bytes += len(raw)
             self.digest.update(len(raw).to_bytes(8, "little"))
             self.digest.update(raw)
@@ -2092,6 +2095,12 @@ def finite_output_schema(value: Any) -> dict[str, Any]:
                     f"output scalar at {path} contains NaN or Inf"
                 )
             return {"type": f"numpy.scalar:{item.dtype.str}"}
+        if isinstance(item, type):
+            return {
+                "type": "python.type",
+                "module": item.__module__,
+                "qualname": item.__qualname__,
+            }
         if isinstance(item, Mapping):
             return {
                 "type": f"mapping:{type(item).__module__}.{type(item).__qualname__}",
