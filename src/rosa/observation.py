@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from torch.utils import _python_dispatch
 
 from . import geometry as _geometry
 from .geometry import (
@@ -15,6 +16,7 @@ from .geometry import (
     ocam_project_points,
     ocam_projection_scales,
 )
+from .sampling import FusedBilinearSampler
 from .types import RayFeatureRelation
 
 
@@ -36,6 +38,8 @@ _RELEASED_OCAM_PROJECT_POINTS = ocam_project_points
 _RELEASED_OCAM_PROJECT_WITH_XYZ = _ocam_project_points_with_raw_camera_xyz
 _RELEASED_GEOMETRY_CAMERA_XYZ = _geometry._camera_xyz
 _RELEASED_OCAM_PROJECT_IMPL = _geometry._ocam_project_points_impl
+_RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
+_RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
 # CUDA raw-bit parity must be established before this candidate becomes the
 # production default.  CPU tests exercise the complete guarded implementation.
 _ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE = False
@@ -251,6 +255,67 @@ def project_and_describe(
     return uv, geometry, relation, valid
 
 
+def _can_use_prepared_multiscale(
+    fpn: Sequence[Tensor],
+    uv: Tensor,
+    sampler: nn.Module,
+) -> bool:
+    """Fail closed unless the private released no-grad sampler is unobserved."""
+
+    if (
+        type(fpn) not in (list, tuple)
+        or len(fpn) != 4
+        or type(sampler) is not FusedBilinearSampler
+        or sampler.training
+        or torch.is_grad_enabled()
+        or torch.overrides._is_torch_function_mode_enabled()
+        or getattr(
+            _python_dispatch,
+            "_is_in_non_infra_torch_dispatch_mode",
+            True,
+        )
+        or "forward" in sampler.__dict__
+        or type(sampler).forward is not _RELEASED_FUSED_SAMPLER_FORWARD
+        or "_sample_multiscale_prepared" in sampler.__dict__
+        or type(sampler)._sample_multiscale_prepared
+        is not _RELEASED_PREPARED_MULTISCALE
+        or torch.jit.is_scripting()
+        or torch.jit.is_tracing()
+        or type(uv) is not torch.Tensor
+        or uv.ndim != 5
+        or uv.shape[-1] != 2
+        or uv.requires_grad
+        or any(type(feature) is not torch.Tensor for feature in fpn)
+        or any(feature.ndim != 5 or feature.requires_grad for feature in fpn)
+    ):
+        return False
+    if (
+        sampler._forward_pre_hooks
+        or sampler._forward_hooks
+        or torch.nn.modules.module._global_forward_pre_hooks
+        or torch.nn.modules.module._global_forward_hooks
+    ):
+        return False
+
+    batch, cameras, channels = fpn[0].shape[:3]
+    tensors = (*fpn, uv)
+    if (
+        uv.shape[0] != batch
+        or uv.shape[2] != cameras
+        or any(feature.shape[:3] != (batch, cameras, channels) for feature in fpn)
+        or any(
+            feature.dtype != uv.dtype or feature.device != uv.device for feature in fpn
+        )
+        or any(
+            tensor.layout != torch.strided or tensor.is_quantized for tensor in tensors
+        )
+    ):
+        return False
+    if torch._dynamo.is_compiling():
+        return True
+    return bool(all(all(name is None for name in tensor.names) for tensor in tensors))
+
+
 def sample_multiscale_features(
     fpn: Sequence[Tensor],
     uv: Tensor,
@@ -265,7 +330,13 @@ def sample_multiscale_features(
             f"expected {level_head.out_features} FPN levels, " f"got {len(fpn)}"
         )
     sample_uv = uv.unsqueeze(4)
-    sampled = [sampler(feature, sample_uv).squeeze(4) for feature in fpn]
+    if _can_use_prepared_multiscale(fpn, uv, sampler):
+        sampled = [
+            value.squeeze(4)
+            for value in sampler._sample_multiscale_prepared(fpn, sample_uv)
+        ]
+    else:
+        sampled = [sampler(feature, sample_uv).squeeze(4) for feature in fpn]
     levels = torch.stack(sampled, dim=2)
     # ``stack`` owns the fused level storage.  Drop the four per-level outputs
     # before allocating any subsequent tensor; keeping the Python list alive

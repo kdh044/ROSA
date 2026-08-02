@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
@@ -116,6 +118,48 @@ class FusedBilinearSampler(nn.Module):
             patch,
         )
         return sampled.permute(0, 3, 1, 4, 5, 2).contiguous()
+
+    def _sample_multiscale_prepared(
+        self,
+        features: Sequence[Tensor],
+        uv: Tensor,
+    ) -> tuple[Tensor, ...]:
+        """Reuse one grid for caller-validated homogeneous FPN inputs."""
+
+        batch, cameras = features[0].shape[:2]
+        queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
+        grid = (
+            torch.nan_to_num(
+                uv.permute(0, 2, 1, 3, 4, 5),
+                nan=-2.0,
+                posinf=-2.0,
+                neginf=-2.0,
+            )
+            .reshape(batch * cameras, queries * samples * patch, 1, 2)
+            .mul(2.0)
+            .sub(1.0)
+        )
+        prepared = []
+        for feature in features:
+            channels, height, width = feature.shape[-3:]
+            sampled = F.grid_sample(
+                feature.reshape(batch * cameras, channels, height, width),
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+            prepared.append(
+                sampled.reshape(
+                    batch,
+                    cameras,
+                    channels,
+                    queries,
+                    samples,
+                    patch,
+                ).permute(0, 3, 1, 4, 5, 2)
+            )
+        return tuple(prepared)
 
 
 __all__ = ["DeterministicBilinearSampler", "FusedBilinearSampler"]
