@@ -129,6 +129,36 @@ def _sanitize_camera_xyz(camera_xyz: Tensor) -> tuple[Tensor, Tensor]:
     return safe, geometry_valid
 
 
+def _sanitize_camera_xyz_inference_storage_reuse(
+    camera_xyz: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Sanitize an owned transform output in place for ordinary inference."""
+
+    if torch.is_grad_enabled():
+        raise RuntimeError(
+            "OCam inference storage reuse requires torch.no_grad() or "
+            "torch.inference_mode()"
+        )
+    finite_and_bounded = torch.isfinite(camera_xyz).all(dim=-1) & (
+        camera_xyz.detach().abs().amax(dim=-1) < 1e4
+    )
+    # ``camera_xyz`` is the freshly allocated affine/matmul result and never
+    # aliases a caller input.  Reuse it instead of retaining separate
+    # bounded and safe full-size XYZ tensors.
+    finite_and_bounded.logical_not_()
+    camera_xyz.masked_fill_(finite_and_bounded[..., None], 0.0)
+    finite_and_bounded.logical_not_()
+    radius_squared = (camera_xyz * camera_xyz).sum(dim=-1)
+    geometry_valid = finite_and_bounded & radius_squared.gt(1e-6)
+    # Reuse the validity mask itself while filling invalid entries, then
+    # restore its public polarity before returning it.
+    geometry_valid.logical_not_()
+    camera_xyz.masked_fill_(geometry_valid[..., None], 0.0)
+    camera_xyz[..., 2].masked_fill_(geometry_valid, -1.0)
+    geometry_valid.logical_not_()
+    return camera_xyz, geometry_valid
+
+
 def _half_fov_radians(
     raw_fov, *, batch: int, cameras: int, reference: Tensor
 ) -> Tensor:
@@ -188,7 +218,12 @@ def ocam_project_points(
         camera_xyz = _camera_xyz_affine(points, lidar2cam)
     else:
         raise ValueError(f"unknown OCam camera transform: {camera_transform}")
-    safe_xyz, geometry_valid = _sanitize_camera_xyz(camera_xyz)
+    if inference_storage_reuse:
+        safe_xyz, geometry_valid = _sanitize_camera_xyz_inference_storage_reuse(
+            camera_xyz
+        )
+    else:
+        safe_xyz, geometry_valid = _sanitize_camera_xyz(camera_xyz)
     x, y, z = safe_xyz.unbind(dim=-1)
     planar_norm = torch.sqrt(x.square() + y.square() + 1e-12)
     theta_ocam = torch.atan2(z, planar_norm)
@@ -211,7 +246,15 @@ def ocam_project_points(
             rho / planar_norm.clamp_min(1e-8),
             0.0,
         )
-    image_x, image_y = x * scale, y * scale
+    if inference_storage_reuse:
+        # ``safe_xyz`` is owned by this call in the reuse path.  Projection no
+        # longer needs x/y after their planar norm and theta have been formed,
+        # so retain the products in those two slots instead of allocating two
+        # additional full-size tensors.
+        image_x = safe_xyz[..., 0].mul_(scale)
+        image_y = safe_xyz[..., 1].mul_(scale)
+    else:
+        image_x, image_y = x * scale, y * scale
 
     a11 = intrinsic[..., 1, 0][:, :, None, None]
     a12 = intrinsic[..., 1, 1][:, :, None, None]

@@ -85,9 +85,11 @@ def _projection_fixture(dtype: torch.dtype, *, camera_conditioned: bool):
     (torch.float16, torch.float32, torch.float64, torch.bfloat16),
 )
 @pytest.mark.parametrize("camera_conditioned", (False, True))
+@pytest.mark.parametrize("camera_transform", ("homogeneous_4x4", "affine_3x3"))
 def test_inference_storage_reuse_is_raw_bit_equal_and_input_safe(
     dtype,
     camera_conditioned,
+    camera_transform,
 ):
     points, metas, image_wh = _projection_fixture(
         dtype,
@@ -106,14 +108,14 @@ def test_inference_storage_reuse_is_raw_bit_equal_and_input_safe(
             metas,
             image_wh,
             contract="full_fov",
-            camera_transform="affine_3x3",
+            camera_transform=camera_transform,
         )
         candidate = ocam_project_points(
             points,
             metas,
             image_wh,
             contract="full_fov",
-            camera_transform="affine_3x3",
+            camera_transform=camera_transform,
             inference_storage_reuse=True,
         )
     assert torch.equal(candidate, parent)
