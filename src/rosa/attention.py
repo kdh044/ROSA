@@ -243,7 +243,12 @@ class PointwiseROSA(nn.Module):
                 type(value) is torch.Tensor
                 for value in (features, geometry, valid, query)
             )
-            and type(relation) is RayFeatureRelation
+            and _rfl._is_prepared_ray_feature_relation
+            is _RELEASED_PREPARED_RELATION_CHECK
+            and (
+                type(relation) is RayFeatureRelation
+                or _rfl._is_prepared_ray_feature_relation(relation)
+            )
             and all(not module.training for module in modules)
             and all(
                 "__call__" not in module.__dict__
@@ -439,6 +444,18 @@ class PointwiseROSA(nn.Module):
     ) -> ObservationEncoding:
         """Fuse a lean observation while reusing owned RFL/Pointwise storage."""
 
+        carrier_relation = type(relation) is _RELEASED_PREPARED_RELATION_TYPE
+        prepared_relation = bool(
+            carrier_relation
+            and _rfl._is_prepared_ray_feature_relation
+            is _RELEASED_PREPARED_RELATION_CHECK
+            and _rfl._is_prepared_ray_feature_relation(relation)
+        )
+        public_relation = (
+            RayFeatureRelation(ray=relation.ray, valid=relation.valid)
+            if carrier_relation
+            else relation
+        )
         pointwise_storage_reuse = bool(
             "_can_reuse_owned_pointwise_storage" not in self.__dict__
             and type(self)._can_reuse_owned_pointwise_storage
@@ -477,7 +494,7 @@ class PointwiseROSA(nn.Module):
             return self(
                 features,
                 geometry,
-                relation,
+                public_relation,
                 valid,
                 query,
                 observation_usage=observation_usage,
@@ -1004,6 +1021,8 @@ class PointwiseROSA(nn.Module):
 
 _RELEASED_ALIAS_CHECK = getattr(torch._C, "_is_alias_of", None)
 _RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
+_RELEASED_PREPARED_RELATION_TYPE = _rfl._PreparedRayFeatureRelation
+_RELEASED_PREPARED_RELATION_CHECK = _rfl._is_prepared_ray_feature_relation
 _RELEASED_OWNED_TENSOR_CHECK = _is_owned_plain_fp32_tensor
 _RELEASED_OWNED_CONSISTENCY = _mean_pairwise_camera_cosine_owned_inference
 _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE = mean_pairwise_camera_cosine

@@ -248,6 +248,35 @@ def test_dual_guard_is_released_fast_fp32_eager_only(monkeypatch):
         assert not _dual_guard(module, features, geometry, relation, valid, query)
 
 
+def test_prepared_rfl_relation_preserves_dual_attention_output_raw_exact():
+    module, features, geometry, relation, valid, query = _pointwise_fixture()
+    generator = torch.Generator().manual_seed(81_071)
+    with torch.no_grad():
+        module.rfl.output_proj.weight.normal_(generator=generator)
+        prepared = rfl_module._prepare_ray_feature_relation(relation)
+        assert _dual_guard(module, features, geometry, relation, valid, query)
+        assert _dual_guard(module, features, geometry, prepared, valid, query)
+        assert module.rfl._can_use_prepared_relation(features, prepared)
+        expected = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            prepared,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+
+    _assert_encoding_equal(actual, expected)
+
+
 def test_private_entry_falls_back_to_public_autograd_and_module_override():
     module, features, geometry, relation, valid, query = _pointwise_fixture()
     differentiable = features.clone().requires_grad_()

@@ -1,17 +1,23 @@
 from collections import Counter
+import math
+import sys
 import warnings
 
 import pytest
 import torch
+import torch.nn.functional as F
 from torch.overrides import TorchFunctionMode
 from torch.utils import _python_dispatch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+import rosa.rfl as rfl_module
 from rosa.attention import PointwiseROSA
 from rosa.config import ROSAConfig
 from rosa.rfl import (
     SphericalRayFeatureLifting,
     _mask_cast_and_add_owned_delta,
+    _prepare_ray_feature_relation,
+    _prepared_compact_basis_and_valid,
 )
 from rosa.types import RayFeatureRelation
 
@@ -188,6 +194,143 @@ def test_owned_delta_finish_has_one_inplace_mask_sanitize_and_add_out():
             "aten.add.out": 1,
         }
     )
+
+
+def test_prepared_relation_basis_and_owned_delta_are_raw_exact():
+    module, features, relation = _rfl_fixture(torch.float32, factorized=True)
+    relation = RayFeatureRelation(
+        ray=torch.nan_to_num(relation.ray),
+        valid=relation.valid,
+    )
+    finite_extremes = torch.tensor(
+        (
+            0.0,
+            -0.0,
+            torch.finfo(torch.float32).max,
+            -torch.finfo(torch.float32).max,
+            torch.finfo(torch.float32).tiny,
+            -torch.finfo(torch.float32).tiny,
+        )
+    )
+    relation.ray.reshape(-1)[: finite_extremes.numel()].copy_(finite_extremes)
+    prepared = _prepare_ray_feature_relation(relation)
+
+    expected_basis, expected_valid = module.compact_basis_and_valid(relation)
+    actual_basis, actual_valid = _prepared_compact_basis_and_valid(prepared)
+    assert _raw_equal(actual_basis, expected_basis)
+    assert torch.equal(actual_valid, expected_valid)
+
+    observed_calls = Counter()
+    prepared_code = _prepared_compact_basis_and_valid.__code__
+
+    def count_prepared(frame, event, _arg):
+        if event == "call" and frame.f_code is prepared_code:
+            observed_calls["prepared_basis"] += 1
+
+    with torch.no_grad():
+        assert module._can_reuse_owned_delta(features, prepared)
+        assert module._can_use_prepared_relation(features, prepared)
+        expected = features + 1.0 * module(features, relation)
+        previous_profile = sys.getprofile()
+        sys.setprofile(count_prepared)
+        try:
+            actual = module._forward_lifted_owned_delta_inference(
+                features,
+                prepared,
+            )
+        finally:
+            sys.setprofile(previous_profile)
+
+    assert observed_calls == Counter({"prepared_basis": 1})
+    assert _raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    "helper_name",
+    (
+        "_is_prepared_ray_feature_relation",
+        "_prepared_compact_basis_and_valid",
+    ),
+)
+def test_prepared_relation_falls_back_before_overridden_helpers(
+    helper_name,
+    monkeypatch,
+):
+    module, features, relation = _rfl_fixture(torch.float32, factorized=True)
+    relation = RayFeatureRelation(
+        ray=torch.nan_to_num(relation.ray),
+        valid=relation.valid,
+    )
+    prepared = _prepare_ray_feature_relation(relation)
+    with torch.no_grad():
+        expected = features + 1.0 * module(features, relation)
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden prepared-relation helper executed")
+
+    monkeypatch.setattr(rfl_module, helper_name, must_not_run)
+    with torch.no_grad():
+        actual = module._forward_lifted_owned_delta_inference(features, prepared)
+    assert _raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("owner", "helper_name"),
+    (
+        (torch, "nan_to_num"),
+        (torch, "where"),
+        (torch, "zeros_like"),
+        (F, "normalize"),
+        (torch, "stack"),
+        (torch, "full_like"),
+        (torch.Tensor, "masked_fill_"),
+        (math, "sqrt"),
+    ),
+)
+def test_prepared_relation_preserves_overridden_primitive_helpers(
+    owner,
+    helper_name,
+    monkeypatch,
+):
+    module, features, relation = _rfl_fixture(torch.float32, factorized=True)
+    relation = RayFeatureRelation(
+        ray=torch.nan_to_num(relation.ray),
+        valid=relation.valid,
+    )
+    prepared = _prepare_ray_feature_relation(relation)
+    with torch.no_grad():
+        expected = features + 1.0 * module(features, relation)
+
+    released = getattr(owner, helper_name)
+    calls = []
+
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return released(*args, **kwargs)
+
+    monkeypatch.setattr(owner, helper_name, observed)
+    with torch.no_grad():
+        assert not module._can_use_prepared_relation(features, prepared)
+        actual = module._forward_lifted_owned_delta_inference(features, prepared)
+    assert calls
+    assert _raw_equal(actual, expected)
+
+
+def test_prepared_relation_guard_is_fp32_plain_eager_only():
+    module, features, relation = _rfl_fixture(torch.float32, factorized=True)
+    relation = RayFeatureRelation(
+        ray=torch.nan_to_num(relation.ray),
+        valid=relation.valid,
+    )
+    prepared = _prepare_ray_feature_relation(relation)
+
+    assert not module._can_use_prepared_relation(features, prepared)
+    with torch.no_grad():
+        assert module._can_use_prepared_relation(features, prepared)
+        assert not module._can_use_prepared_relation(features.double(), prepared)
+        assert not module._can_use_prepared_relation(features, relation)
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        assert not module._can_use_prepared_relation(features, prepared)
 
 
 def test_owned_delta_rfl_falls_back_for_noncontiguous_input_and_hooks():

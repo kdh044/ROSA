@@ -142,12 +142,15 @@ def test_compact_lean_refiner_reuses_exactly_two_rfl_delta_buffers():
     observed_calls = Counter()
     private_code = type(stage.rosa.rfl)._forward_lifted_owned_delta_inference.__code__
     finish_code = rfl_module._mask_cast_and_add_owned_delta.__code__
+    prepared_basis_code = rfl_module._prepared_compact_basis_and_valid.__code__
 
     def count_private_rfl(frame, event, _arg):
         if event == "call" and frame.f_code is private_code:
             observed_calls["private_rfl"] += 1
         elif event == "call" and frame.f_code is finish_code:
             observed_calls["owned_finish"] += 1
+        elif event == "call" and frame.f_code is prepared_basis_code:
+            observed_calls["prepared_basis"] += 1
 
     with torch.no_grad():
         stage.rosa.rfl.output_proj.weight.normal_()
@@ -167,7 +170,9 @@ def test_compact_lean_refiner_reuses_exactly_two_rfl_delta_buffers():
             sys.setprofile(previous_profile)
     # Fast refinement observes the base anchors once and all three candidates
     # once, and each observation must consume exactly one owned delta.
-    assert observed_calls == Counter({"private_rfl": 2, "owned_finish": 2})
+    assert observed_calls == Counter(
+        {"private_rfl": 2, "owned_finish": 2, "prepared_basis": 2}
+    )
 
 
 def test_compact_lean_refiner_reuses_pointwise_storage_for_base_and_candidates():
@@ -238,6 +243,7 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
             stage.sampler
         )._sample_multiscale_prepared_stacked.__code__,
         "owned_rfl_delta": rfl_module._mask_cast_and_add_owned_delta.__code__,
+        "prepared_rfl_basis": rfl_module._prepared_compact_basis_and_valid.__code__,
         "single_ocam_transform": (
             observation_module._ocam_project_points_with_raw_camera_xyz_and_valid.__code__
         ),
@@ -303,6 +309,7 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
         {
             "direct_level_buffer": 2,
             "owned_rfl_delta": 2,
+            "prepared_rfl_basis": 2,
             "single_ocam_transform": 2,
             "owned_pointwise_check_True": 9,
             "owned_pointwise_consistency": 1,

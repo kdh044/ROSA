@@ -10,6 +10,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from . import observation as _observation
+from . import rfl as _rfl
 from .attention import PointwiseROSA, masked_softmax
 from .config import ROSAConfig
 from .observation import (
@@ -25,7 +27,7 @@ from .sampling import (
     DeterministicBilinearSampler,
     FusedBilinearSampler,
 )
-from .rfl import SphericalRayFeatureLifting
+from .rfl import SphericalRayFeatureLifting, _prepare_ray_feature_relation
 from .types import ObservationEncoding, ROSAOutput
 
 _SIZE = slice(3, 6)
@@ -39,10 +41,20 @@ _RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
 _RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
 _RELEASED_POINTWISE_ROSA_IMPL = PointwiseROSA._forward_impl
 _RELEASED_POINTWISE_ROSA_REUSE_GUARD = PointwiseROSA._can_reuse_owned_rfl_delta
+_RELEASED_PROJECT_AND_DESCRIBE = project_and_describe
+_RELEASED_OBSERVATION_PROJECT_AND_DESCRIBE = _observation.project_and_describe
+_RELEASED_PREPARE_RAY_FEATURE_RELATION = _prepare_ray_feature_relation
+_RELEASED_RFL_PREPARE_RAY_FEATURE_RELATION = _rfl._prepare_ray_feature_relation
+_RELEASED_RFL_PREPARED_RELATION_TYPE = _rfl._PreparedRayFeatureRelation
+_RELEASED_RFL_PREPARED_RELATION_PROVENANCE = _rfl._PREPARED_RELATION_PROVENANCE
+_RELEASED_RFL_PREPARED_BASIS = _rfl._prepared_compact_basis_and_valid
 _RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
 _RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
 _RELEASED_RFL_OWNED_DELTA_FORWARD = (
     SphericalRayFeatureLifting._forward_lifted_owned_delta_inference
+)
+_RELEASED_RFL_PREPARED_RELATION_GUARD = (
+    SphericalRayFeatureLifting._can_use_prepared_relation
 )
 
 
@@ -406,6 +418,16 @@ class ROSARefiner(nn.Module):
         relation_modules = tuple(self.rosa.modules())
         released_relation_surface = bool(
             type(self.rosa) is PointwiseROSA
+            and project_and_describe is _RELEASED_PROJECT_AND_DESCRIBE
+            and _observation.project_and_describe
+            is _RELEASED_OBSERVATION_PROJECT_AND_DESCRIBE
+            and _prepare_ray_feature_relation is _RELEASED_PREPARE_RAY_FEATURE_RELATION
+            and _rfl._prepare_ray_feature_relation
+            is _RELEASED_RFL_PREPARE_RAY_FEATURE_RELATION
+            and _rfl._PreparedRayFeatureRelation is _RELEASED_RFL_PREPARED_RELATION_TYPE
+            and _rfl._PREPARED_RELATION_PROVENANCE
+            is _RELEASED_RFL_PREPARED_RELATION_PROVENANCE
+            and _rfl._prepared_compact_basis_and_valid is _RELEASED_RFL_PREPARED_BASIS
             and "forward" not in self.rosa.__dict__
             and type(self.rosa).forward is _RELEASED_POINTWISE_ROSA_FORWARD
             and "_call_impl" not in self.rosa.__dict__
@@ -424,6 +446,9 @@ class ROSARefiner(nn.Module):
             and "_forward_lifted_owned_delta_inference" not in rfl.__dict__
             and type(rfl)._forward_lifted_owned_delta_inference
             is _RELEASED_RFL_OWNED_DELTA_FORWARD
+            and "_can_use_prepared_relation" not in rfl.__dict__
+            and type(rfl)._can_use_prepared_relation
+            is _RELEASED_RFL_PREPARED_RELATION_GUARD
             and all(
                 "_call_impl" not in module.__dict__
                 and type(module)._call_impl is _RELEASED_MODULE_CALL_IMPL
@@ -478,6 +503,7 @@ class ROSARefiner(nn.Module):
             self.level_head,
         )
         if private_rfl_buffer_inference:
+            relation = _prepare_ray_feature_relation(relation)
             return self.rosa._forward_compact_lean_inference(
                 features,
                 geometry,

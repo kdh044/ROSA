@@ -22,6 +22,80 @@ from torch.utils import _python_dispatch
 
 from .types import RayFeatureRelation
 
+_PREPARED_RELATION_PROVENANCE = object()
+
+
+class _PreparedRayFeatureRelation:
+    """Private carrier proving a relation came from released observation code."""
+
+    __slots__ = ("ray", "valid", "_provenance")
+
+    def __init__(
+        self,
+        relation: RayFeatureRelation,
+        provenance: object,
+    ) -> None:
+        if (
+            type(relation) is not RayFeatureRelation
+            or provenance is not _PREPARED_RELATION_PROVENANCE
+        ):
+            raise TypeError("prepared RFL relations are private observation values")
+        self.ray = relation.ray
+        self.valid = relation.valid
+        self._provenance = provenance
+
+
+def _prepare_ray_feature_relation(
+    relation: RayFeatureRelation,
+) -> _PreparedRayFeatureRelation:
+    """Attach private released-observation provenance without copying tensors."""
+
+    return _PreparedRayFeatureRelation(relation, _PREPARED_RELATION_PROVENANCE)
+
+
+def _is_prepared_ray_feature_relation(value: object) -> bool:
+    return bool(
+        type(value) is _PreparedRayFeatureRelation
+        and value._provenance is _PREPARED_RELATION_PROVENANCE
+    )
+
+
+def _prepared_compact_basis_and_valid(
+    relation: _PreparedRayFeatureRelation,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build SH basis from a released finite FP32 ray/boolean-valid carrier.
+
+    The ordinary compact path defensively sanitizes the ray twice and converts
+    boolean validity through FP32.  Released observation construction already
+    guarantees those properties.  Its private provenance lets this eager-only
+    path retain the exact arithmetic while omitting the duplicate copies.
+    """
+
+    ray = F.normalize(relation.ray, dim=-1, eps=1e-6)
+    x, y, z = ray.unbind(dim=-1)
+
+    c0 = 1.0 / (2.0 * math.sqrt(math.pi))
+    c1 = math.sqrt(3.0 / (4.0 * math.pi))
+    c2_cross = math.sqrt(15.0 / (4.0 * math.pi))
+    c2_z = math.sqrt(5.0 / (16.0 * math.pi))
+    c2_xy = math.sqrt(15.0 / (16.0 * math.pi))
+    basis = torch.stack(
+        (
+            torch.full_like(x, c0),
+            c1 * x,
+            c1 * y,
+            c1 * z,
+            c2_cross * x * y,
+            c2_cross * y * z,
+            c2_cross * z * x,
+            c2_z * (3.0 * z.square() - 1.0),
+            c2_xy * (x.square() - y.square()),
+        ),
+        dim=-1,
+    )
+    basis.masked_fill_(~relation.valid[..., None], 0.0)
+    return basis, relation.valid
+
 
 def _plain_eager_no_grad_execution() -> bool:
     """Return whether private storage reuse cannot hide tensor interception."""
@@ -347,7 +421,7 @@ class SphericalRayFeatureLifting(nn.Module):
     def _can_reuse_owned_delta(
         self,
         keypoint_features: torch.Tensor,
-        relation: torch.Tensor | RayFeatureRelation,
+        relation: torch.Tensor | RayFeatureRelation | _PreparedRayFeatureRelation,
     ) -> bool:
         """Seal the allocation-reuse path to released compact eager inference."""
 
@@ -361,9 +435,17 @@ class SphericalRayFeatureLifting(nn.Module):
             or type(self)._forward_lifted_owned_delta_inference
             is not _RELEASED_RFL_OWNED_DELTA_FORWARD
             or _mask_cast_and_add_owned_delta is not _RELEASED_MASK_CAST_ADD
+            or _plain_eager_no_grad_execution is not _RELEASED_PLAIN_EAGER_NO_GRAD
             or not _plain_eager_no_grad_execution()
             or type(keypoint_features) is not torch.Tensor
-            or type(relation) is not RayFeatureRelation
+            or not (
+                type(relation) is RayFeatureRelation
+                or (
+                    _is_prepared_ray_feature_relation
+                    is _RELEASED_PREPARED_RELATION_CHECK
+                    and _is_prepared_ray_feature_relation(relation)
+                )
+            )
             or type(relation.ray) is not torch.Tensor
             or type(relation.valid) is not torch.Tensor
             or keypoint_features.ndim != 5
@@ -468,10 +550,55 @@ class SphericalRayFeatureLifting(nn.Module):
             )
         )
 
+    def _can_use_prepared_relation(
+        self,
+        keypoint_features: torch.Tensor,
+        relation: object,
+    ) -> bool:
+        """Recognize the finite FP32 relation produced by released observation."""
+
+        return bool(
+            "_can_use_prepared_relation" not in self.__dict__
+            and type(self)._can_use_prepared_relation
+            is _RELEASED_RFL_PREPARED_RELATION_GUARD
+            and _PreparedRayFeatureRelation is _RELEASED_PREPARED_RELATION_TYPE
+            and _PREPARED_RELATION_PROVENANCE is _RELEASED_PREPARED_RELATION_PROVENANCE
+            and _is_prepared_ray_feature_relation is _RELEASED_PREPARED_RELATION_CHECK
+            and _prepared_compact_basis_and_valid is _RELEASED_PREPARED_BASIS_HELPER
+            and _plain_eager_no_grad_execution is _RELEASED_PLAIN_EAGER_NO_GRAD
+            and torch.nan_to_num is _RELEASED_TORCH_NAN_TO_NUM
+            and torch.where is _RELEASED_TORCH_WHERE
+            and torch.zeros_like is _RELEASED_TORCH_ZEROS_LIKE
+            and F.normalize is _RELEASED_FUNCTIONAL_NORMALIZE
+            and torch.stack is _RELEASED_TORCH_STACK
+            and torch.full_like is _RELEASED_TORCH_FULL_LIKE
+            and torch.Tensor.masked_fill_ is _RELEASED_TENSOR_MASKED_FILL_INPLACE
+            and math.sqrt is _RELEASED_MATH_SQRT
+            and _plain_eager_no_grad_execution()
+            and _is_prepared_ray_feature_relation(relation)
+            and type(keypoint_features) is torch.Tensor
+            and type(relation.ray) is torch.Tensor
+            and type(relation.valid) is torch.Tensor
+            and keypoint_features.dtype is torch.float32
+            and relation.ray.dtype is torch.float32
+            and relation.valid.dtype is torch.bool
+            and relation.ray.shape == keypoint_features.shape[:-1] + (3,)
+            and relation.valid.shape == keypoint_features.shape[:-1]
+            and all(
+                value.device == keypoint_features.device
+                and value.layout == torch.strided
+                and not value.is_quantized
+                and not value.requires_grad
+                and value.is_contiguous()
+                and all(name is None for name in value.names)
+                for value in (keypoint_features, relation.ray, relation.valid)
+            )
+        )
+
     def _forward_lifted_owned_delta_inference(
         self,
         keypoint_features: torch.Tensor,
-        relation: torch.Tensor | RayFeatureRelation,
+        relation: torch.Tensor | RayFeatureRelation | _PreparedRayFeatureRelation,
     ) -> torch.Tensor:
         """Return ``features + RFL(features)`` on the sealed lean edge.
 
@@ -481,12 +608,26 @@ class SphericalRayFeatureLifting(nn.Module):
         fail closed to their historical allocation and interception surface.
         """
 
+        carrier_relation = type(relation) is _RELEASED_PREPARED_RELATION_TYPE
+        prepared_relation = bool(
+            carrier_relation
+            and _is_prepared_ray_feature_relation is _RELEASED_PREPARED_RELATION_CHECK
+            and _is_prepared_ray_feature_relation(relation)
+        )
+        public_relation = (
+            RayFeatureRelation(ray=relation.ray, valid=relation.valid)
+            if carrier_relation
+            else relation
+        )
         if (
             "_can_reuse_owned_delta" in self.__dict__
             or type(self)._can_reuse_owned_delta is not _RELEASED_RFL_REUSE_GUARD
             or not self._can_reuse_owned_delta(keypoint_features, relation)
         ):
-            return keypoint_features + 1.0 * self(keypoint_features, relation)
+            return keypoint_features + 1.0 * self(
+                keypoint_features,
+                public_relation,
+            )
 
         features = torch.nan_to_num(
             keypoint_features.float(),
@@ -494,7 +635,17 @@ class SphericalRayFeatureLifting(nn.Module):
             posinf=0.0,
             neginf=0.0,
         )
-        basis, valid = self.compact_basis_and_valid(relation)
+        use_prepared_relation = bool(
+            prepared_relation
+            and "_can_use_prepared_relation" not in self.__dict__
+            and type(self)._can_use_prepared_relation
+            is _RELEASED_RFL_PREPARED_RELATION_GUARD
+            and self._can_use_prepared_relation(keypoint_features, relation)
+        )
+        if use_prepared_relation:
+            basis, valid = _prepared_compact_basis_and_valid(relation)
+        else:
+            basis, valid = self.compact_basis_and_valid(public_relation)
         appearance = self.appearance_proj(self.feature_norm(features))
         if self.ray_proj is None:
             lifted = basis[..., :, None] * appearance[..., None, :]
@@ -517,15 +668,34 @@ class SphericalRayFeatureLifting(nn.Module):
             or delta.shape != keypoint_features.shape
             or any(name is not None for name in delta.names)
         ):
-            return keypoint_features + 1.0 * self(keypoint_features, relation)
+            return keypoint_features + 1.0 * self(
+                keypoint_features,
+                public_relation,
+            )
         return _mask_cast_and_add_owned_delta(keypoint_features, delta, valid)
 
 
 _RELEASED_LINEAR_FORWARD = nn.Linear.forward
 _RELEASED_LAYER_NORM_FORWARD = nn.LayerNorm.forward
 _RELEASED_MASK_CAST_ADD = _mask_cast_and_add_owned_delta
+_RELEASED_PLAIN_EAGER_NO_GRAD = _plain_eager_no_grad_execution
+_RELEASED_PREPARED_RELATION_TYPE = _PreparedRayFeatureRelation
+_RELEASED_PREPARED_RELATION_PROVENANCE = _PREPARED_RELATION_PROVENANCE
+_RELEASED_PREPARED_RELATION_CHECK = _is_prepared_ray_feature_relation
+_RELEASED_PREPARED_BASIS_HELPER = _prepared_compact_basis_and_valid
+_RELEASED_TORCH_NAN_TO_NUM = torch.nan_to_num
+_RELEASED_TORCH_WHERE = torch.where
+_RELEASED_TORCH_ZEROS_LIKE = torch.zeros_like
+_RELEASED_FUNCTIONAL_NORMALIZE = F.normalize
+_RELEASED_TORCH_STACK = torch.stack
+_RELEASED_TORCH_FULL_LIKE = torch.full_like
+_RELEASED_TENSOR_MASKED_FILL_INPLACE = torch.Tensor.masked_fill_
+_RELEASED_MATH_SQRT = math.sqrt
 _RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
 _RELEASED_RFL_REUSE_GUARD = SphericalRayFeatureLifting._can_reuse_owned_delta
+_RELEASED_RFL_PREPARED_RELATION_GUARD = (
+    SphericalRayFeatureLifting._can_use_prepared_relation
+)
 _RELEASED_RFL_OWNED_DELTA_FORWARD = (
     SphericalRayFeatureLifting._forward_lifted_owned_delta_inference
 )
