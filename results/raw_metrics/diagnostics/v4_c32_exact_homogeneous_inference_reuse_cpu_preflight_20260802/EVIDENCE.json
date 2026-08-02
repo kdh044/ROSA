@@ -1,0 +1,45 @@
+{
+  "schema": "rosa.c32.exact_homogeneous_inference_reuse.cpu_preflight.v4",
+  "status": "AUTHOR_CPU_PREFLIGHT_NOT_ADOPTED",
+  "parent_commit": "e4f533aaaa01d2293f1e70e13ea7fdfcc31cf60d",
+  "candidate_commit": "8d29476437f3f1aaaec0138ee2ff90dfb3d0e4ff",
+  "candidate_tree": "2e7cdce1857837bbf8528732808948b4e7e432dd",
+  "camera_transform": "homogeneous_4x4",
+  "reduction_order_changed": false,
+  "storage_reuse": true,
+  "training": "fail closed",
+  "grad_enabled_evaluation": "fail closed",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "new_user_exposed_numeric_dimensions": 0,
+  "registered_module_component_raw_bit_equal": true,
+  "registered_module_dtypes": ["float16", "float32", "float64"],
+  "inherited_bfloat16_and_adversarial_exactness": true,
+  "model_identity": {
+    "state_keys": 595,
+    "parameters": 29667109,
+    "buffer_elements": 10097,
+    "state_bytes_equal": true,
+    "construction_rng_equal": true,
+    "strict_load_equal": true
+  },
+  "tests": {
+    "focused": "63 passed",
+    "full_cpu_suite": "300 passed, 5 optional-host skipped"
+  },
+  "source_sha256": {
+    "src/rosa/integrations/sparse4d.py": "fe8f744a2a258208626773f465f142141fed272f35afa4e98b09acece609b231",
+    "tests/test_ocam_inference_storage_reuse.py": "48000e1021bc1c999c65e36879f3e1b533c56df2e04f6e7e84a4cad984af94f5",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_homogeneous4x4_inference_reuse_exact.py": "8a04026749427884160d25e11ece4b20eaf9b79e4d4f01293d6377fc763d06a8"
+  },
+  "gpu_execution": false,
+  "official_metric_execution": false,
+  "speed_claim": false,
+  "pending": [
+    "independent CPU source and evidence audit",
+    "CUDA projection and D0-D5 raw-bit equality",
+    "official Main126 metric closure",
+    "full-test-step CUDA median, p95, allocated, and reserved-memory gates"
+  ]
+}
