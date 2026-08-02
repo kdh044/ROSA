@@ -20,7 +20,6 @@ from typing import Any, Iterable
 import numpy as np
 import torch
 
-
 PARENT_ARM = "parent"
 CANDIDATE_ARM = "candidate"
 CPU_METADATA_PROTOCOL = "cpu-metadata"
@@ -32,9 +31,7 @@ CPPC = "CPPC"
 PHYSICAL_ROUND_ORDER = (PCCP, CPPC, PCCP, CPPC, PCCP, CPPC)
 PHYSICAL_ROUND_COUNT = len(PHYSICAL_ROUND_ORDER)
 INVOCATIONS_PER_ARM_PER_BLOCK = 2
-ITERATIONS_PER_ARM_GRANULARITY = (
-    PHYSICAL_ROUND_COUNT * INVOCATIONS_PER_ARM_PER_BLOCK
-)
+ITERATIONS_PER_ARM_GRANULARITY = PHYSICAL_ROUND_COUNT * INVOCATIONS_PER_ARM_PER_BLOCK
 MINIMUM_WARMUP_ITERATIONS_PER_ARM = 50
 MINIMUM_MEASURED_ITERATIONS_PER_ARM = 300
 DEFAULT_WARMUP_ITERATIONS_PER_ARM = 60
@@ -52,19 +49,46 @@ EXPECTED_MODEL_TYPE = "Fisheye3DODGravityCenterSparse4D"
 EXPECTED_HEAD_TYPE = "ROSAOfficialResidualNativeBaselineHead"
 EXPECTED_PARENT_PREPROCESSOR = "Sparse4DDataPreprocessor"
 EXPECTED_CANDIDATE_PREPROCESSOR = "Fisheye3DODSingleFrameDataPreprocessor"
-EXPECTED_REPRESENTATION_PREPROCESSOR = (
-    "Fisheye3DODSingleFrameDataPreprocessor"
-)
+EXPECTED_REPRESENTATION_PREPROCESSOR = "Fisheye3DODSingleFrameDataPreprocessor"
 EXPECTED_LEAN_LOADER = "LoadOfficialFisheye3DODLeanForSparse4D"
 EXPECTED_PARENT_PACKER = "PackSparse4DInputs"
 EXPECTED_CANDIDATE_PACKER = "PackFisheye3DODUint8Inputs"
-EXPECTED_RUNTIME_TRANSFORM_IMPORT = (
-    "rosa.integrations.fisheye3dod.runtime_transforms"
-)
+EXPECTED_RUNTIME_TRANSFORM_IMPORT = "rosa.integrations.fisheye3dod.runtime_transforms"
 REPRESENTATION_STREAM_POLICY = "torch-current-default-stream-only"
 MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM = 1.01
 MODEL_ONLY_P95_RATIO_MAXIMUM = 1.01
 NON_EXECUTABLE_CONFIG_KEYS = ("work_dir", "experiment_contract")
+
+# Representation-runtime v2 is deliberately a single immutable experiment.
+# These are equality constraints, not user-tunable defaults.  Keeping them in
+# the CUDA-free contract module lets the dry-run reject protocol drift before
+# a model, dataloader, or accelerator API is touched.
+REPRESENTATION_CAPTURE_BATCHES = 2
+REPRESENTATION_WARMUP_ITERATIONS_PER_ARM = 60
+REPRESENTATION_MEASURED_ITERATIONS_PER_ARM = 300
+REPRESENTATION_EXPECTED_BATCH_SIZE = 4
+REPRESENTATION_DATALOADER_WORKERS = 0
+REPRESENTATION_SEED = 3407
+REPRESENTATION_SEQUENCE_PAIRS_PER_ARM = (
+    REPRESENTATION_WARMUP_ITERATIONS_PER_ARM
+    + REPRESENTATION_MEASURED_ITERATIONS_PER_ARM
+)
+REPRESENTATION_C32_E20_CHECKPOINT_SHA256 = (
+    "cb5b0956ab8357d64bbcde919d8aa10aa772d03c73252c137709529e6299e85d"
+)
+REPRESENTATION_PARENT_NORMALIZED_CONFIG_SHA256 = (
+    "3496f6f0459fbf443dcc94659c5a2de35acaefd837f29f968f96437cc40d2559"
+)
+REPRESENTATION_CANDIDATE_NORMALIZED_CONFIG_SHA256 = (
+    "d79deb42055136c0137fa7e101dc53156899f25e9b5b85bff2146f10e9474c91"
+)
+REPRESENTATION_PREREGISTRATION_SCHEMA = (
+    "rosa.c32_representation_runtime_preregistration.v2"
+)
+REPRESENTATION_SEQUENCE_SCHEMA = "rosa.live_representation_pair_sequence.v2"
+REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA = (
+    "rosa.timed_common_preprocessor_boundary_receipt.v2"
+)
 
 
 class VerificationContractError(ValueError):
@@ -94,9 +118,7 @@ def _exact_integer(name: str, value: Any, *, minimum: int) -> int:
     try:
         observed = operator.index(value)
     except TypeError as error:
-        raise VerificationContractError(
-            f"{name} must be an exact integer"
-        ) from error
+        raise VerificationContractError(f"{name} must be an exact integer") from error
     if observed < minimum:
         raise VerificationContractError(f"{name} must be >= {minimum}")
     return observed
@@ -112,9 +134,7 @@ def validate_runtime_parameters(
 ) -> dict[str, int]:
     """Validate the immutable timing/capture shape before any execution."""
 
-    capture_batches = _exact_integer(
-        "capture_batches", capture_batches, minimum=1
-    )
+    capture_batches = _exact_integer("capture_batches", capture_batches, minimum=1)
     warmup_iterations_per_arm = _exact_integer(
         "warmup_iterations_per_arm",
         warmup_iterations_per_arm,
@@ -163,6 +183,79 @@ def validate_runtime_parameters(
     }
 
 
+def validate_representation_protocol_freeze(
+    *,
+    parameters: Mapping[str, Any],
+    dataloader_workers: int,
+    seed: int,
+    checkpoint_sha256: str,
+    config_contract: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Reject every deviation from the one preregistered representation run.
+
+    This is intentionally stricter than :func:`validate_runtime_parameters`:
+    values that are useful CLI options for the older CPU-metadata protocol are
+    not tuning knobs in the representation experiment.
+    """
+
+    expected_parameters = {
+        "capture_batches": REPRESENTATION_CAPTURE_BATCHES,
+        "warmup_iterations_per_arm": (REPRESENTATION_WARMUP_ITERATIONS_PER_ARM),
+        "measured_iterations_per_arm": (REPRESENTATION_MEASURED_ITERATIONS_PER_ARM),
+        "expected_batch_size": REPRESENTATION_EXPECTED_BATCH_SIZE,
+    }
+    if not isinstance(parameters, Mapping):
+        raise VerificationContractError("representation parameters must be a mapping")
+    for name, expected in expected_parameters.items():
+        if parameters.get(name) != expected:
+            raise VerificationContractError(
+                f"representation protocol freezes {name}={expected}"
+            )
+    if dataloader_workers != REPRESENTATION_DATALOADER_WORKERS:
+        raise VerificationContractError(
+            "representation protocol freezes dataloader_workers=0"
+        )
+    if seed != REPRESENTATION_SEED:
+        raise VerificationContractError(
+            f"representation protocol freezes seed={REPRESENTATION_SEED}"
+        )
+    if checkpoint_sha256 != REPRESENTATION_C32_E20_CHECKPOINT_SHA256:
+        raise VerificationContractError(
+            "representation protocol requires the exact official C32 e20 "
+            "checkpoint SHA256"
+        )
+    if not isinstance(config_contract, Mapping):
+        raise VerificationContractError(
+            "representation config contract must be a mapping"
+        )
+    parent_digest = config_contract.get("parent_normalized_config_sha256")
+    candidate_digest = config_contract.get("candidate_normalized_config_sha256")
+    if parent_digest != REPRESENTATION_PARENT_NORMALIZED_CONFIG_SHA256:
+        raise VerificationContractError(
+            "representation parent normalized config digest changed"
+        )
+    if candidate_digest != REPRESENTATION_CANDIDATE_NORMALIZED_CONFIG_SHA256:
+        raise VerificationContractError(
+            "representation candidate normalized config digest changed"
+        )
+    return {
+        "capture_batches": REPRESENTATION_CAPTURE_BATCHES,
+        "warmup_iterations_per_arm": (REPRESENTATION_WARMUP_ITERATIONS_PER_ARM),
+        "measured_iterations_per_arm": (REPRESENTATION_MEASURED_ITERATIONS_PER_ARM),
+        "sequence_pairs_per_arm": REPRESENTATION_SEQUENCE_PAIRS_PER_ARM,
+        "expected_batch_size": REPRESENTATION_EXPECTED_BATCH_SIZE,
+        "dataloader_workers": REPRESENTATION_DATALOADER_WORKERS,
+        "seed": REPRESENTATION_SEED,
+        "checkpoint_sha256": REPRESENTATION_C32_E20_CHECKPOINT_SHA256,
+        "parent_normalized_config_sha256": (
+            REPRESENTATION_PARENT_NORMALIZED_CONFIG_SHA256
+        ),
+        "candidate_normalized_config_sha256": (
+            REPRESENTATION_CANDIDATE_NORMALIZED_CONFIG_SHA256
+        ),
+    }
+
+
 def build_alternating_schedule(
     *,
     iterations_per_arm: int,
@@ -190,9 +283,7 @@ def build_alternating_schedule(
         raise VerificationContractError("phase must be a nonempty string")
     entries: list[ScheduleEntry] = []
     arm_for_token = {"P": PARENT_ARM, "C": CANDIDATE_ARM}
-    iterations_per_segment = (
-        iterations_per_arm // ITERATIONS_PER_ARM_GRANULARITY
-    )
+    iterations_per_segment = iterations_per_arm // ITERATIONS_PER_ARM_GRANULARITY
     for round_index, pattern in enumerate(PHYSICAL_ROUND_ORDER):
         pairs_per_round = 2 * iterations_per_segment
         for slot_index, token in enumerate(pattern):
@@ -251,9 +342,7 @@ def summarize_timings(
     sample_count = 0
     for record in selected:
         elapsed = _exact_integer("elapsed_ns", record.get("elapsed_ns"), minimum=1)
-        samples = _exact_integer(
-            "sample_count", record.get("sample_count"), minimum=1
-        )
+        samples = _exact_integer("sample_count", record.get("sample_count"), minimum=1)
         elapsed_ns.append(elapsed)
         sample_count += samples
     milliseconds = [value / 1_000_000.0 for value in elapsed_ns]
@@ -275,9 +364,7 @@ def _timing_pairs(
     expected_pairs: int,
     required_pair_fields: Sequence[str] = (),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    expected_pairs = _exact_integer(
-        "expected_pairs", expected_pairs, minimum=1
-    )
+    expected_pairs = _exact_integer("expected_pairs", expected_pairs, minimum=1)
     if expected_pairs % ITERATIONS_PER_ARM_GRANULARITY:
         raise VerificationContractError(
             "expected_pairs must preserve equal six-round arm segments"
@@ -287,9 +374,7 @@ def _timing_pairs(
         arm = record.get("arm")
         if arm not in (PARENT_ARM, CANDIDATE_ARM):
             raise VerificationContractError("timing record has an invalid arm")
-        pair_index = _exact_integer(
-            "pair_index", record.get("pair_index"), minimum=0
-        )
+        pair_index = _exact_integer("pair_index", record.get("pair_index"), minimum=0)
         pair = grouped.setdefault(pair_index, {})
         if arm in pair:
             raise VerificationContractError(
@@ -311,8 +396,7 @@ def _timing_pairs(
         )
     normalized_required_fields = tuple(required_pair_fields)
     if any(
-        not isinstance(name, str) or not name
-        for name in normalized_required_fields
+        not isinstance(name, str) or not name for name in normalized_required_fields
     ):
         raise VerificationContractError(
             "required_pair_fields must contain nonempty strings"
@@ -362,9 +446,7 @@ def _timing_pairs(
         expected_slots = {first_slot, first_slot + 1}
         observed_slots = {
             _exact_integer("slot_index", parent.get("slot_index"), minimum=0),
-            _exact_integer(
-                "slot_index", candidate.get("slot_index"), minimum=0
-            ),
+            _exact_integer("slot_index", candidate.get("slot_index"), minimum=0),
         }
         if observed_slots != expected_slots:
             raise VerificationContractError(
@@ -398,9 +480,7 @@ def _timing_pairs(
         sample_counts.append(parent_samples)
         round_pair_counts[round_index] += 1
 
-    expected_per_round, remainder = divmod(
-        expected_pairs, PHYSICAL_ROUND_COUNT
-    )
+    expected_per_round, remainder = divmod(expected_pairs, PHYSICAL_ROUND_COUNT)
     if remainder or round_pair_counts != [expected_per_round] * PHYSICAL_ROUND_COUNT:
         raise VerificationContractError(
             "timing pairs must be equally distributed across all six rounds"
@@ -440,8 +520,7 @@ def paired_bootstrap_confidence_intervals(
     )
     point_estimates = {
         "median_candidate_over_parent": (
-            percentile(candidate_ns.tolist(), 0.5)
-            / percentile(parent_ns.tolist(), 0.5)
+            percentile(candidate_ns.tolist(), 0.5) / percentile(parent_ns.tolist(), 0.5)
         ),
         "p95_candidate_over_parent": (
             percentile(candidate_ns.tolist(), 0.95)
@@ -478,9 +557,7 @@ def paired_bootstrap_confidence_intervals(
         )
 
     generated = np.random.Generator(np.random.PCG64(seed))
-    bootstrap_values: dict[str, list[float]] = {
-        name: [] for name in point_estimates
-    }
+    bootstrap_values: dict[str, list[float]] = {name: [] for name in point_estimates}
     remaining = bootstrap_samples
     chunk_size = 512
     while remaining:
@@ -492,24 +569,19 @@ def paired_bootstrap_confidence_intervals(
             endpoint=False,
         )
         round_offsets = (
-            np.arange(PHYSICAL_ROUND_COUNT, dtype=np.int64)
-            .reshape(1, PHYSICAL_ROUND_COUNT, 1)
+            np.arange(PHYSICAL_ROUND_COUNT, dtype=np.int64).reshape(
+                1, PHYSICAL_ROUND_COUNT, 1
+            )
             * pairs_per_round
         )
-        indices = (within_round_indices + round_offsets).reshape(
-            count, len(parent_ns)
-        )
+        indices = (within_round_indices + round_offsets).reshape(count, len(parent_ns))
         parent_samples_ns = parent_ns[indices]
         candidate_samples_ns = candidate_ns[indices]
         sampled_counts = sample_counts[indices]
         parent_medians = np.median(parent_samples_ns, axis=1)
         candidate_medians = np.median(candidate_samples_ns, axis=1)
-        parent_p95 = np.quantile(
-            parent_samples_ns, 0.95, axis=1, method="linear"
-        )
-        candidate_p95 = np.quantile(
-            candidate_samples_ns, 0.95, axis=1, method="linear"
-        )
+        parent_p95 = np.quantile(parent_samples_ns, 0.95, axis=1, method="linear")
+        candidate_p95 = np.quantile(candidate_samples_ns, 0.95, axis=1, method="linear")
         sample_totals = sampled_counts.sum(axis=1)
         parent_throughput = sample_totals / parent_samples_ns.sum(axis=1)
         candidate_throughput = sample_totals / candidate_samples_ns.sum(axis=1)
@@ -560,9 +632,7 @@ def evaluate_strict_lightweight_gate(
     median_upper = float(
         _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
     )
-    p95_ratio = float(
-        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
-    )
+    p95_ratio = float(_nested(metrics, "p95_candidate_over_parent", "point_estimate"))
     parent_memory = _nested(memory, PARENT_ARM)
     candidate_memory = _nested(memory, CANDIDATE_ARM)
     parent_peak_allocated = _exact_integer(
@@ -585,7 +655,9 @@ def evaluate_strict_lightweight_gate(
         _nested(candidate_memory, "peak_reserved_bytes"),
         minimum=0,
     )
-    if not all(math.isfinite(value) for value in (median_ratio, median_upper, p95_ratio)):
+    if not all(
+        math.isfinite(value) for value in (median_ratio, median_upper, p95_ratio)
+    ):
         raise VerificationContractError("decision metrics must be finite")
     checks = {
         "median_reduction_at_least_2_percent": {
@@ -619,9 +691,7 @@ def evaluate_strict_lightweight_gate(
         "gate": "strict_lightweight_adoption",
         "passed": passed,
         "decision": (
-            "ADOPT_CANDIDATE"
-            if passed
-            else "RETAIN_PARENT_AND_REPORT_INCONCLUSIVE"
+            "ADOPT_CANDIDATE" if passed else "RETAIN_PARENT_AND_REPORT_INCONCLUSIVE"
         ),
         "checks": checks,
     }
@@ -636,20 +706,14 @@ def evaluate_c32_near_native_gate(
     median_upper = float(
         _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
     )
-    p95_ratio = float(
-        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
-    )
+    p95_ratio = float(_nested(metrics, "p95_candidate_over_parent", "point_estimate"))
     if not all(math.isfinite(value) for value in (median_upper, p95_ratio)):
         raise VerificationContractError("near-native metrics must be finite")
     checks = {
         "median_ratio_ci95_upper_at_most_1_10": {
             "observed": median_upper,
-            "threshold_max_inclusive": (
-                NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
-            ),
-            "passed": (
-                median_upper <= NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
-            ),
+            "threshold_max_inclusive": (NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM),
+            "passed": (median_upper <= NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM),
         },
         "p95_ratio_at_most_1_10": {
             "observed_candidate_over_parent": p95_ratio,
@@ -662,9 +726,7 @@ def evaluate_c32_near_native_gate(
         "gate": "c32_vs_c0_near_native_statement",
         "passed": passed,
         "decision": (
-            "NEAR_NATIVE_SUPPORTED"
-            if passed
-            else "NEAR_NATIVE_NOT_SUPPORTED"
+            "NEAR_NATIVE_SUPPORTED" if passed else "NEAR_NATIVE_NOT_SUPPORTED"
         ),
         "checks": checks,
     }
@@ -679,20 +741,14 @@ def evaluate_model_only_non_regression_gate(
     median_upper = float(
         _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
     )
-    p95_ratio = float(
-        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
-    )
+    p95_ratio = float(_nested(metrics, "p95_candidate_over_parent", "point_estimate"))
     if not all(math.isfinite(value) for value in (median_upper, p95_ratio)):
         raise VerificationContractError("model-only decision metrics must be finite")
     checks = {
         "median_ratio_ci95_upper_at_most_1_01": {
             "observed": median_upper,
-            "threshold_max_inclusive": (
-                MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
-            ),
-            "passed": (
-                median_upper <= MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
-            ),
+            "threshold_max_inclusive": (MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM),
+            "passed": (median_upper <= MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM),
         },
         "p95_ratio_at_most_1_01": {
             "observed_candidate_over_parent": p95_ratio,
@@ -715,18 +771,18 @@ def evaluate_input_pipeline_gate(
     paired_bootstrap: Mapping[str, Any],
     representation_pairs: Sequence[Mapping[str, Any]],
     *,
-    common_boundary_parity: bool,
+    common_boundary_receipt: Mapping[str, Any],
 ) -> dict[str, Any]:
     """Gate loader+collate+transfer separately from model execution."""
 
-    if common_boundary_parity is not True:
-        raise VerificationContractError(
-            "input-pipeline timing requires exact common-boundary parity"
-        )
     if not isinstance(representation_pairs, Sequence) or not representation_pairs:
         raise VerificationContractError(
             "input-pipeline gate requires representation pair manifests"
         )
+    boundary_contract = validate_timed_common_boundary_receipt(
+        common_boundary_receipt,
+        representation_pairs,
+    )
     metrics = _nested(paired_bootstrap, "metrics")
     median_ratio = float(
         _nested(metrics, "median_candidate_over_parent", "point_estimate")
@@ -734,12 +790,9 @@ def evaluate_input_pipeline_gate(
     median_upper = float(
         _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
     )
-    p95_ratio = float(
-        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
-    )
+    p95_ratio = float(_nested(metrics, "p95_candidate_over_parent", "point_estimate"))
     if not all(
-        math.isfinite(value)
-        for value in (median_ratio, median_upper, p95_ratio)
+        math.isfinite(value) for value in (median_ratio, median_upper, p95_ratio)
     ):
         raise VerificationContractError("input-pipeline metrics must be finite")
     byte_records = []
@@ -768,6 +821,8 @@ def evaluate_input_pipeline_gate(
         )
     checks = {
         "common_preprocessor_boundary_raw_bit_parity": {
+            "receipt_sha256": boundary_contract["sha256"],
+            "timed_pairs": boundary_contract["pairs"],
             "passed": True,
         },
         "candidate_ingress_bytes_strictly_lower": {
@@ -818,9 +873,7 @@ def _nested(mapping: Mapping[str, Any], *keys: str) -> Any:
     value: Any = mapping
     for key in keys:
         if not isinstance(value, Mapping) or key not in value:
-            raise VerificationContractError(
-                "config is missing " + ".".join(keys)
-            )
+            raise VerificationContractError("config is missing " + ".".join(keys))
         value = value[key]
     return value
 
@@ -830,17 +883,13 @@ def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
 
     if not isinstance(plan, Mapping):
         raise VerificationContractError("preregistration plan must be a mapping")
-    expected_schema = (
-        "rosa.exacte94_lightweight_fresh30_runtime_preregistration.v1"
-    )
+    expected_schema = "rosa.exacte94_lightweight_fresh30_runtime_preregistration.v1"
     if plan.get("schema") != expected_schema:
         raise VerificationContractError("unexpected preregistration schema")
     if plan.get("status") != "PREPARATION_ONLY_DISARMED":
         raise VerificationContractError("preregistration status is not frozen")
     if plan.get("execution_authorized") is not False:
-        raise VerificationContractError(
-            "preregistration must remain non-authorizing"
-        )
+        raise VerificationContractError("preregistration must remain non-authorizing")
     gate = _nested(plan, "future_cuda_gate")
     if _nested(gate, "correctness_before_timing") is not True:
         raise VerificationContractError(
@@ -871,9 +920,10 @@ def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "allocated/reserved/peak memory",
         "full environment and hashes",
     }
-    if not isinstance(required_reporting, (list, tuple)) or set(
-        required_reporting
-    ) != expected_reporting:
+    if (
+        not isinstance(required_reporting, (list, tuple))
+        or set(required_reporting) != expected_reporting
+    ):
         raise VerificationContractError(
             "preregistration reporting requirements changed"
         )
@@ -892,12 +942,11 @@ def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "no concurrent GPU workload",
     }
     environment_pins = _nested(gate, "environment_pins")
-    if not isinstance(environment_pins, (list, tuple)) or set(
-        environment_pins
-    ) != expected_environment_pins:
-        raise VerificationContractError(
-            "preregistration environment pins changed"
-        )
+    if (
+        not isinstance(environment_pins, (list, tuple))
+        or set(environment_pins) != expected_environment_pins
+    ):
+        raise VerificationContractError("preregistration environment pins changed")
     strict_gate = _nested(gate, "strict_lightweight_adoption_gate")
     expected_gate = {
         "same_checkpoint_and_exact_outputs": True,
@@ -915,9 +964,7 @@ def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
     near_native_gate = _nested(gate, "c32_vs_c0_near_native_gate")
     expected_near_native_gate = {
         "same_checkpoint_and_inputs": True,
-        "upper_95ci_median_ratio_max": (
-            NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
-        ),
+        "upper_95ci_median_ratio_max": (NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM),
         "p95_ratio_max": NEAR_NATIVE_P95_RATIO_MAXIMUM,
     }
     if dict(near_native_gate) != expected_near_native_gate:
@@ -933,9 +980,7 @@ def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
         "execution_authorized": False,
         "correctness_before_timing": True,
         "minimum_warmup_iterations_per_arm": MINIMUM_WARMUP_ITERATIONS_PER_ARM,
-        "minimum_measured_iterations_per_arm": (
-            MINIMUM_MEASURED_ITERATIONS_PER_ARM
-        ),
+        "minimum_measured_iterations_per_arm": (MINIMUM_MEASURED_ITERATIONS_PER_ARM),
         "physical_round_order": list(PHYSICAL_ROUND_ORDER),
         "environment_pins": sorted(expected_environment_pins),
         "strict_lightweight_gate": expected_gate,
@@ -948,6 +993,242 @@ def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
             "seed": BOOTSTRAP_SEED,
             "samples": BOOTSTRAP_SAMPLES,
         },
+    }
+
+
+def _is_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def validate_representation_sequence_document(
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Validate the immutable 360-pair arm-specific preregistration payload."""
+
+    if not isinstance(document, Mapping):
+        raise VerificationContractError(
+            "representation sequence manifest must be a mapping"
+        )
+    if document.get("schema") != REPRESENTATION_SEQUENCE_SCHEMA:
+        raise VerificationContractError(
+            "unexpected representation sequence manifest schema"
+        )
+    if document.get("protocol") != REPRESENTATION_PROTOCOL:
+        raise VerificationContractError(
+            "representation sequence manifest protocol changed"
+        )
+    if document.get("pairs_per_arm") != REPRESENTATION_SEQUENCE_PAIRS_PER_ARM:
+        raise VerificationContractError(
+            "representation sequence manifest must contain exactly 360 pairs"
+        )
+    pairs = document.get("pairs")
+    if not isinstance(pairs, list) or len(pairs) != (
+        REPRESENTATION_SEQUENCE_PAIRS_PER_ARM
+    ):
+        raise VerificationContractError(
+            "representation sequence pair payload is incomplete"
+        )
+    observed_identities: set[str] = set()
+    for pair_index, pair in enumerate(pairs):
+        if not isinstance(pair, Mapping):
+            raise VerificationContractError(
+                f"representation sequence pair {pair_index} is not a mapping"
+            )
+        if pair.get("schema") != "rosa.representation_pair.v1":
+            raise VerificationContractError(
+                f"representation sequence pair {pair_index} schema changed"
+            )
+        if pair.get("batch_index") != pair_index:
+            raise VerificationContractError(
+                "representation sequence pair indices are not contiguous"
+            )
+        if not _is_sha256(pair.get("semantic_sha256")):
+            raise VerificationContractError(
+                f"representation sequence pair {pair_index} lacks semantic SHA"
+            )
+        arms = pair.get("arms")
+        if not isinstance(arms, Mapping) or set(arms) != {
+            PARENT_ARM,
+            CANDIDATE_ARM,
+        }:
+            raise VerificationContractError(
+                f"representation sequence pair {pair_index} arms changed"
+            )
+        for arm in (PARENT_ARM, CANDIDATE_ARM):
+            arm_manifest = arms[arm]
+            if not isinstance(arm_manifest, Mapping):
+                raise VerificationContractError(
+                    f"representation sequence pair {pair_index} {arm} "
+                    "manifest is invalid"
+                )
+            if arm_manifest.get("arm") != arm:
+                raise VerificationContractError(
+                    f"representation sequence pair {pair_index} arm label changed"
+                )
+            if arm_manifest.get("batch_index") != pair_index:
+                raise VerificationContractError(
+                    "representation arm manifest batch index changed"
+                )
+            if arm_manifest.get("semantic_sha256") != pair.get("semantic_sha256"):
+                raise VerificationContractError(
+                    "representation arm semantic digest changed"
+                )
+            fingerprint = arm_manifest.get("representation_fingerprint")
+            if not isinstance(fingerprint, Mapping) or not _is_sha256(
+                fingerprint.get("sha256")
+            ):
+                raise VerificationContractError(
+                    "representation arm fingerprint is incomplete"
+                )
+            if not _is_sha256(arm_manifest.get("sha256")):
+                raise VerificationContractError(
+                    "representation arm manifest SHA is incomplete"
+                )
+            arm_payload = {
+                key: value
+                for key, value in arm_manifest.items()
+                if key != "sha256"
+            }
+            if arm_manifest["sha256"] != canonical_sha256(arm_payload):
+                raise VerificationContractError(
+                    "representation arm manifest SHA mismatch"
+                )
+            if arm_manifest.get("sample_identities") != pair.get(
+                "sample_identities"
+            ):
+                raise VerificationContractError(
+                    "representation arm sample identities changed"
+                )
+        if not _is_sha256(pair.get("sha256")):
+            raise VerificationContractError(
+                f"representation sequence pair {pair_index} SHA is missing"
+            )
+        if (
+            canonical_sha256(
+                {key: value for key, value in pair.items() if key != "sha256"}
+            )
+            != pair["sha256"]
+        ):
+            raise VerificationContractError(
+                f"representation sequence pair {pair_index} SHA mismatch"
+            )
+        identities = pair.get("sample_identities")
+        if not isinstance(identities, list) or len(identities) != (
+            REPRESENTATION_EXPECTED_BATCH_SIZE
+        ):
+            raise VerificationContractError(
+                "representation sequence sample identities are incomplete"
+            )
+        for identity in identities:
+            digest = canonical_sha256(identity)
+            if digest in observed_identities:
+                raise VerificationContractError(
+                    "representation sequence repeats a sample identity"
+                )
+            observed_identities.add(digest)
+    expected_document_sha = canonical_sha256(pairs)
+    if document.get("sha256") != expected_document_sha:
+        raise VerificationContractError("representation sequence document SHA mismatch")
+    return {
+        "schema": REPRESENTATION_SEQUENCE_SCHEMA,
+        "pairs_per_arm": REPRESENTATION_SEQUENCE_PAIRS_PER_ARM,
+        "samples": len(observed_identities),
+        "sha256": expected_document_sha,
+    }
+
+
+def validate_representation_preregistration_plan(
+    plan: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Accept a disarmed placeholder, but mark only a fully sealed plan ready."""
+
+    if not isinstance(plan, Mapping):
+        raise VerificationContractError(
+            "representation preregistration plan must be a mapping"
+        )
+    if plan.get("schema") != REPRESENTATION_PREREGISTRATION_SCHEMA:
+        raise VerificationContractError(
+            "unexpected representation preregistration schema"
+        )
+    if plan.get("protocol") != REPRESENTATION_PROTOCOL:
+        raise VerificationContractError(
+            "representation preregistration protocol changed"
+        )
+    if plan.get("execution_authorized") is not False:
+        raise VerificationContractError(
+            "representation preregistration is never execution authorization"
+        )
+    status = plan.get("status")
+    if status not in ("PLACEHOLDER_DISARMED", "SEALED"):
+        raise VerificationContractError(
+            "representation preregistration status is invalid"
+        )
+    frozen = plan.get("frozen_contract")
+    expected_frozen = {
+        "capture_batches": REPRESENTATION_CAPTURE_BATCHES,
+        "warmup_iterations_per_arm": (REPRESENTATION_WARMUP_ITERATIONS_PER_ARM),
+        "measured_iterations_per_arm": (REPRESENTATION_MEASURED_ITERATIONS_PER_ARM),
+        "sequence_pairs_per_arm": REPRESENTATION_SEQUENCE_PAIRS_PER_ARM,
+        "expected_batch_size": REPRESENTATION_EXPECTED_BATCH_SIZE,
+        "dataloader_workers": REPRESENTATION_DATALOADER_WORKERS,
+        "seed": REPRESENTATION_SEED,
+        "bootstrap_seed": BOOTSTRAP_SEED,
+        "bootstrap_samples": BOOTSTRAP_SAMPLES,
+        "physical_round_order": list(PHYSICAL_ROUND_ORDER),
+        "checkpoint_sha256": REPRESENTATION_C32_E20_CHECKPOINT_SHA256,
+        "parent_normalized_config_sha256": (
+            REPRESENTATION_PARENT_NORMALIZED_CONFIG_SHA256
+        ),
+        "candidate_normalized_config_sha256": (
+            REPRESENTATION_CANDIDATE_NORMALIZED_CONFIG_SHA256
+        ),
+    }
+    if frozen != expected_frozen:
+        raise VerificationContractError(
+            "representation preregistration frozen contract changed"
+        )
+    required_sections = (
+        "sequence_manifest",
+        "rosa_source_closure",
+        "detector_host_source_closure",
+        "official_source_closure",
+        "dataset_payload_closure",
+    )
+    sections = {}
+    for name in required_sections:
+        section = plan.get(name)
+        if not isinstance(section, Mapping):
+            raise VerificationContractError(
+                f"representation preregistration lacks {name}"
+            )
+        section_status = section.get("status")
+        if section_status not in ("MISSING", "SEALED"):
+            raise VerificationContractError(
+                f"representation preregistration {name} status is invalid"
+            )
+        if section_status == "SEALED":
+            if not isinstance(section.get("file"), str) or not _is_sha256(
+                section.get("sha256")
+            ):
+                raise VerificationContractError(
+                    f"representation preregistration {name} seal is incomplete"
+                )
+        sections[name] = section_status
+    ready = status == "SEALED" and all(value == "SEALED" for value in sections.values())
+    if status == "SEALED" and not ready:
+        raise VerificationContractError(
+            "SEALED representation preregistration has missing closures"
+        )
+    return {
+        "schema": REPRESENTATION_PREREGISTRATION_SCHEMA,
+        "status": status,
+        "ready_for_armed_execution": ready,
+        "sections": sections,
+        "frozen_contract": expected_frozen,
     }
 
 
@@ -1013,9 +1294,7 @@ def validate_config_pair(
                 )
 
     parent_preprocessor = _nested(parent, "model", "data_preprocessor", "type")
-    candidate_preprocessor = _nested(
-        candidate, "model", "data_preprocessor", "type"
-    )
+    candidate_preprocessor = _nested(candidate, "model", "data_preprocessor", "type")
     if parent_preprocessor != EXPECTED_PARENT_PREPROCESSOR:
         raise VerificationContractError(
             f"parent preprocessor must be {EXPECTED_PARENT_PREPROCESSOR}"
@@ -1027,9 +1306,9 @@ def validate_config_pair(
 
     normalized_parent = copy.deepcopy(parent)
     normalized_candidate = copy.deepcopy(candidate)
-    normalized_candidate["model"]["data_preprocessor"]["type"] = (
-        normalized_parent["model"]["data_preprocessor"]["type"]
-    )
+    normalized_candidate["model"]["data_preprocessor"]["type"] = normalized_parent[
+        "model"
+    ]["data_preprocessor"]["type"]
     for config in (normalized_parent, normalized_candidate):
         for key in NON_EXECUTABLE_CONFIG_KEYS:
             config.pop(key, None)
@@ -1089,6 +1368,13 @@ def validate_representation_config_pair(
     )
     parent = _mapping(parent_config)
     candidate = _mapping(candidate_config)
+    digest_parent = copy.deepcopy(parent)
+    digest_candidate = copy.deepcopy(candidate)
+    for config in (digest_parent, digest_candidate):
+        for key in NON_EXECUTABLE_CONFIG_KEYS:
+            config.pop(key, None)
+    parent_normalized_config_sha256 = canonical_sha256(digest_parent)
+    candidate_normalized_config_sha256 = canonical_sha256(digest_candidate)
     for label, config in ((PARENT_ARM, parent), (CANDIDATE_ARM, candidate)):
         if _nested(config, "model", "type") != EXPECTED_MODEL_TYPE:
             raise VerificationContractError(
@@ -1158,9 +1444,7 @@ def validate_representation_config_pair(
                 f"both representation arms must use {EXPECTED_LEAN_LOADER}"
             )
         if parent_loader.get("to_float32") is not True:
-            raise VerificationContractError(
-                "parent lean loader must emit FP32 images"
-            )
+            raise VerificationContractError("parent lean loader must emit FP32 images")
         if candidate_loader.get("to_float32") is not False:
             raise VerificationContractError(
                 "candidate lean loader must retain uint8 images"
@@ -1207,9 +1491,9 @@ def validate_representation_config_pair(
         }
         normalized_candidate[loader_name].pop("pin_memory", None)
         if "pin_memory" in normalized_parent[loader_name]:
-            normalized_candidate[loader_name]["pin_memory"] = (
-                normalized_parent[loader_name]["pin_memory"]
-            )
+            normalized_candidate[loader_name]["pin_memory"] = normalized_parent[
+                loader_name
+            ]["pin_memory"]
 
     parent_preprocessor = _nested(parent, "model", "data_preprocessor")
     candidate_preprocessor = _nested(candidate, "model", "data_preprocessor")
@@ -1230,9 +1514,7 @@ def validate_representation_config_pair(
             "representation pair requires parent non_blocking=False and "
             "candidate non_blocking=True"
         )
-    normalized_candidate["model"]["data_preprocessor"].pop(
-        "non_blocking", None
-    )
+    normalized_candidate["model"]["data_preprocessor"].pop("non_blocking", None)
     if "non_blocking" in normalized_parent["model"]["data_preprocessor"]:
         normalized_candidate["model"]["data_preprocessor"]["non_blocking"] = (
             normalized_parent["model"]["data_preprocessor"]["non_blocking"]
@@ -1275,6 +1557,8 @@ def validate_representation_config_pair(
         "stream_policy": REPRESENTATION_STREAM_POLICY,
         "test_batch_size": expected_batch_size,
         "normalized_config_sha256": canonical_sha256(normalized_parent),
+        "parent_normalized_config_sha256": parent_normalized_config_sha256,
+        "candidate_normalized_config_sha256": (candidate_normalized_config_sha256),
     }
 
 
@@ -1384,11 +1668,15 @@ class _RawFingerprinter:
             self.digest.update(struct.pack("!d", value))
             return
         if hasattr(value, "tensor") and isinstance(value.tensor, torch.Tensor):
-            self._tag(f"tensor-wrapper:{type(value).__module__}.{type(value).__qualname__}")
+            self._tag(
+                f"tensor-wrapper:{type(value).__module__}.{type(value).__qualname__}"
+            )
             self.visit(value.tensor, depth=depth + 1)
             return
         if hasattr(value, "to_dict") and callable(value.to_dict):
-            self._tag(f"data-element:{type(value).__module__}.{type(value).__qualname__}")
+            self._tag(
+                f"data-element:{type(value).__module__}.{type(value).__qualname__}"
+            )
             self.visit(value.to_dict(), depth=depth + 1)
             return
         raise VerificationContractError(
@@ -1428,9 +1716,7 @@ def _sample_identity(sample: Any, index: int) -> dict[str, Any]:
     if metainfo is None and isinstance(sample, Mapping):
         metainfo = sample.get("metainfo")
     if not isinstance(metainfo, Mapping):
-        raise VerificationContractError(
-            f"data sample {index} has no metainfo mapping"
-        )
+        raise VerificationContractError(f"data sample {index} has no metainfo mapping")
     keys = ("sample_idx", "token", "scene_token", "frame_idx", "timestamp")
     identity = {key: metainfo[key] for key in keys if key in metainfo}
     if not identity:
@@ -1543,9 +1829,7 @@ def build_representation_batch_manifest(
     inputs = batch.get("inputs")
     samples = batch.get("data_samples")
     if not isinstance(inputs, Mapping):
-        raise VerificationContractError(
-            "representation batch inputs must be a mapping"
-        )
+        raise VerificationContractError("representation batch inputs must be a mapping")
     if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
         raise VerificationContractError(
             "representation batch data_samples must be a sequence"
@@ -1559,9 +1843,7 @@ def build_representation_batch_manifest(
     if not isinstance(image, torch.Tensor):
         raise VerificationContractError("representation img must be a tensor")
     if image.layout != torch.strided or image.device.type != "cpu":
-        raise VerificationContractError(
-            "representation img must be a dense CPU tensor"
-        )
+        raise VerificationContractError("representation img must be a dense CPU tensor")
     if not image.is_contiguous():
         raise VerificationContractError("representation img must be contiguous")
     expected_shape = (expected_batch_size, 4, 3, 800, 800)
@@ -1569,9 +1851,7 @@ def build_representation_batch_manifest(
         raise VerificationContractError(
             f"representation img shape {tuple(image.shape)} != {expected_shape}"
         )
-    expected_dtype = (
-        torch.float32 if arm == PARENT_ARM else torch.uint8
-    )
+    expected_dtype = torch.float32 if arm == PARENT_ARM else torch.uint8
     if image.dtype != expected_dtype:
         raise VerificationContractError(
             f"{arm} representation img dtype {image.dtype} != {expected_dtype}"
@@ -1606,17 +1886,13 @@ def build_representation_batch_manifest(
                 f"representation {name} must have the frozen batch dimension"
             )
         if not value.is_contiguous():
-            raise VerificationContractError(
-                f"representation {name} must be contiguous"
-            )
+            raise VerificationContractError(f"representation {name} must be contiguous")
     identities = [
         _sample_identity(sample, index) for index, sample in enumerate(samples)
     ]
     canonical_image = image if image.dtype == torch.float32 else image.float()
     common_input_fingerprints = {
-        name: raw_fingerprint(inputs[name])
-        for name in sorted(inputs)
-        if name != "img"
+        name: raw_fingerprint(inputs[name]) for name in sorted(inputs) if name != "img"
     }
     semantic_payload = {
         "batch_index": batch_index,
@@ -1747,10 +2023,7 @@ def build_representation_pair_manifest(
         raise VerificationContractError(
             "representation pair does not share one semantic batch digest"
         )
-    if (
-        parent["representation_fingerprint"]
-        == candidate["representation_fingerprint"]
-    ):
+    if parent["representation_fingerprint"] == candidate["representation_fingerprint"]:
         raise VerificationContractError(
             "representation pair must preserve distinct FP32 and uint8 ingress"
         )
@@ -1786,6 +2059,70 @@ def validate_representation_snapshot(
     return observed
 
 
+def validate_live_representation_observation(
+    batch: Mapping[str, Any],
+    expected_pair: Mapping[str, Any],
+    *,
+    arm: str,
+    sequence_position: int,
+    expected_batch_size: int,
+    observed_pinned: bool | None = None,
+) -> dict[str, Any]:
+    """Rebuild and compare the full live arm snapshot at its timing position.
+
+    The returned semantic SHA is computed from ``batch``.  It is never copied
+    from the preregistered pair, which is important because sample identity
+    alone does not bind pixels or non-image metadata.
+    """
+
+    if arm not in (PARENT_ARM, CANDIDATE_ARM):
+        raise VerificationContractError("live representation arm is invalid")
+    sequence_position = _exact_integer(
+        "sequence_position", sequence_position, minimum=0
+    )
+    if not isinstance(expected_pair, Mapping):
+        raise VerificationContractError(
+            "live representation expected pair must be a mapping"
+        )
+    if expected_pair.get("batch_index") != sequence_position:
+        raise VerificationContractError("live representation sequence position changed")
+    arms = expected_pair.get("arms")
+    if not isinstance(arms, Mapping) or arm not in arms:
+        raise VerificationContractError(
+            "live representation expected arm manifest is missing"
+        )
+    expected_arm = arms[arm]
+    observed_arm = build_representation_batch_manifest(
+        batch,
+        arm=arm,
+        batch_index=sequence_position,
+        expected_batch_size=expected_batch_size,
+        observed_pinned=observed_pinned,
+    )
+    if observed_arm != expected_arm:
+        raise VerificationContractError(
+            f"live {arm} representation snapshot differs from preregistered "
+            f"pair {sequence_position}"
+        )
+    observed_semantic_sha256 = observed_arm["semantic_sha256"]
+    if observed_semantic_sha256 != expected_pair.get(
+        "semantic_sha256"
+    ) or observed_semantic_sha256 != expected_arm.get("semantic_sha256"):
+        raise VerificationContractError(
+            f"live {arm} semantic digest differs at pair {sequence_position}"
+        )
+    return {
+        "arm": arm,
+        "sequence_position": sequence_position,
+        "observed_semantic_sha256": observed_semantic_sha256,
+        "observed_representation_fingerprint": observed_arm[
+            "representation_fingerprint"
+        ],
+        "observed_arm_manifest_sha256": observed_arm["sha256"],
+        "exact_arm_manifest_match": True,
+    }
+
+
 def validate_common_preprocessor_boundary(
     parent_processed: Mapping[str, Any],
     candidate_processed: Mapping[str, Any],
@@ -1814,7 +2151,10 @@ def validate_common_preprocessor_boundary(
             raise VerificationContractError(
                 f"{label} common boundary img must be torch.float32"
             )
-        if expected_device_type is not None and image.device.type != expected_device_type:
+        if (
+            expected_device_type is not None
+            and image.device.type != expected_device_type
+        ):
             raise VerificationContractError(
                 f"{label} common boundary img device {image.device.type} != "
                 f"{expected_device_type}"
@@ -1832,12 +2172,227 @@ def validate_common_preprocessor_boundary(
     }
 
 
+def build_timed_common_boundary_receipt(
+    observations: Mapping[int, Mapping[str, Mapping[str, Any]]],
+    expected_pairs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Close all timed semantic pairs at the shared post-preprocessor boundary."""
+
+    if not isinstance(observations, Mapping):
+        raise VerificationContractError(
+            "common-boundary observations must be a mapping"
+        )
+    if not isinstance(expected_pairs, Sequence) or isinstance(
+        expected_pairs, (str, bytes)
+    ):
+        raise VerificationContractError(
+            "common-boundary expected pairs must be a sequence"
+        )
+    if len(expected_pairs) != REPRESENTATION_SEQUENCE_PAIRS_PER_ARM:
+        raise VerificationContractError(
+            "common-boundary receipt requires all 360 timed semantic pairs"
+        )
+    if set(observations) != set(range(len(expected_pairs))):
+        raise VerificationContractError(
+            "common-boundary observations are incomplete or non-contiguous"
+        )
+    records = []
+    for pair_index, expected_pair in enumerate(expected_pairs):
+        observed = observations[pair_index]
+        if not isinstance(observed, Mapping) or set(observed) != {
+            PARENT_ARM,
+            CANDIDATE_ARM,
+        }:
+            raise VerificationContractError(
+                f"common-boundary pair {pair_index} lacks one arm"
+            )
+        parent = observed[PARENT_ARM]
+        candidate = observed[CANDIDATE_ARM]
+        for arm, arm_observation in (
+            (PARENT_ARM, parent),
+            (CANDIDATE_ARM, candidate),
+        ):
+            if not isinstance(arm_observation, Mapping):
+                raise VerificationContractError(
+                    f"common-boundary pair {pair_index} {arm} is invalid"
+                )
+            if arm_observation.get("arm") != arm:
+                raise VerificationContractError("common-boundary arm label changed")
+            if arm_observation.get("sequence_position") != pair_index:
+                raise VerificationContractError(
+                    "common-boundary sequence position changed"
+                )
+            if arm_observation.get("observed_semantic_sha256") != (
+                expected_pair.get("semantic_sha256")
+            ):
+                raise VerificationContractError(
+                    "common-boundary observed semantic digest changed"
+                )
+            if arm_observation.get("exact_arm_manifest_match") is not True:
+                raise VerificationContractError(
+                    "common-boundary ingress arm snapshot was not exact"
+                )
+        parent_boundary = parent.get("boundary_fingerprint")
+        candidate_boundary = candidate.get("boundary_fingerprint")
+        if (
+            not isinstance(parent_boundary, Mapping)
+            or parent_boundary != candidate_boundary
+        ):
+            raise VerificationContractError(
+                f"common preprocessor boundary mismatch at timed pair {pair_index}"
+            )
+        records.append(
+            {
+                "pair_index": pair_index,
+                "semantic_sha256": parent["observed_semantic_sha256"],
+                "boundary_fingerprint": parent_boundary,
+                "parity": "raw-bit exact",
+            }
+        )
+    receipt = {
+        "schema": REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA,
+        "protocol": REPRESENTATION_PROTOCOL,
+        "pairs": len(records),
+        "all_timed_pairs_covered": True,
+        "parity": "raw-bit exact",
+        "records": records,
+    }
+    receipt["sha256"] = canonical_sha256(receipt)
+    return receipt
+
+
+def validate_timed_common_boundary_receipt(
+    receipt: Mapping[str, Any],
+    expected_pairs: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Recompute the receipt closure and bind it to the timed pair manifest."""
+
+    if not isinstance(receipt, Mapping):
+        raise VerificationContractError(
+            "timed common-boundary receipt must be a mapping"
+        )
+    if receipt.get("schema") != REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA:
+        raise VerificationContractError("timed common-boundary receipt schema changed")
+    if receipt.get("protocol") != REPRESENTATION_PROTOCOL:
+        raise VerificationContractError(
+            "timed common-boundary receipt protocol changed"
+        )
+    if receipt.get("pairs") != REPRESENTATION_SEQUENCE_PAIRS_PER_ARM:
+        raise VerificationContractError(
+            "timed common-boundary receipt does not cover 360 pairs"
+        )
+    if receipt.get("all_timed_pairs_covered") is not True:
+        raise VerificationContractError("timed common-boundary receipt is incomplete")
+    if receipt.get("parity") != "raw-bit exact":
+        raise VerificationContractError(
+            "timed common-boundary parity is not raw-bit exact"
+        )
+    records = receipt.get("records")
+    if not isinstance(records, list) or len(records) != (
+        REPRESENTATION_SEQUENCE_PAIRS_PER_ARM
+    ):
+        raise VerificationContractError("timed common-boundary records are incomplete")
+    if len(expected_pairs) != len(records):
+        raise VerificationContractError(
+            "timed common-boundary receipt/pair count differs"
+        )
+    for pair_index, (record, pair) in enumerate(zip(records, expected_pairs)):
+        if not isinstance(record, Mapping):
+            raise VerificationContractError(
+                "timed common-boundary record must be a mapping"
+            )
+        if record.get("pair_index") != pair_index:
+            raise VerificationContractError("timed common-boundary pair order changed")
+        if record.get("semantic_sha256") != pair.get("semantic_sha256"):
+            raise VerificationContractError(
+                "timed common-boundary semantic sequence changed"
+            )
+        if record.get("parity") != "raw-bit exact":
+            raise VerificationContractError("timed common-boundary pair parity changed")
+    payload = {key: value for key, value in receipt.items() if key != "sha256"}
+    if receipt.get("sha256") != canonical_sha256(payload):
+        raise VerificationContractError("timed common-boundary receipt SHA mismatch")
+    return {
+        "schema": REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA,
+        "pairs": len(records),
+        "all_timed_pairs_covered": True,
+        "parity": "raw-bit exact",
+        "sha256": receipt["sha256"],
+    }
+
+
+def validate_pipeline_memory_baseline_receipt(
+    receipt: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Require an explicit release boundary before pipeline-only timing."""
+
+    if not isinstance(receipt, Mapping):
+        raise VerificationContractError(
+            "pipeline memory baseline receipt must be a mapping"
+        )
+    if receipt.get("schema") != "rosa.pipeline_memory_baseline_receipt.v2":
+        raise VerificationContractError(
+            "pipeline memory baseline receipt schema changed"
+        )
+    actions = receipt.get("release_actions")
+    expected_actions = {
+        "processed_cuda_batches_released": True,
+        "raw_captured_cpu_batches_released": True,
+        "full_models_released": True,
+        "preprocessors_preserved": True,
+        "gc_collect_called": True,
+        "cuda_empty_cache_called": True,
+        "cuda_synchronize_called": True,
+    }
+    if actions != expected_actions:
+        raise VerificationContractError(
+            "pipeline timing retained state across the release boundary"
+        )
+    snapshots = {}
+    for name in ("before_release", "after_release", "pipeline_baseline"):
+        snapshot = receipt.get(name)
+        if not isinstance(snapshot, Mapping):
+            raise VerificationContractError(f"pipeline memory receipt lacks {name}")
+        normalized = {}
+        for key in ("allocated_bytes", "reserved_bytes"):
+            normalized[key] = _exact_integer(
+                f"pipeline memory {name}.{key}",
+                snapshot.get(key),
+                minimum=0,
+            )
+        snapshots[name] = normalized
+    if snapshots["pipeline_baseline"] != snapshots["after_release"]:
+        raise VerificationContractError(
+            "pipeline CUDA baseline changed after the release receipt"
+        )
+    if (
+        snapshots["after_release"]["allocated_bytes"]
+        > snapshots["before_release"]["allocated_bytes"]
+    ):
+        raise VerificationContractError(
+            "pipeline release increased allocated CUDA memory"
+        )
+    payload = {key: value for key, value in receipt.items() if key != "sha256"}
+    if receipt.get("sha256") != canonical_sha256(payload):
+        raise VerificationContractError("pipeline memory baseline receipt SHA mismatch")
+    return {
+        "schema": receipt["schema"],
+        "release_actions": expected_actions,
+        "before_release": snapshots["before_release"],
+        "after_release": snapshots["after_release"],
+        "pipeline_baseline": snapshots["pipeline_baseline"],
+        "sha256": receipt["sha256"],
+    }
+
+
 def validate_expected_manifest(
     observed: Mapping[str, Any],
     expected: Mapping[str, Any],
 ) -> None:
     if canonical_sha256(observed) != canonical_sha256(expected):
-        raise VerificationContractError("captured sample manifest does not match expected")
+        raise VerificationContractError(
+            "captured sample manifest does not match expected"
+        )
 
 
 def classify_transfer_event(name: str) -> str | None:
@@ -1934,12 +2489,26 @@ __all__ = [
     "PHYSICAL_ROUND_ORDER",
     "REPRESENTATION_PROTOCOL",
     "REPRESENTATION_STREAM_POLICY",
+    "REPRESENTATION_BOUNDARY_RECEIPT_SCHEMA",
+    "REPRESENTATION_C32_E20_CHECKPOINT_SHA256",
+    "REPRESENTATION_CANDIDATE_NORMALIZED_CONFIG_SHA256",
+    "REPRESENTATION_CAPTURE_BATCHES",
+    "REPRESENTATION_DATALOADER_WORKERS",
+    "REPRESENTATION_EXPECTED_BATCH_SIZE",
+    "REPRESENTATION_MEASURED_ITERATIONS_PER_ARM",
+    "REPRESENTATION_PARENT_NORMALIZED_CONFIG_SHA256",
+    "REPRESENTATION_PREREGISTRATION_SCHEMA",
+    "REPRESENTATION_SEED",
+    "REPRESENTATION_SEQUENCE_PAIRS_PER_ARM",
+    "REPRESENTATION_SEQUENCE_SCHEMA",
+    "REPRESENTATION_WARMUP_ITERATIONS_PER_ARM",
     "ScheduleEntry",
     "VerificationContractError",
     "build_alternating_schedule",
     "build_batch_manifest",
     "build_representation_batch_manifest",
     "build_representation_pair_manifest",
+    "build_timed_common_boundary_receipt",
     "canonical_json",
     "canonical_sha256",
     "classify_transfer_event",
@@ -1959,9 +2528,15 @@ __all__ = [
     "validate_common_preprocessor_boundary",
     "validate_expected_manifest",
     "validate_preregistration_plan",
+    "validate_pipeline_memory_baseline_receipt",
     "validate_representation_config_pair",
     "validate_representation_ingress",
+    "validate_live_representation_observation",
+    "validate_representation_preregistration_plan",
+    "validate_representation_protocol_freeze",
+    "validate_representation_sequence_document",
     "validate_representation_snapshot",
     "validate_runtime_parameters",
+    "validate_timed_common_boundary_receipt",
     "validate_transfer_reduction",
 ]

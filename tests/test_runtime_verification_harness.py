@@ -536,7 +536,7 @@ def test_nvidia_smi_snapshot_records_clock_power_and_rejects_foreign_compute(
         return SimpleNamespace(stdout=next(responses), stderr="")
 
     monkeypatch.setattr(verify_tool.subprocess, "run", fake_run)
-    snapshot = verify_tool._nvidia_smi_snapshot(0)
+    snapshot = verify_tool._nvidia_smi_snapshot("GPU-abc")
 
     assert snapshot["foreign_compute_processes"] == 0
     assert "power.draw" in snapshot["gpu_fields"]
@@ -549,7 +549,7 @@ def test_nvidia_smi_snapshot_records_clock_power_and_rejects_foreign_compute(
         ]
     )
     with pytest.raises(VerificationContractError, match="concurrent GPU"):
-        verify_tool._nvidia_smi_snapshot(0)
+        verify_tool._nvidia_smi_snapshot("GPU-abc")
 
 
 def test_default_cli_path_is_disarmed_and_does_not_create_output(

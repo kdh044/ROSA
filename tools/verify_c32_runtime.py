@@ -32,7 +32,6 @@ import numpy as np
 import torch
 from mmengine.config import Config
 
-
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -52,11 +51,13 @@ from rosa.runtime_verification import (  # noqa: E402
     PHYSICAL_ROUND_ORDER,
     MODEL_ONLY_SCOPE,
     REPRESENTATION_PROTOCOL,
+    REPRESENTATION_SEQUENCE_SCHEMA,
     REPRESENTATION_STREAM_POLICY,
     VerificationContractError,
     build_alternating_schedule,
     build_batch_manifest,
     build_representation_pair_manifest,
+    build_timed_common_boundary_receipt,
     canonical_sha256,
     evaluate_c32_near_native_gate,
     evaluate_input_pipeline_gate,
@@ -66,7 +67,6 @@ from rosa.runtime_verification import (  # noqa: E402
     paired_bootstrap_confidence_intervals,
     raw_fingerprint,
     require_same_fingerprint,
-    semantic_sample_digest,
     summarize_timings,
     summarize_transfer_event_names,
     validate_config_pair,
@@ -74,12 +74,17 @@ from rosa.runtime_verification import (  # noqa: E402
     validate_expected_manifest,
     validate_runtime_parameters,
     validate_preregistration_plan,
+    validate_pipeline_memory_baseline_receipt,
     validate_representation_config_pair,
     validate_representation_ingress,
+    validate_live_representation_observation,
+    validate_representation_preregistration_plan,
+    validate_representation_protocol_freeze,
+    validate_representation_sequence_document,
     validate_representation_snapshot,
+    validate_timed_common_boundary_receipt,
     validate_transfer_reduction,
 )
-
 
 IDLE_GPU_CONFIRMATION = "I_HAVE_VERIFIED_THE_GPU_IS_IDLE_AND_RESERVED"
 DEFAULT_PARENT_CONFIG = (
@@ -103,6 +108,27 @@ DEFAULT_PREREGISTRATION_DIR = Path(
     "/home/airlab/user/kdh/ROSA/results/raw_metrics/diagnostics/"
     "v1_exacte94_lightweight_fresh30_runtime_preregistration_20260802"
 )
+DEFAULT_REPRESENTATION_PREREGISTRATION_DIR = ROOT / (
+    "results/raw_metrics/diagnostics/"
+    "v2_c32_representation_runtime_preregistration_disarmed_20260802"
+)
+# This pins the default placeholder directory.  A future sealed directory must
+# be supplied together with its explicit SHA256SUMS digest.
+DEFAULT_REPRESENTATION_PREREGISTRATION_SHA256 = (
+    "cb0f613f7021d61c73fa46ba562caff34cf2b87c1744058c491eaa638b408aab"
+)
+DEFAULT_DETECTOR_HOST_ROOT = Path(
+    os.environ.get(
+        "ROSA_DETECTOR_HOST_ROOT",
+        "/home/airlab/user/kdh/dependencies/rosa_detector_host",
+    )
+)
+DEFAULT_OFFICIAL_ROOT = Path(
+    os.environ.get(
+        "FISHEYE3DOD_OFFICIAL_ROOT",
+        "/home/airlab/user/kdh/dependencies/fisheye3dod",
+    )
+)
 EXPECTED_PREREGISTRATION_HASHES = {
     "PLAN.json": "f82b46f0dfdec8d1482d9b0dc219aada2f4288b7eab322dd87e64b5478cb616d",
     "REPORT.md": "93550205c0b330509d3340126f072c39850062324fd22da0ffbb354a4fca7ed5",
@@ -118,6 +144,8 @@ class PreparedVerification:
     checkpoint: Mapping[str, Any]
     state_dict: Mapping[str, torch.Tensor]
     expected_manifest: Mapping[str, Any] | None
+    representation_preregistration: Mapping[str, Any] | None
+    representation_sequence: Mapping[str, Any] | None
     plan: dict[str, Any]
 
 
@@ -129,15 +157,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=CPU_METADATA_PROTOCOL,
     )
     parser.add_argument("--parent-config", type=Path)
-    parser.add_argument(
-        "--candidate-config", type=Path
-    )
+    parser.add_argument("--candidate-config", type=Path)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--preregistration-dir",
         type=Path,
         default=DEFAULT_PREREGISTRATION_DIR,
+    )
+    parser.add_argument(
+        "--representation-preregistration-dir",
+        type=Path,
+        default=DEFAULT_REPRESENTATION_PREREGISTRATION_DIR,
+    )
+    parser.add_argument(
+        "--representation-preregistration-sha256",
+        help=(
+            "Required for a non-default sealed preregistration directory; "
+            "pins its SHA256SUMS file."
+        ),
+    )
+    parser.add_argument(
+        "--detector-host-root",
+        type=Path,
+        default=DEFAULT_DETECTOR_HOST_ROOT,
+    )
+    parser.add_argument(
+        "--official-root",
+        type=Path,
+        default=DEFAULT_OFFICIAL_ROOT,
     )
     parser.add_argument("--expected-sample-manifest", type=Path)
     parser.add_argument("--capture-batches", type=int, default=2)
@@ -171,10 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--idle-gpu-confirmation",
-        help=(
-            "Required with --execute; must equal "
-            f"{IDLE_GPU_CONFIRMATION!r}."
-        ),
+        help=("Required with --execute; must equal " f"{IDLE_GPU_CONFIRMATION!r}."),
     )
     return parser
 
@@ -200,6 +245,16 @@ def _resolve_file(path: Path, label: str) -> Path:
     return resolved
 
 
+def _resolve_dir(path: Path, label: str) -> Path:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except FileNotFoundError as error:
+        raise VerificationContractError(f"{label} does not exist: {path}") from error
+    if not resolved.is_dir():
+        raise VerificationContractError(f"{label} must be a directory: {resolved}")
+    return resolved
+
+
 def _load_json_mapping(path: Path, label: str) -> Mapping[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -208,6 +263,148 @@ def _load_json_mapping(path: Path, label: str) -> Mapping[str, Any]:
     if not isinstance(value, Mapping):
         raise VerificationContractError(f"{label} must contain a JSON object")
     return value
+
+
+def _load_sha256sums(directory: Path, *, expected_digest: str) -> dict[str, str]:
+    sums_path = _resolve_file(directory / "SHA256SUMS", "SHA256SUMS")
+    observed_receipt = file_sha256(sums_path)
+    if observed_receipt != expected_digest:
+        raise VerificationContractError(
+            "representation preregistration SHA256SUMS digest mismatch: "
+            f"{observed_receipt} != {expected_digest}"
+        )
+    entries: dict[str, str] = {}
+    for line_number, line in enumerate(
+        sums_path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if not line or "  " not in line:
+            raise VerificationContractError(f"invalid SHA256SUMS line {line_number}")
+        digest, relative_name = line.split("  ", 1)
+        if len(digest) != 64 or any(
+            character not in "0123456789abcdef" for character in digest
+        ):
+            raise VerificationContractError(
+                f"invalid SHA256SUMS digest at line {line_number}"
+            )
+        relative = Path(relative_name)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or relative.name == "SHA256SUMS"
+            or relative_name in entries
+        ):
+            raise VerificationContractError(
+                f"unsafe or duplicate SHA256SUMS entry: {relative_name}"
+            )
+        path = directory / relative
+        if path.is_symlink():
+            raise VerificationContractError(
+                f"preregistration artifact must not be a symlink: {relative_name}"
+            )
+        resolved = _resolve_file(path, f"preregistration artifact {relative_name}")
+        if resolved.parent != directory:
+            raise VerificationContractError(
+                "preregistration artifacts must be flat files"
+            )
+        observed = file_sha256(resolved)
+        if observed != digest:
+            raise VerificationContractError(
+                f"preregistration artifact hash mismatch: {relative_name}"
+            )
+        entries[relative_name] = digest
+    actual_names = {
+        path.name for path in directory.iterdir() if path.is_file() or path.is_symlink()
+    }
+    expected_names = set(entries) | {"SHA256SUMS"}
+    if actual_names != expected_names:
+        raise VerificationContractError(
+            "representation preregistration has unsealed or missing artifacts"
+        )
+    if "PLAN.json" not in entries:
+        raise VerificationContractError(
+            "representation preregistration does not seal PLAN.json"
+        )
+    return entries
+
+
+def _load_representation_preregistration(
+    directory: Path,
+    *,
+    explicit_sha256: str | None,
+) -> tuple[Mapping[str, Any], Mapping[str, Any] | None, dict[str, Any]]:
+    resolved = _resolve_dir(directory, "representation preregistration directory")
+    default_resolved = DEFAULT_REPRESENTATION_PREREGISTRATION_DIR.resolve()
+    if explicit_sha256 is None:
+        if resolved != default_resolved:
+            raise VerificationContractError(
+                "a non-default representation preregistration requires "
+                "--representation-preregistration-sha256"
+            )
+        pinned_sha256 = DEFAULT_REPRESENTATION_PREREGISTRATION_SHA256
+    else:
+        pinned_sha256 = explicit_sha256
+    if (
+        not isinstance(pinned_sha256, str)
+        or len(pinned_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in pinned_sha256)
+    ):
+        raise VerificationContractError(
+            "representation preregistration SHA256 pin is invalid"
+        )
+    entries = _load_sha256sums(resolved, expected_digest=pinned_sha256)
+    plan = _load_json_mapping(resolved / "PLAN.json", "representation PLAN.json")
+    contract = validate_representation_preregistration_plan(plan)
+    loaded_sections: dict[str, Any] = {}
+    sequence = None
+    for section_name in (
+        "sequence_manifest",
+        "rosa_source_closure",
+        "detector_host_source_closure",
+        "official_source_closure",
+        "dataset_payload_closure",
+    ):
+        section = plan[section_name]
+        if section["status"] != "SEALED":
+            loaded_sections[section_name] = {"status": "MISSING"}
+            continue
+        filename = section["file"]
+        if entries.get(filename) != section["sha256"]:
+            raise VerificationContractError(
+                f"representation preregistration {section_name} hash is not "
+                "closed by PLAN.json and SHA256SUMS"
+            )
+        document = _load_json_mapping(
+            resolved / filename,
+            f"representation {section_name}",
+        )
+        if section_name == "sequence_manifest":
+            loaded_sections[section_name] = validate_representation_sequence_document(
+                document
+            )
+            sequence = document
+        else:
+            loaded_sections[section_name] = {
+                "status": "SEALED",
+                "path": str(resolved / filename),
+                "sha256": entries[filename],
+                "document": document,
+            }
+    ready = contract["ready_for_armed_execution"] and sequence is not None
+    return (
+        plan,
+        sequence,
+        {
+            "directory": str(resolved),
+            "sha256sums": {
+                "path": str(resolved / "SHA256SUMS"),
+                "sha256": pinned_sha256,
+            },
+            "plan_sha256": entries["PLAN.json"],
+            "contract": contract,
+            "sections": loaded_sections,
+            "ready_for_armed_execution": ready,
+        },
+    )
 
 
 def _load_preregistration(directory: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
@@ -322,13 +519,12 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
     preregistration_plan, preregistration = _load_preregistration(
         args.preregistration_dir
     )
-    preregistration["parsed_plan_sha256"] = canonical_sha256(
-        preregistration_plan
-    )
+    preregistration["parsed_plan_sha256"] = canonical_sha256(preregistration_plan)
 
     parent_path = _resolve_file(parent_config_argument, "parent config")
     candidate_path = _resolve_file(candidate_config_argument, "candidate config")
     checkpoint_path = _resolve_file(args.checkpoint, "checkpoint")
+    checkpoint_sha256 = file_sha256(checkpoint_path)
     parent_config = Config.fromfile(parent_path, import_custom_modules=False)
     candidate_config = Config.fromfile(candidate_path, import_custom_modules=False)
     if args.protocol == CPU_METADATA_PROTOCOL:
@@ -342,6 +538,13 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
             parent_config,
             candidate_config,
             expected_batch_size=parameters["expected_batch_size"],
+        )
+        representation_freeze = validate_representation_protocol_freeze(
+            parameters=parameters,
+            dataloader_workers=dataloader_workers,
+            seed=seed,
+            checkpoint_sha256=checkpoint_sha256,
+            config_contract=config_contract,
         )
 
     run_tool = _load_run_tool()
@@ -360,12 +563,38 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
     expected_manifest = None
     expected_manifest_path = None
     if args.expected_sample_manifest is not None:
+        if args.protocol == REPRESENTATION_PROTOCOL:
+            raise VerificationContractError(
+                "representation protocol uses only its sealed 360-pair "
+                "preregistration manifest"
+            )
         expected_manifest_path = _resolve_file(
             args.expected_sample_manifest, "expected sample manifest"
         )
         expected_manifest = _load_json_mapping(
             expected_manifest_path, "expected sample manifest"
         )
+
+    representation_preregistration = None
+    representation_sequence = None
+    if args.protocol == REPRESENTATION_PROTOCOL:
+        (
+            _representation_plan,
+            representation_sequence,
+            representation_preregistration,
+        ) = _load_representation_preregistration(
+            args.representation_preregistration_dir,
+            explicit_sha256=args.representation_preregistration_sha256,
+        )
+        detector_host_root = _resolve_dir(
+            args.detector_host_root,
+            "detector host root",
+        )
+        official_root = _resolve_dir(args.official_root, "official source root")
+    else:
+        representation_freeze = None
+        detector_host_root = None
+        official_root = None
 
     warmup_schedule = build_alternating_schedule(
         iterations_per_arm=parameters["warmup_iterations_per_arm"],
@@ -377,6 +606,7 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         batch_count=parameters["capture_batches"],
         phase="measured",
     )
+
     def schedule_contract(schedule, iterations_per_arm):
         serialized = [entry.to_dict() for entry in schedule]
         return {
@@ -407,7 +637,7 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         ),
     }
     plan = {
-        "schema_version": 2,
+        "schema_version": 3,
         "status": "DRY_RUN",
         "protocol": args.protocol,
         "execution_state": args.execution_state,
@@ -424,7 +654,7 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         },
         "checkpoint": {
             "path": str(checkpoint_path),
-            "sha256": file_sha256(checkpoint_path),
+            "sha256": checkpoint_sha256,
             "schema": checkpoint_schema,
         },
         "expected_sample_manifest": (
@@ -449,14 +679,26 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         "schedule_sha256": canonical_sha256(schedule_payload),
     }
     if args.protocol == REPRESENTATION_PROTOCOL:
+        plan["representation_protocol_freeze"] = representation_freeze
+        preregistration_record = copy.deepcopy(representation_preregistration)
+        for section in preregistration_record["sections"].values():
+            if isinstance(section, dict):
+                section.pop("document", None)
+        plan["representation_preregistration"] = preregistration_record
+        plan["armed_execution_ready"] = representation_preregistration[
+            "ready_for_armed_execution"
+        ]
+        plan["source_roots"] = {
+            "rosa": str(ROOT.resolve()),
+            "detector_host": str(detector_host_root),
+            "official": str(official_root),
+        }
         plan["benchmark_scopes"] = {
             "model_only": {
                 "name": MODEL_ONLY_SCOPE,
                 "includes": ["model._run_forward(mode='predict')"],
                 "excludes": ["loader", "collate", "pinning", "preprocessor", "H2D"],
-                "warmup_iterations_per_arm": parameters[
-                    "warmup_iterations_per_arm"
-                ],
+                "warmup_iterations_per_arm": parameters["warmup_iterations_per_arm"],
                 "measured_iterations_per_arm": parameters[
                     "measured_iterations_per_arm"
                 ],
@@ -473,9 +715,7 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
                     "data preprocessor/H2D",
                 ],
                 "excludes": ["model execution", "evaluator", "serialization"],
-                "warmup_iterations_per_arm": parameters[
-                    "warmup_iterations_per_arm"
-                ],
+                "warmup_iterations_per_arm": parameters["warmup_iterations_per_arm"],
                 "measured_iterations_per_arm": parameters[
                     "measured_iterations_per_arm"
                 ],
@@ -497,7 +737,11 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
             },
         }
         plan["transfer_contract"] = {
-            "parent": {"dtype": "torch.float32", "pinned": False, "non_blocking": False},
+            "parent": {
+                "dtype": "torch.float32",
+                "pinned": False,
+                "non_blocking": False,
+            },
             "candidate": {"dtype": "torch.uint8", "pinned": True, "non_blocking": True},
             "stream_policy": REPRESENTATION_STREAM_POLICY,
         }
@@ -508,6 +752,8 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         checkpoint=checkpoint,
         state_dict=state_dict,
         expected_manifest=expected_manifest,
+        representation_preregistration=representation_preregistration,
+        representation_sequence=representation_sequence,
         plan=plan,
     )
 
@@ -527,6 +773,55 @@ def _write_jsonl(path: Path, values: Sequence[Mapping[str, Any]]) -> None:
         for value in values:
             handle.write(json.dumps(value, sort_keys=True) + "\n")
     temporary.replace(path)
+
+
+def _seal_final_artifact_receipt(output_dir: Path) -> dict[str, Any]:
+    """Hash every completed artifact, including immutable plan and summary.
+
+    ``final_receipt.json`` is the sole conventional self-exclusion.  Its hash
+    is returned to the caller/stdout so no mutable file sits outside the
+    closure it describes.
+    """
+
+    artifacts = []
+    for path in sorted(output_dir.iterdir(), key=lambda value: value.name):
+        if path.name == "final_receipt.json":
+            raise VerificationContractError(
+                "final receipt already exists; refusing overwrite"
+            )
+        if path.is_symlink() or not path.is_file() or path.name.endswith(".tmp"):
+            raise VerificationContractError(f"unsealable runtime artifact: {path.name}")
+        artifacts.append(
+            {
+                "name": path.name,
+                "size": path.stat().st_size,
+                "sha256": file_sha256(path),
+            }
+        )
+    names = {artifact["name"] for artifact in artifacts}
+    if "plan.json" not in names or "summary.json" not in names:
+        raise VerificationContractError(
+            "final artifact closure requires plan.json and summary.json"
+        )
+    receipt = {
+        "schema": "rosa.runtime_final_artifact_receipt.v2",
+        "self_exclusion": "final_receipt.json",
+        "self_hash_delivery": "returned_by_executor_and_printed_to_stdout",
+        "artifacts": artifacts,
+        "artifact_count": len(artifacts),
+        "closure_sha256": canonical_sha256(artifacts),
+    }
+    _atomic_json(output_dir / "final_receipt.json", receipt)
+    observed_names = {path.name for path in output_dir.iterdir() if path.is_file()}
+    if observed_names != names | {"final_receipt.json"}:
+        raise VerificationContractError(
+            "artifact set changed while final receipt was written"
+        )
+    return {
+        "receipt": receipt,
+        "path": str(output_dir / "final_receipt.json"),
+        "sha256": file_sha256(output_dir / "final_receipt.json"),
+    }
 
 
 def _git_snapshot(repository: Path, *, require_clean: bool) -> dict[str, Any]:
@@ -556,6 +851,182 @@ def _git_snapshot(repository: Path, *, require_clean: bool) -> dict[str, Any]:
     }
 
 
+SOURCE_CLOSURE_EXCLUDED_PARTS = (
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+    "results",
+    "work_dirs",
+)
+
+
+def _source_inventory(root: Path) -> list[Path]:
+    files = []
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if any(part in SOURCE_CLOSURE_EXCLUDED_PARTS for part in relative.parts):
+            continue
+        if path.is_symlink():
+            raise VerificationContractError(
+                f"source closure does not permit symlinks: {path}"
+            )
+        if path.is_file() and path.suffix != ".pyc":
+            files.append(path)
+    return sorted(files, key=lambda path: path.relative_to(root).as_posix())
+
+
+def _validate_source_closure(
+    document: Mapping[str, Any],
+    *,
+    expected_root: Path,
+    label: str,
+) -> dict[str, Any]:
+    if not isinstance(document, Mapping):
+        raise VerificationContractError(f"{label} source closure is invalid")
+    if document.get("schema") != "rosa.complete_source_content_manifest.v2":
+        raise VerificationContractError(f"{label} source closure schema changed")
+    root = _resolve_dir(Path(str(document.get("root"))), f"{label} closure root")
+    if root != expected_root.resolve():
+        raise VerificationContractError(f"{label} source closure root changed")
+    if document.get("excluded_parts") != list(SOURCE_CLOSURE_EXCLUDED_PARTS):
+        raise VerificationContractError(f"{label} source closure policy changed")
+    records = document.get("files")
+    if not isinstance(records, list) or not records:
+        raise VerificationContractError(f"{label} source closure is empty")
+    expected_paths = _source_inventory(root)
+    expected_relatives = [path.relative_to(root).as_posix() for path in expected_paths]
+    observed_relatives = []
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise VerificationContractError(f"{label} source record is invalid")
+        relative_name = record.get("path")
+        if not isinstance(relative_name, str):
+            raise VerificationContractError(f"{label} source path is invalid")
+        relative = Path(relative_name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise VerificationContractError(f"{label} source path escapes root")
+        path = root / relative
+        if path.is_symlink():
+            raise VerificationContractError(f"{label} source path became a symlink")
+        resolved = _resolve_file(path, f"{label} source payload")
+        if root not in resolved.parents:
+            raise VerificationContractError(f"{label} source path escapes root")
+        size = resolved.stat().st_size
+        if record.get("size") != size or record.get("sha256") != file_sha256(resolved):
+            raise VerificationContractError(
+                f"{label} source payload changed: {relative_name}"
+            )
+        observed_relatives.append(relative.as_posix())
+    if observed_relatives != expected_relatives:
+        raise VerificationContractError(
+            f"{label} source closure is not an exact complete-tree inventory"
+        )
+    payload = {key: value for key, value in document.items() if key != "sha256"}
+    if document.get("sha256") != canonical_sha256(payload):
+        raise VerificationContractError(f"{label} source closure SHA mismatch")
+    return {
+        "root": str(root),
+        "files": len(records),
+        "bytes": sum(record["size"] for record in records),
+        "sha256": document["sha256"],
+    }
+
+
+def _validate_dataset_payload_closure(
+    document: Mapping[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(document, Mapping):
+        raise VerificationContractError("dataset payload closure is invalid")
+    if document.get("schema") != "rosa.referenced_dataset_payload_manifest.v2":
+        raise VerificationContractError("dataset payload closure schema changed")
+    records = document.get("files")
+    if not isinstance(records, list) or not records:
+        raise VerificationContractError("dataset payload closure is empty")
+    observed_keys = set()
+    total_bytes = 0
+    for record in records:
+        if not isinstance(record, Mapping):
+            raise VerificationContractError("dataset payload record is invalid")
+        root = _resolve_dir(Path(str(record.get("root"))), "dataset payload root")
+        relative_name = record.get("path")
+        if not isinstance(relative_name, str):
+            raise VerificationContractError("dataset payload path is invalid")
+        relative = Path(relative_name)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise VerificationContractError("dataset payload path escapes root")
+        path = root / relative
+        if path.is_symlink():
+            raise VerificationContractError("dataset payload must not be a symlink")
+        resolved = _resolve_file(path, "dataset payload")
+        if root not in resolved.parents:
+            raise VerificationContractError("dataset payload path escapes root")
+        key = (str(root), relative.as_posix())
+        if key in observed_keys:
+            raise VerificationContractError("dataset payload path repeats")
+        observed_keys.add(key)
+        size = resolved.stat().st_size
+        if record.get("size") != size or record.get("sha256") != file_sha256(resolved):
+            raise VerificationContractError(
+                f"referenced dataset payload changed: {resolved}"
+            )
+        total_bytes += size
+    payload = {key: value for key, value in document.items() if key != "sha256"}
+    if document.get("sha256") != canonical_sha256(payload):
+        raise VerificationContractError("dataset payload closure SHA mismatch")
+    return {
+        "files": len(records),
+        "bytes": total_bytes,
+        "sha256": document["sha256"],
+    }
+
+
+def _verify_representation_closures(
+    prepared: PreparedVerification,
+) -> dict[str, Any]:
+    preregistration = prepared.representation_preregistration
+    if not isinstance(preregistration, Mapping) or not preregistration.get(
+        "ready_for_armed_execution"
+    ):
+        raise VerificationContractError(
+            "ARMED representation execution requires a fully sealed "
+            "preregistration manifest and all content closures"
+        )
+    sections = preregistration["sections"]
+    roots = prepared.plan["source_roots"]
+    source_receipts = {}
+    for section_name, root_name, label in (
+        ("rosa_source_closure", "rosa", "ROSA"),
+        ("detector_host_source_closure", "detector_host", "detector host"),
+        ("official_source_closure", "official", "official"),
+    ):
+        source_receipts[section_name] = _validate_source_closure(
+            sections[section_name]["document"],
+            expected_root=Path(roots[root_name]),
+            label=label,
+        )
+    dataset = _validate_dataset_payload_closure(
+        sections["dataset_payload_closure"]["document"]
+    )
+    external_git = {
+        "detector_host": _git_snapshot(
+            Path(roots["detector_host"]),
+            require_clean=False,
+        ),
+        "official": _git_snapshot(
+            Path(roots["official"]),
+            require_clean=False,
+        ),
+    }
+    return {
+        "source_closures": source_receipts,
+        "dataset_payload_closure": dataset,
+        "external_git": external_git,
+        "dirty_external_roots_allowed_only_by_exact_content_closure": True,
+    }
+
+
 def _seed_everything(seed: int, *, cuda: bool) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -571,7 +1042,9 @@ def _capture_rng(*, cuda: bool) -> dict[str, Any]:
         "torch_cpu": torch.get_rng_state().clone(),
     }
     if cuda:
-        state["torch_cuda"] = [value.clone() for value in torch.cuda.get_rng_state_all()]
+        state["torch_cuda"] = [
+            value.clone() for value in torch.cuda.get_rng_state_all()
+        ]
     return state
 
 
@@ -668,8 +1141,7 @@ def _build_representation_dataloaders(
     prepared: PreparedVerification,
 ) -> dict[str, Any]:
     return {
-        arm: _build_dataloader(prepared, arm=arm)
-        for arm in (PARENT_ARM, CANDIDATE_ARM)
+        arm: _build_dataloader(prepared, arm=arm) for arm in (PARENT_ARM, CANDIDATE_ARM)
     }
 
 
@@ -721,16 +1193,13 @@ def _capture_representation_batches(prepared: PreparedVerification):
                 current[arm] = next(iterators[arm])
             except StopIteration as error:
                 raise VerificationContractError(
-                    f"{arm} dataloader ended before representation capture "
-                    "completed"
+                    f"{arm} dataloader ended before representation capture " "completed"
                 ) from error
         pair = build_representation_pair_manifest(
             current[PARENT_ARM],
             current[CANDIDATE_ARM],
             batch_index=batch_index,
-            expected_batch_size=prepared.plan["parameters"][
-                "expected_batch_size"
-            ],
+            expected_batch_size=prepared.plan["parameters"]["expected_batch_size"],
         )
         for identity in pair["sample_identities"]:
             digest = canonical_sha256(identity)
@@ -788,9 +1257,7 @@ def _prevalidate_live_representation_sequence(
             current[PARENT_ARM],
             current[CANDIDATE_ARM],
             batch_index=sequence_index,
-            expected_batch_size=prepared.plan["parameters"][
-                "expected_batch_size"
-            ],
+            expected_batch_size=prepared.plan["parameters"]["expected_batch_size"],
         )
         for identity in pair["sample_identities"]:
             digest = canonical_sha256(identity)
@@ -802,7 +1269,7 @@ def _prevalidate_live_representation_sequence(
         pairs.append(pair)
         del current
     document = {
-        "schema": "rosa.live_representation_pair_sequence.v1",
+        "schema": REPRESENTATION_SEQUENCE_SCHEMA,
         "protocol": REPRESENTATION_PROTOCOL,
         "pairs_per_arm": pairs_per_arm,
         "pairs": pairs,
@@ -873,9 +1340,7 @@ def _verify_common_preprocessor_boundaries(
 ):
     pairs = representation_manifest.get("pairs")
     if not isinstance(pairs, Sequence):
-        raise VerificationContractError(
-            "representation manifest has no pair sequence"
-        )
+        raise VerificationContractError("representation manifest has no pair sequence")
     processed = {PARENT_ARM: [], CANDIDATE_ARM: []}
     records = []
     for batch_index, pair in enumerate(pairs):
@@ -991,9 +1456,7 @@ def _verify_outputs_and_state(
     )
     initial_rng = _capture_rng(cuda=True)
     _restore_rng(initial_rng, cuda=True)
-    parent_batches = (
-        batches[PARENT_ARM] if isinstance(batches, Mapping) else batches
-    )
+    parent_batches = batches[PARENT_ARM] if isinstance(batches, Mapping) else batches
     candidate_batches = (
         batches[CANDIDATE_ARM] if isinstance(batches, Mapping) else batches
     )
@@ -1181,9 +1644,9 @@ def _run_model_only_schedule(
             {
                 "sequence_index": sequence_index,
                 "benchmark_scope": MODEL_ONLY_SCOPE,
-                "semantic_batch_sha256": representation_pairs[
-                    entry.batch_index
-                ]["semantic_sha256"],
+                "semantic_batch_sha256": representation_pairs[entry.batch_index][
+                    "semantic_sha256"
+                ],
                 "elapsed_ns": elapsed_ns,
                 "sample_count": sample_count,
                 "stream": stream,
@@ -1197,13 +1660,14 @@ def _run_model_only_schedule(
 @torch.inference_mode()
 def _run_input_pipeline_schedule(
     schedule,
-    models: Mapping[str, torch.nn.Module],
+    preprocessors: Mapping[str, torch.nn.Module],
     iterators: Mapping[str, Any],
     *,
     expected_batch_size: int,
     device: torch.device,
     expected_pair_sequence: Sequence[Mapping[str, Any]],
     stream_positions: dict[str, int],
+    boundary_observations: dict[int, dict[str, Mapping[str, Any]]],
     sequence_offset: int = 0,
 ) -> list[dict[str, Any]]:
     """Time loader+collate and preprocessor/H2D, excluding model execution."""
@@ -1222,8 +1686,17 @@ def _run_input_pipeline_schedule(
             ) from error
         loader_collate_ns = time.perf_counter_ns() - loader_start_ns
 
-        identity = semantic_sample_digest(
+        stream_position = stream_positions[entry.arm]
+        if stream_position >= len(expected_pair_sequence):
+            raise VerificationContractError(
+                "input pipeline exceeded the prevalidated pair sequence"
+            )
+        expected_pair = expected_pair_sequence[stream_position]
+        observed_arm = validate_live_representation_observation(
             batch,
+            expected_pair,
+            arm=entry.arm,
+            sequence_position=stream_position,
             expected_batch_size=expected_batch_size,
         )
         ingress = validate_representation_ingress(
@@ -1231,25 +1704,16 @@ def _run_input_pipeline_schedule(
             arm=entry.arm,
             expected_batch_size=expected_batch_size,
         )
-        stream_position = stream_positions[entry.arm]
-        if stream_position >= len(expected_pair_sequence):
-            raise VerificationContractError(
-                "input pipeline exceeded the prevalidated pair sequence"
-            )
-        expected_pair = expected_pair_sequence[stream_position]
-        if identity["sample_identities"] != expected_pair["sample_identities"]:
-            raise VerificationContractError(
-                f"{entry.arm} live input pipeline diverged from prevalidated "
-                f"semantic pair {stream_position}"
-            )
         stream_positions[entry.arm] = stream_position + 1
 
         torch.cuda.synchronize(device)
         preprocessor_start_ns = time.perf_counter_ns()
-        processed = models[entry.arm].data_preprocessor(batch, training=False)
+        processed = preprocessors[entry.arm](batch, training=False)
         torch.cuda.synchronize(device)
         preprocessor_transfer_ns = time.perf_counter_ns() - preprocessor_start_ns
-        processed_inputs = processed.get("inputs") if isinstance(processed, Mapping) else None
+        processed_inputs = (
+            processed.get("inputs") if isinstance(processed, Mapping) else None
+        )
         processed_samples = (
             processed.get("data_samples") if isinstance(processed, Mapping) else None
         )
@@ -1266,21 +1730,48 @@ def _run_input_pipeline_schedule(
             raise VerificationContractError(
                 "input pipeline did not reach the common CUDA FP32 boundary"
             )
-        if not isinstance(processed_samples, Sequence) or len(processed_samples) != expected_batch_size:
+        if (
+            not isinstance(processed_samples, Sequence)
+            or len(processed_samples) != expected_batch_size
+        ):
             raise VerificationContractError(
                 "input pipeline changed the batch sample count"
             )
+        boundary_fingerprint = raw_fingerprint(processed)
+        observation = dict(observed_arm)
+        observation["boundary_fingerprint"] = boundary_fingerprint
+        pair_observations = boundary_observations.setdefault(stream_position, {})
+        if entry.arm in pair_observations:
+            raise VerificationContractError(
+                f"live pipeline repeats {entry.arm} at pair {stream_position}"
+            )
+        pair_observations[entry.arm] = observation
+        if set(pair_observations) == {PARENT_ARM, CANDIDATE_ARM}:
+            if (
+                pair_observations[PARENT_ARM]["boundary_fingerprint"]
+                != pair_observations[CANDIDATE_ARM]["boundary_fingerprint"]
+            ):
+                raise VerificationContractError(
+                    "common preprocessor boundary differs for live timed pair "
+                    f"{stream_position}"
+                )
         record = entry.to_dict()
         record.update(
             {
                 "sequence_index": sequence_index,
                 "benchmark_scope": INPUT_PIPELINE_SCOPE,
-                "semantic_batch_sha256": expected_pair["semantic_sha256"],
-                "sample_identities": identity["sample_identities"],
+                "semantic_batch_sha256": observed_arm["observed_semantic_sha256"],
+                "observed_representation_fingerprint": observed_arm[
+                    "observed_representation_fingerprint"
+                ],
+                "observed_arm_manifest_sha256": observed_arm[
+                    "observed_arm_manifest_sha256"
+                ],
+                "exact_arm_manifest_match": True,
                 "prevalidated_stream_position": stream_position,
                 "loader_collate_ns": loader_collate_ns,
                 "preprocessor_transfer_ns": preprocessor_transfer_ns,
-                "validation_gap_excluded": True,
+                "full_snapshot_and_boundary_validation_excluded": True,
                 "elapsed_ns": loader_collate_ns + preprocessor_transfer_ns,
                 "sample_count": expected_batch_size,
                 "ingress": ingress,
@@ -1299,7 +1790,32 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _nvidia_smi_snapshot(device_index: int) -> dict[str, Any]:
+def _normalize_gpu_uuid(value: Any) -> str:
+    if isinstance(value, bytes):
+        value = value.decode("ascii", errors="strict")
+    if not isinstance(value, str) or not value.strip():
+        raise VerificationContractError(
+            "Torch device properties did not expose a GPU UUID"
+        )
+    normalized = value.strip()
+    if not normalized.startswith("GPU-"):
+        normalized = "GPU-" + normalized
+    return normalized
+
+
+def _logical_cuda_device_uuid(device: torch.device) -> dict[str, Any]:
+    properties = torch.cuda.get_device_properties(device)
+    gpu_uuid = _normalize_gpu_uuid(getattr(properties, "uuid", None))
+    return {
+        "logical_device": str(device),
+        "logical_index": device.index,
+        "gpu_uuid": gpu_uuid,
+        "torch_name": properties.name,
+    }
+
+
+def _nvidia_smi_snapshot(gpu_uuid: str) -> dict[str, Any]:
+    gpu_uuid = _normalize_gpu_uuid(gpu_uuid)
     gpu_fields = (
         "timestamp",
         "index",
@@ -1315,7 +1831,7 @@ def _nvidia_smi_snapshot(device_index: int) -> dict[str, Any]:
     gpu_result = subprocess.run(
         [
             "nvidia-smi",
-            f"--id={device_index}",
+            f"--id={gpu_uuid}",
             "--query-gpu=" + ",".join(gpu_fields),
             "--format=csv,noheader,nounits",
         ],
@@ -1324,18 +1840,25 @@ def _nvidia_smi_snapshot(device_index: int) -> dict[str, Any]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    gpu_rows = [
-        row.strip() for row in gpu_result.stdout.splitlines() if row.strip()
-    ]
+    gpu_rows = [row.strip() for row in gpu_result.stdout.splitlines() if row.strip()]
     if len(gpu_rows) != 1:
         raise VerificationContractError(
             "nvidia-smi must return exactly one selected GPU row"
+        )
+    gpu_values = [value.strip() for value in gpu_rows[0].split(",")]
+    uuid_position = gpu_fields.index("uuid")
+    if (
+        len(gpu_values) != len(gpu_fields)
+        or _normalize_gpu_uuid(gpu_values[uuid_position]) != gpu_uuid
+    ):
+        raise VerificationContractError(
+            "nvidia-smi GPU UUID does not match the Torch logical device"
         )
     app_fields = ("pid", "process_name", "used_gpu_memory", "gpu_uuid")
     app_result = subprocess.run(
         [
             "nvidia-smi",
-            f"--id={device_index}",
+            f"--id={gpu_uuid}",
             "--query-compute-apps=" + ",".join(app_fields),
             "--format=csv,noheader,nounits",
         ],
@@ -1344,9 +1867,7 @@ def _nvidia_smi_snapshot(device_index: int) -> dict[str, Any]:
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    app_rows = [
-        row.strip() for row in app_result.stdout.splitlines() if row.strip()
-    ]
+    app_rows = [row.strip() for row in app_result.stdout.splitlines() if row.strip()]
     foreign_rows = []
     for row in app_rows:
         try:
@@ -1364,6 +1885,7 @@ def _nvidia_smi_snapshot(device_index: int) -> dict[str, Any]:
     return {
         "gpu_fields": list(gpu_fields),
         "gpu_row": gpu_rows[0],
+        "selected_gpu_uuid": gpu_uuid,
         "compute_app_fields": list(app_fields),
         "compute_app_rows": app_rows,
         "current_pid": os.getpid(),
@@ -1375,13 +1897,12 @@ def _environment(
     device: torch.device,
     *,
     nvidia_smi_start: Mapping[str, Any],
+    device_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
     properties = torch.cuda.get_device_properties(device)
     get_autocast_dtype = getattr(torch, "get_autocast_dtype", None)
     autocast_dtype = (
-        str(get_autocast_dtype("cuda"))
-        if callable(get_autocast_dtype)
-        else None
+        str(get_autocast_dtype("cuda")) if callable(get_autocast_dtype) else None
     )
     return {
         "platform": platform.platform(),
@@ -1395,6 +1916,7 @@ def _environment(
         },
         "device": {
             "requested": str(device),
+            "logical_to_physical_identity": dict(device_identity),
             "name": properties.name,
             "capability": list(torch.cuda.get_device_capability(device)),
             "total_memory_bytes": properties.total_memory,
@@ -1415,7 +1937,7 @@ def _environment(
         },
         "nvidia_smi": {
             "start": dict(nvidia_smi_start),
-            "end": _nvidia_smi_snapshot(device.index),
+            "end": _nvidia_smi_snapshot(device_identity["gpu_uuid"]),
         },
         "environment": {
             name: os.environ.get(name)
@@ -1437,9 +1959,7 @@ def _preregistered_decisions(
         paired_bootstrap,
         memory,
     )
-    near_native_calculation = evaluate_c32_near_native_gate(
-        paired_bootstrap
-    )
+    near_native_calculation = evaluate_c32_near_native_gate(paired_bootstrap)
     return {
         "strict_lightweight": strict_decision,
         "c32_vs_c0_near_native": {
@@ -1473,14 +1993,12 @@ def _segmented_records(
             segment_warmup = tuple(
                 entry
                 for entry in warmup_schedule
-                if entry.round_index == round_index
-                and entry.slot_index == slot_index
+                if entry.round_index == round_index and entry.slot_index == slot_index
             )
             segment_measured = tuple(
                 entry
                 for entry in measured_schedule
-                if entry.round_index == round_index
-                and entry.slot_index == slot_index
+                if entry.round_index == round_index and entry.slot_index == slot_index
             )
             if not segment_warmup or not segment_measured:
                 raise VerificationContractError(
@@ -1521,9 +2039,7 @@ def _validate_semantic_record_pairs(
     grouped: dict[int, dict[str, Mapping[str, Any]]] = {}
     for record in records:
         if record.get("benchmark_scope") != expected_scope:
-            raise VerificationContractError(
-                "timing record benchmark scope changed"
-            )
+            raise VerificationContractError("timing record benchmark scope changed")
         if record.get("phase") != expected_phase:
             raise VerificationContractError("timing record phase changed")
         raw_pair_index = record.get("pair_index")
@@ -1540,9 +2056,7 @@ def _validate_semantic_record_pairs(
             raise VerificationContractError("timing record arm changed")
         pair = grouped.setdefault(pair_index, {})
         if arm in pair:
-            raise VerificationContractError(
-                f"timing pair {pair_index} repeats {arm}"
-            )
+            raise VerificationContractError(f"timing pair {pair_index} repeats {arm}")
         pair[arm] = record
     if sorted(grouped) != list(range(expected_pairs)):
         raise VerificationContractError(
@@ -1588,8 +2102,24 @@ def _execute_representation_protocol(
     output_dir: Path,
     repository: Mapping[str, Any],
     nvidia_smi_start: Mapping[str, Any],
+    device_identity: Mapping[str, Any],
 ) -> dict[str, Any]:
+    sealed_sequence = prepared.representation_sequence
+    if not isinstance(sealed_sequence, Mapping):
+        raise VerificationContractError(
+            "representation execution has no sealed 360-pair manifest"
+        )
+    validate_representation_sequence_document(sealed_sequence)
     batches, representation_manifest = _capture_representation_batches(prepared)
+    sealed_pairs = sealed_sequence["pairs"]
+    if (
+        representation_manifest["pairs"]
+        != sealed_pairs[: len(representation_manifest["pairs"])]
+    ):
+        raise VerificationContractError(
+            "model-only captured batches differ from the first sealed "
+            "representation pairs"
+        )
     _atomic_json(
         output_dir / "representation_pairs.json",
         representation_manifest,
@@ -1694,34 +2224,80 @@ def _execute_representation_protocol(
     )
     _atomic_json(output_dir / "model_only_paired_bootstrap.json", model_bootstrap)
 
-    live_pair_sequence = _prevalidate_live_representation_sequence(
-        prepared,
-        pairs_per_arm=(
-            parameters["warmup_iterations_per_arm"]
-            + parameters["measured_iterations_per_arm"]
-        ),
-    )
-    _atomic_json(
-        output_dir / "live_representation_pair_sequence.json",
-        live_pair_sequence,
-    )
-    live_dataloaders = _build_representation_dataloaders(prepared)
-    live_iterators = {
-        arm: iter(loader) for arm, loader in live_dataloaders.items()
+    # The pipeline scope needs only the two preprocessors.  Drop every cached
+    # model-only CUDA/CPU batch and the full detectors before constructing the
+    # live iterators, then seal the exact CUDA baseline used by that scope.
+    preprocessors = {
+        arm: models[arm].data_preprocessor for arm in (PARENT_ARM, CANDIDATE_ARM)
     }
+    torch.cuda.synchronize(device)
+    memory_before_release = {
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+        "reserved_bytes": torch.cuda.memory_reserved(device),
+    }
+    for values in processed_batches.values():
+        values.clear()
+    processed_batches.clear()
+    for values in batches.values():
+        values.clear()
+    batches.clear()
+    if not isinstance(models, dict):
+        raise VerificationContractError(
+            "representation model container must be releasable"
+        )
+    models.clear()
+    processed_batches = None
+    batches = None
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+    memory_after_release = {
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+        "reserved_bytes": torch.cuda.memory_reserved(device),
+    }
+    live_dataloaders = _build_representation_dataloaders(prepared)
+    live_iterators = {arm: iter(loader) for arm, loader in live_dataloaders.items()}
+    torch.cuda.synchronize(device)
+    pipeline_baseline = {
+        "allocated_bytes": torch.cuda.memory_allocated(device),
+        "reserved_bytes": torch.cuda.memory_reserved(device),
+    }
+    pipeline_memory_receipt = {
+        "schema": "rosa.pipeline_memory_baseline_receipt.v2",
+        "before_release": memory_before_release,
+        "after_release": memory_after_release,
+        "pipeline_baseline": pipeline_baseline,
+        "release_actions": {
+            "processed_cuda_batches_released": True,
+            "raw_captured_cpu_batches_released": True,
+            "full_models_released": True,
+            "preprocessors_preserved": True,
+            "gc_collect_called": True,
+            "cuda_empty_cache_called": True,
+            "cuda_synchronize_called": True,
+        },
+    }
+    pipeline_memory_receipt["sha256"] = canonical_sha256(pipeline_memory_receipt)
+    validate_pipeline_memory_baseline_receipt(pipeline_memory_receipt)
+    _atomic_json(
+        output_dir / "pipeline_memory_baseline_receipt.json",
+        pipeline_memory_receipt,
+    )
     live_stream_positions = {PARENT_ARM: 0, CANDIDATE_ARM: 0}
+    boundary_observations: dict[int, dict[str, Mapping[str, Any]]] = {}
     pipeline_warmup, pipeline_measured = _segmented_records(
         warmup_schedule,
         measured_schedule,
-        models=models,
+        models=preprocessors,
         run_segment=lambda schedule, sequence_offset: _run_input_pipeline_schedule(
             schedule,
-            models,
+            preprocessors,
             live_iterators,
             expected_batch_size=parameters["expected_batch_size"],
             device=device,
-            expected_pair_sequence=live_pair_sequence["pairs"],
+            expected_pair_sequence=sealed_pairs,
             stream_positions=live_stream_positions,
+            boundary_observations=boundary_observations,
             sequence_offset=sequence_offset,
         ),
     )
@@ -1736,6 +2312,15 @@ def _execute_representation_protocol(
         raise VerificationContractError(
             "input pipeline did not consume the full prevalidated pair sequence"
         )
+    boundary_receipt = build_timed_common_boundary_receipt(
+        boundary_observations,
+        sealed_pairs,
+    )
+    validate_timed_common_boundary_receipt(boundary_receipt, sealed_pairs)
+    _atomic_json(
+        output_dir / "timed_common_preprocessor_boundary_receipt.json",
+        boundary_receipt,
+    )
     _write_jsonl(
         output_dir / "input_pipeline_warmup_timings.jsonl",
         pipeline_warmup,
@@ -1767,8 +2352,8 @@ def _execute_representation_protocol(
         "model_only": evaluate_model_only_non_regression_gate(model_bootstrap),
         "input_pipeline_end_to_end": evaluate_input_pipeline_gate(
             pipeline_bootstrap,
-            representation_manifest["pairs"],
-            common_boundary_parity=True,
+            sealed_pairs,
+            common_boundary_receipt=boundary_receipt,
         ),
         "combined_full_inference": {
             "measured": False,
@@ -1783,15 +2368,15 @@ def _execute_representation_protocol(
             "decision": "NOT_APPLICABLE_TO_CURRENT_ARM_PAIR",
         },
     }
-    _validate_captured_representation_batches(
-        batches,
-        representation_manifest,
-        phase="after all timing scopes",
-    )
     _atomic_json(output_dir / "representation_scope_decisions.json", decisions)
-    environment = _environment(device, nvidia_smi_start=nvidia_smi_start)
+    environment = _environment(
+        device,
+        nvidia_smi_start=nvidia_smi_start,
+        device_identity=device_identity,
+    )
     _atomic_json(output_dir / "environment.json", environment)
     artifacts = (
+        "content_closure_revalidation.json",
         "representation_pairs.json",
         "common_preprocessor_boundary_parity.json",
         "output_state_rng_parity.json",
@@ -1799,7 +2384,8 @@ def _execute_representation_protocol(
         "combined_test_step_profile_candidate.json",
         "combined_test_step_profiles.json",
         "combined_test_step_memory.json",
-        "live_representation_pair_sequence.json",
+        "pipeline_memory_baseline_receipt.json",
+        "timed_common_preprocessor_boundary_receipt.json",
         "model_only_warmup_timings.jsonl",
         "model_only_raw_timings.jsonl",
         "model_only_paired_bootstrap.json",
@@ -1811,15 +2397,28 @@ def _execute_representation_protocol(
         "environment.json",
     )
     summary = {
-        "schema": "rosa.c32_representation_runtime.v1",
+        "schema": "rosa.c32_representation_runtime.v2",
         "status": "COMPLETE",
         "protocol": REPRESENTATION_PROTOCOL,
+        "immutable_plan": {
+            "path": str(output_dir / "plan.json"),
+            "sha256": file_sha256(output_dir / "plan.json"),
+        },
+        "final_artifact_closure": (
+            "final_receipt.json will hash plan.json, summary.json, and every "
+            "completed raw artifact; only the receipt self-excludes"
+        ),
         "repository": repository,
         "environment": environment,
         "model_contracts": model_contracts,
         "representation_manifest": representation_manifest,
+        "sealed_representation_sequence": {
+            "pairs": sealed_sequence["pairs_per_arm"],
+            "sha256": sealed_sequence["sha256"],
+        },
         "parity": {
             "common_preprocessor_boundary": "raw-bit exact",
+            "all_timed_semantic_pairs_common_boundary": boundary_receipt["sha256"],
             "outputs_runtime_state_rng": "raw-bit exact",
         },
         "measurement_contract": prepared.plan["benchmark_scopes"],
@@ -1833,6 +2432,7 @@ def _execute_representation_protocol(
             "input_pipeline_end_to_end": pipeline_bootstrap,
         },
         "decisions": decisions,
+        "pipeline_memory_baseline_receipt": pipeline_memory_receipt,
         "full_inference_speed_claim_authorized": False,
         "raw_artifacts": {
             name: {
@@ -1863,7 +2463,9 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
     try:
         device_index = int(args.device.split(":", 1)[1])
     except (IndexError, ValueError) as error:
-        raise VerificationContractError("armed verification requires device cuda:N") from error
+        raise VerificationContractError(
+            "armed verification requires device cuda:N"
+        ) from error
     if device_index < 0:
         raise VerificationContractError("CUDA device index must be nonnegative")
     existing_workspace = os.environ.get("CUBLAS_WORKSPACE_CONFIG")
@@ -1873,6 +2475,15 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         )
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+    if prepared.plan["protocol"] == REPRESENTATION_PROTOCOL:
+        if not prepared.plan.get("armed_execution_ready"):
+            raise VerificationContractError(
+                "representation preregistration is a DISARMED placeholder; "
+                "generate and seal all 360 pairs and content closures first"
+            )
+        closure_receipt = _verify_representation_closures(prepared)
+    else:
+        closure_receipt = None
     repository = _git_snapshot(ROOT, require_clean=True)
     output_dir = Path(prepared.plan["output_dir"])
     if output_dir.exists():
@@ -1884,17 +2495,16 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
     armed_plan.update(
         {
             "status": "ARMED",
-            "cuda_queried": False,
+            "cuda_query_state_when_plan_written": "NOT_YET_QUERIED",
+            "immutable_after_write": True,
             "repository": repository,
+            "verified_content_closures": closure_receipt,
         }
     )
     _atomic_json(output_dir / "plan.json", armed_plan)
 
     try:
         cuda_available = torch.cuda.is_available()
-        armed_plan["cuda_queried"] = True
-        armed_plan["cuda_available"] = cuda_available
-        _atomic_json(output_dir / "plan.json", armed_plan)
         if not cuda_available:
             raise VerificationContractError("armed verification requires CUDA")
         device = torch.device(args.device)
@@ -1903,12 +2513,27 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         _seed_everything(prepared.plan["seed"], cuda=True)
-        nvidia_smi_start = _nvidia_smi_snapshot(device_index)
+        device_identity = _logical_cuda_device_uuid(device)
+        if device_identity["logical_index"] != device_index:
+            raise VerificationContractError(
+                "Torch logical CUDA device index changed after selection"
+            )
+        nvidia_smi_start = _nvidia_smi_snapshot(device_identity["gpu_uuid"])
         _atomic_json(output_dir / "environment_start.json", nvidia_smi_start)
 
         models, model_contracts = _build_models(prepared, device)
         if prepared.plan["protocol"] == REPRESENTATION_PROTOCOL:
-            return _execute_representation_protocol(
+            closure_revalidation = _verify_representation_closures(prepared)
+            if closure_revalidation != closure_receipt:
+                raise VerificationContractError(
+                    "source or dataset closure changed between pre-CUDA "
+                    "verification and model import"
+                )
+            _atomic_json(
+                output_dir / "content_closure_revalidation.json",
+                closure_revalidation,
+            )
+            summary = _execute_representation_protocol(
                 prepared,
                 device=device,
                 models=models,
@@ -1916,7 +2541,10 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
                 output_dir=output_dir,
                 repository=repository,
                 nvidia_smi_start=nvidia_smi_start,
+                device_identity=device_identity,
             )
+            receipt = _seal_final_artifact_receipt(output_dir)
+            return {"summary": summary, "final_receipt": receipt}
         batches, sample_manifest = _capture_batches(prepared)
         _atomic_json(output_dir / "captured_batches.json", sample_manifest)
 
@@ -1925,9 +2553,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         output_parity = _verify_outputs_and_state(models, batches)
         _atomic_json(output_dir / "output_state_rng_parity.json", output_parity)
 
-        profile_batch = batches[
-            prepared.plan["parameters"]["profile_batch_index"]
-        ]
+        profile_batch = batches[prepared.plan["parameters"]["profile_batch_index"]]
         profile_parent = _profile_arm(
             PARENT_ARM,
             models[PARENT_ARM],
@@ -1964,9 +2590,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         _atomic_json(output_dir / "memory.json", memory)
 
         warmup_schedule = build_alternating_schedule(
-            iterations_per_arm=prepared.plan["parameters"][
-                "warmup_iterations_per_arm"
-            ],
+            iterations_per_arm=prepared.plan["parameters"]["warmup_iterations_per_arm"],
             batch_count=len(batches),
             phase="warmup",
         )
@@ -1984,9 +2608,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
             for model in models.values():
                 _reset_runtime_state(model)
             for slot_index, token in enumerate(expected_pattern):
-                expected_arm = (
-                    PARENT_ARM if token == "P" else CANDIDATE_ARM
-                )
+                expected_arm = PARENT_ARM if token == "P" else CANDIDATE_ARM
                 segment_warmup = tuple(
                     entry
                     for entry in warmup_schedule
@@ -2005,8 +2627,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
                         "has no timing entries"
                     )
                 if any(
-                    entry.pattern != expected_pattern
-                    or entry.arm != expected_arm
+                    entry.pattern != expected_pattern or entry.arm != expected_arm
                     for entry in segment_warmup + segment_measured
                 ):
                     raise VerificationContractError(
@@ -2062,9 +2683,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         }
         paired_bootstrap = paired_bootstrap_confidence_intervals(
             measured_records,
-            expected_pairs=prepared.plan["parameters"][
-                "measured_iterations_per_arm"
-            ],
+            expected_pairs=prepared.plan["parameters"]["measured_iterations_per_arm"],
             bootstrap_samples=BOOTSTRAP_SAMPLES,
             seed=BOOTSTRAP_SEED,
         )
@@ -2074,6 +2693,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         environment = _environment(
             device,
             nvidia_smi_start=nvidia_smi_start,
+            device_identity=device_identity,
         )
         _atomic_json(output_dir / "environment.json", environment)
         summary = {
@@ -2092,18 +2712,18 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
             "memory": memory,
             "measurement_contract": {
                 "physical_round_order": list(PHYSICAL_ROUND_ORDER),
-                "warmup_invocations_per_arm_excluded": prepared.plan[
-                    "parameters"
-                ]["warmup_iterations_per_arm"],
+                "warmup_invocations_per_arm_excluded": prepared.plan["parameters"][
+                    "warmup_iterations_per_arm"
+                ],
                 "measured_invocations_per_arm": prepared.plan["parameters"][
                     "measured_iterations_per_arm"
                 ],
-                "warmup_iterations_per_arm_segment": prepared.plan[
-                    "parameters"
-                ]["warmup_iterations_per_segment"],
-                "measured_iterations_per_arm_segment": prepared.plan[
-                    "parameters"
-                ]["measured_iterations_per_segment"],
+                "warmup_iterations_per_arm_segment": prepared.plan["parameters"][
+                    "warmup_iterations_per_segment"
+                ],
+                "measured_iterations_per_arm_segment": prepared.plan["parameters"][
+                    "measured_iterations_per_segment"
+                ],
                 "dataloader_io_in_primary_timing": False,
                 "evaluator_serialization_in_primary_timing": False,
             },
@@ -2133,7 +2753,8 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
             },
         }
         _atomic_json(output_dir / "summary.json", summary)
-        return summary
+        receipt = _seal_final_artifact_receipt(output_dir)
+        return {"summary": summary, "final_receipt": receipt}
     except Exception as error:
         failure = {
             "schema_version": 2,
@@ -2154,8 +2775,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("--execute requires --execution-state ARMED")
         if args.idle_gpu_confirmation != IDLE_GPU_CONFIRMATION:
             parser.error(
-                "--execute requires --idle-gpu-confirmation "
-                + IDLE_GPU_CONFIRMATION
+                "--execute requires --idle-gpu-confirmation " + IDLE_GPU_CONFIRMATION
             )
     prepared = prepare_verification(args)
     if not args.execute:

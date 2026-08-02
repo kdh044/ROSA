@@ -1,0 +1,51 @@
+{
+  "schema": "rosa.c32_representation_runtime_preregistration.v2",
+  "status": "PLACEHOLDER_DISARMED",
+  "protocol": "lean-loader-uint8-pinned",
+  "execution_authorized": false,
+  "frozen_contract": {
+    "capture_batches": 2,
+    "warmup_iterations_per_arm": 60,
+    "measured_iterations_per_arm": 300,
+    "sequence_pairs_per_arm": 360,
+    "expected_batch_size": 4,
+    "dataloader_workers": 0,
+    "seed": 3407,
+    "bootstrap_seed": 3407,
+    "bootstrap_samples": 20000,
+    "physical_round_order": [
+      "PCCP",
+      "CPPC",
+      "PCCP",
+      "CPPC",
+      "PCCP",
+      "CPPC"
+    ],
+    "checkpoint_sha256": "cb5b0956ab8357d64bbcde919d8aa10aa772d03c73252c137709529e6299e85d",
+    "parent_normalized_config_sha256": "3496f6f0459fbf443dcc94659c5a2de35acaefd837f29f968f96437cc40d2559",
+    "candidate_normalized_config_sha256": "d79deb42055136c0137fa7e101dc53156899f25e9b5b85bff2146f10e9474c91"
+  },
+  "sequence_manifest": {
+    "status": "MISSING"
+  },
+  "rosa_source_closure": {
+    "status": "MISSING"
+  },
+  "detector_host_source_closure": {
+    "status": "MISSING"
+  },
+  "official_source_closure": {
+    "status": "MISSING"
+  },
+  "dataset_payload_closure": {
+    "status": "MISSING"
+  },
+  "generator_contract": {
+    "tool": "tools/generate_c32_representation_preregistration.py",
+    "default_state": "DISARMED",
+    "benchmark_execution": false,
+    "timing_execution": false,
+    "required_pairs": 360,
+    "fabricated_manifest_allowed": false
+  }
+}

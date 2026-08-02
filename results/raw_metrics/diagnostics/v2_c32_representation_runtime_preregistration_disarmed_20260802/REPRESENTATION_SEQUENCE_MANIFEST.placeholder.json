@@ -1,0 +1,9 @@
+{
+  "schema": "rosa.representation_sequence_placeholder.v2",
+  "status": "MISSING_NOT_GENERATED",
+  "protocol": "lean-loader-uint8-pinned",
+  "pairs_present": 0,
+  "pairs_required": 360,
+  "armed_execution_ready": false,
+  "reason": "No live dataset payload was read while training was active. Run the disarmed manifest generator later and seal every required closure before ARMED execution."
+}
