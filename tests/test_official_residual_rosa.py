@@ -31,9 +31,23 @@ def _config(name: str) -> Config:
     return Config.fromfile(ROOT / "configs" / name)
 
 
-def test_fast_cp16_config_changes_c32_only_by_rosa_and_training_duration() -> None:
-    c32 = _config("rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py")
+def test_fast_cp16_has_a_schedule_matched_c32_control() -> None:
+    historical = _config(
+        "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py"
+    )
+    c32 = _config("rosa_r18_main126_v3_c32_official_residual_30e.py")
     combined = _config("rosa_r18_main126_v3_fast_cp16_official_residual.py")
+
+    # The control preserves C32 and changes only its horizon/retention.
+    historical_dict = copy.deepcopy(historical.to_dict())
+    control_dict = copy.deepcopy(c32.to_dict())
+    for value in (historical_dict, control_dict):
+        value.pop("work_dir")
+        value.pop("experiment_contract")
+    historical_dict["param_scheduler"] = control_dict["param_scheduler"]
+    historical_dict["train_cfg"] = control_dict["train_cfg"]
+    historical_dict["default_hooks"]["checkpoint"]["max_keep_ckpts"] = 5
+    assert historical_dict == control_dict
 
     assert c32.model.head.type == "ROSAOfficialResidualNativeBaselineHead"
     assert combined.model.head.type == "ROSAOfficialResidualRefinementHead"
@@ -46,14 +60,34 @@ def test_fast_cp16_config_changes_c32_only_by_rosa_and_training_duration() -> No
     observed_head["type"] = expected_head["type"]
     assert observed_head == expected_head
 
-    assert combined.train_cfg.max_epochs == 30
-    assert combined.param_scheduler[1].end == 30
-    assert combined.param_scheduler[1].T_max == 30
-    assert combined.default_hooks.checkpoint.max_keep_ckpts == 5
+    # Freeze the complete scientific pair, not only a hand-picked list of
+    # optimizer fields.  Any future dataset, augmentation, batch, schedule,
+    # evaluator, or detector drift must fail this test.
+    control_pair = copy.deepcopy(c32.to_dict())
+    candidate_pair = copy.deepcopy(combined.to_dict())
+    for value in (control_pair, candidate_pair):
+        value.pop("work_dir")
+        value.pop("experiment_contract")
+    candidate_pair["model"]["head"]["rosa_cfg"] = None
+    candidate_pair["model"]["head"]["type"] = control_pair["model"]["head"][
+        "type"
+    ]
+    assert candidate_pair == control_pair
+
+    for field in ("optim_wrapper", "param_scheduler", "train_cfg"):
+        assert copy.deepcopy(combined[field]) == copy.deepcopy(c32[field])
+    assert combined.default_hooks.checkpoint == c32.default_hooks.checkpoint
+    assert c32.train_cfg.max_epochs == combined.train_cfg.max_epochs == 30
+    assert c32.param_scheduler[1].end == combined.param_scheduler[1].end == 30
+    assert c32.param_scheduler[1].T_max == combined.param_scheduler[1].T_max == 30
+    assert c32.default_hooks.checkpoint.max_keep_ckpts == 5
     assert combined.experiment_contract.backbone == "ImageNet-pretrained ResNet-18"
     assert combined.experiment_contract.learned_refiner_parameters == 87_935
     assert combined.experiment_contract.official_residual_parameters_added == 0
-    assert combined.experiment_contract.user_numeric_hyperparameters_added == 0
+    assert combined.experiment_contract.official_residual_numeric_hyperparameters_added == 0
+    assert combined.experiment_contract.sidecar_profile_selection == (
+        "fast (fixed CP16 topology)"
+    )
 
 
 def test_combined_head_preserves_c32_native_state_and_residual_math() -> None:

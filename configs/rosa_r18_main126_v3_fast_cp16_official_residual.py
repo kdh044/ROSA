@@ -50,7 +50,7 @@ experiment_contract = dict(
     seed=3407,
     detector="C32 corrected Sparse4D D0-D5 plus fast CP16 ROSA sidecar",
     arm="C32+ROSA-fast-CP16-v3",
-    paired_baseline="C32-official-Sparse4D-GNN-residual",
+    paired_baseline="C32-official-Sparse4D-GNN-residual-30e-control",
     changed_detector_operation=("retain C32 identity+dropout around D1-D5 self-GNN"),
     changed_sidecar_operation=(
         "one 50-query full-FOV ROSA refinement pass with signed CP16 RFL"
@@ -58,5 +58,6 @@ experiment_contract = dict(
     learned_refiner_parameters=87_935,
     official_residual_parameters_added=0,
     official_residual_buffers_added=0,
-    user_numeric_hyperparameters_added=0,
+    official_residual_numeric_hyperparameters_added=0,
+    sidecar_profile_selection="fast (fixed CP16 topology)",
 )
