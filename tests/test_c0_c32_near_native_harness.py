@@ -8,7 +8,7 @@ import importlib.util
 from pathlib import Path
 import random
 import sys
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 from mmengine.config import Config
 from mmengine.utils import import_modules_from_strings
@@ -58,6 +58,26 @@ def _clear_preimported_projects(monkeypatch) -> None:
     for name in tuple(sys.modules):
         if name == "projects" or name.startswith("projects."):
             monkeypatch.delitem(sys.modules, name)
+
+
+@pytest.fixture
+def trusted_daf_binary_contract(monkeypatch):
+    def contract(root: Path, *, expected_sha256: str) -> dict:
+        path = (
+            root
+            / "projects/mmdet3d_plugin/ops"
+            / verify_tool.DAF_EXTENSION_BASENAME
+        ).resolve()
+        return {
+            "path": str(path),
+            "basename": verify_tool.DAF_EXTENSION_BASENAME,
+            "sha256": expected_sha256,
+            "size_bytes": 1,
+            "regular_non_symlink": True,
+        }
+
+    monkeypatch.setattr(verify_tool, "_daf_binary_file_contract", contract)
+    return contract
 
 
 def _configs() -> tuple[Config, Config]:
@@ -296,7 +316,12 @@ def test_detection_output_contract_rejects_nan_bad_label_and_count() -> None:
         verify_tool._validate_detection_output(_fake_output()[:3])
 
 
-def test_dry_run_never_queries_cuda_or_creates_output(tmp_path, monkeypatch) -> None:
+def test_dry_run_never_queries_cuda_or_creates_output(
+    tmp_path,
+    monkeypatch,
+    trusted_daf_binary_contract,
+) -> None:
+    del trusted_daf_binary_contract
     checkpoint = tmp_path / "tiny.pth"
     torch.save({"state_dict": {"weight": torch.ones(1)}}, checkpoint)
     output = tmp_path / "never-created"
@@ -334,6 +359,257 @@ def test_dry_run_never_queries_cuda_or_creates_output(tmp_path, monkeypatch) -> 
         args.expected_detector_host_revision
     )
     assert prepared.plan["detector_host"]["source_contract"]["files"]
+    assert prepared.plan["detector_host"]["daf_source_contract"]["files"]
+    assert prepared.plan["detector_host"][
+        "expected_daf_extension_sha256"
+    ] == verify_tool.DEFAULT_DAF_EXTENSION_SHA256
+    assert prepared.plan["detector_host"]["daf_binary_contract"][
+        "sha256"
+    ] == verify_tool.DEFAULT_DAF_EXTENSION_SHA256
+    assert prepared.plan["rosa_source"]["source_contract"]["files"]
+    assert prepared.plan["official_fisheye3dod"]["source_contract"]["files"]
+    assert prepared.plan["official_fisheye3dod"]["git"]["revision"] == (
+        verify_tool.EXPECTED_OFFICIAL_REVISION
+    )
+    assert prepared.plan["official_fisheye3dod"]["source_contract"][
+        "sha256"
+    ] == verify_tool.EXPECTED_OFFICIAL_SOURCE_SHA256
+    assert prepared.plan["measurement"]["pinned_ingress"]
+    assert output.exists() is False
+
+
+def test_cpu_ingress_requires_pinned_storage_when_requested(monkeypatch) -> None:
+    monkeypatch.setattr(verify_tool, "EXPECTED_BATCH_SIZE", 0)
+    batch = {
+        "inputs": {
+            "img": torch.empty((0, 4, 3, 800, 800), dtype=torch.uint8),
+        }
+    }
+
+    verify_tool._validate_cpu_ingress(batch, require_pinned=False)
+    with pytest.raises(VerificationContractError, match="pinned CPU storage"):
+        verify_tool._validate_cpu_ingress(batch, require_pinned=True)
+    with pytest.raises(VerificationContractError, match="pinned CPU storage"):
+        verify_tool._clone_pinned_cpu_ingress_batch(batch)
+
+
+def test_pinned_ingress_clone_requests_independent_pinned_storage(monkeypatch) -> None:
+    class FakePinnedTensor(torch.Tensor):
+        def is_pinned(self, device=None):
+            del device
+            return True
+
+    monkeypatch.setattr(verify_tool, "EXPECTED_BATCH_SIZE", 0)
+    real_empty = torch.empty
+    source = real_empty((0, 4, 3, 800, 800), dtype=torch.uint8).as_subclass(
+        FakePinnedTensor
+    )
+    calls = []
+
+    def fake_empty(*args, **kwargs):
+        calls.append(copy.deepcopy(kwargs))
+        kwargs.pop("pin_memory")
+        return real_empty(*args, **kwargs).as_subclass(FakePinnedTensor)
+
+    monkeypatch.setattr(verify_tool.torch, "empty", fake_empty)
+    cloned = verify_tool._clone_pinned_cpu_ingress_batch(
+        {"inputs": {"img": source}}
+    )
+
+    assert calls == [{"dtype": torch.uint8, "device": "cpu", "pin_memory": True}]
+    assert cloned["inputs"]["img"] is not source
+    assert cloned["inputs"]["img"].is_pinned()
+
+
+def test_ephemeral_id_counter_is_attested_outside_persistent_state() -> None:
+    model = torch.nn.Module()
+    model.head = torch.nn.Module()
+    model.head.instance_bank = torch.nn.Module()
+    bank = model.head.instance_bank
+    bank.num_temp_instances = 0
+    bank.num_anchor = 300
+    bank.prev_id = 0
+
+    reset = verify_tool._ephemeral_id_counter_contract(
+        model,
+        expected_invocations=0,
+    )
+    assert reset["observed_value"] == 0
+    bank.prev_id = torch.tensor(1200, dtype=torch.long)
+    advanced = verify_tool._ephemeral_id_counter_contract(
+        model,
+        expected_invocations=1,
+    )
+    assert advanced["observed_value"] == 1200
+    assert "prev_id" not in verify_tool._runtime_state_snapshot(model)
+    with pytest.raises(VerificationContractError, match="expected 2400"):
+        verify_tool._ephemeral_id_counter_contract(
+            model,
+            expected_invocations=2,
+        )
+
+
+def test_foreign_rosa_module_is_rejected(tmp_path, monkeypatch) -> None:
+    foreign = ModuleType("rosa.foreign_runtime_test")
+    foreign.__file__ = str(tmp_path / "foreign" / "module.py")
+    monkeypatch.setitem(sys.modules, foreign.__name__, foreign)
+
+    with pytest.raises(VerificationContractError, match="foreign ROSA"):
+        verify_tool._reject_foreign_preimported_rosa(verify_tool.SRC_ROOT)
+
+
+def test_loaded_module_contract_accepts_only_pinned_namespace(
+    tmp_path, monkeypatch
+) -> None:
+    root = tmp_path / "official"
+    root.mkdir()
+    namespace = ModuleType("sealed_namespace_test")
+    namespace.__path__ = [str(root)]
+    monkeypatch.setitem(sys.modules, namespace.__name__, namespace)
+
+    contract = verify_tool._loaded_python_module_contract(
+        root,
+        module_prefixes=(namespace.__name__,),
+        label="sealed namespace test",
+    )
+    assert contract["files"][namespace.__name__]["kind"] == "namespace"
+    namespace.__path__ = [str(tmp_path / "foreign")]
+    with pytest.raises(VerificationContractError, match="outside pinned root"):
+        verify_tool._loaded_python_module_contract(
+            root,
+            module_prefixes=(namespace.__name__,),
+            label="sealed namespace test",
+        )
+
+
+def _temporary_daf_path(root: Path) -> Path:
+    path = (
+        root
+        / "projects/mmdet3d_plugin/ops"
+        / verify_tool.DAF_EXTENSION_BASENAME
+    )
+    path.parent.mkdir(parents=True)
+    return path
+
+
+def test_daf_binary_file_contract_rejects_absent_binary(tmp_path) -> None:
+    path = _temporary_daf_path(tmp_path)
+
+    with pytest.raises(VerificationContractError, match="does not exist"):
+        verify_tool._daf_binary_file_contract(
+            tmp_path,
+            expected_sha256="0" * 64,
+        )
+
+    assert path.exists() is False
+
+
+def test_daf_binary_file_contract_rejects_wrong_hash(tmp_path) -> None:
+    path = _temporary_daf_path(tmp_path)
+    path.write_bytes(b"not-the-blessed-binary")
+
+    with pytest.raises(VerificationContractError, match="binary hash is"):
+        verify_tool._daf_binary_file_contract(
+            tmp_path,
+            expected_sha256="0" * 64,
+        )
+
+
+def test_daf_binary_file_contract_accepts_exact_path_and_hash(tmp_path) -> None:
+    path = _temporary_daf_path(tmp_path)
+    payload = b"unit-test-binary-contract"
+    path.write_bytes(payload)
+    digest = file_sha256(path)
+
+    contract = verify_tool._daf_binary_file_contract(
+        tmp_path,
+        expected_sha256=digest,
+    )
+
+    assert contract == {
+        "path": str(path.resolve()),
+        "basename": verify_tool.DAF_EXTENSION_BASENAME,
+        "sha256": digest,
+        "size_bytes": len(payload),
+        "regular_non_symlink": True,
+    }
+
+
+def test_execute_rechecks_daf_before_output_lock_or_cuda(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    revision = "a" * 40
+    repository = {"revision": revision}
+    rosa_sources = {"sha256": "rosa"}
+    detector_host = {"revision": "host"}
+    detector_sources = {"sha256": "host-source"}
+    detector_daf_sources = {"sha256": "daf-source"}
+    output = tmp_path / "never-created"
+    args = SimpleNamespace(
+        execution_state="ARMED",
+        idle_reserved_token=verify_tool.IDLE_RESERVED_TOKEN,
+        expected_source_revision=revision,
+        device="cuda:0",
+    )
+    prepared = verify_tool.PreparedProtocol(
+        args=args,
+        parent_config=None,
+        candidate_config=None,
+        checkpoint={},
+        state_dict={},
+        expected_manifest=None,
+        detector_host_root=tmp_path / "host",
+        official_root=tmp_path / "official",
+        plan={
+            "output_dir": str(output),
+            "rosa_source": {"source_contract": rosa_sources},
+            "detector_host": {
+                "git": detector_host,
+                "source_contract": detector_sources,
+                "daf_source_contract": detector_daf_sources,
+                "daf_binary_contract": {"sha256": "unreachable"},
+            },
+        },
+    )
+    monkeypatch.setattr(verify_tool, "_git_snapshot", lambda **kwargs: repository)
+    monkeypatch.setattr(
+        verify_tool,
+        "_python_source_contract",
+        lambda *args, **kwargs: rosa_sources,
+    )
+    monkeypatch.setattr(
+        verify_tool,
+        "_git_snapshot_at",
+        lambda *args, **kwargs: detector_host,
+    )
+    monkeypatch.setattr(
+        verify_tool,
+        "_host_source_contract",
+        lambda *args, **kwargs: detector_sources,
+    )
+    monkeypatch.setattr(
+        verify_tool,
+        "_host_daf_source_contract",
+        lambda *args, **kwargs: detector_daf_sources,
+    )
+
+    def missing_binary(*args, **kwargs):
+        del args, kwargs
+        raise VerificationContractError("pinned DAF extension binary does not exist")
+
+    def forbidden(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("output lock or CUDA was touched")
+
+    monkeypatch.setattr(verify_tool, "_daf_binary_file_contract", missing_binary)
+    monkeypatch.setattr(verify_tool, "_acquire_lock", forbidden)
+    monkeypatch.setattr(verify_tool, "_nvidia_smi_snapshot", forbidden)
+    monkeypatch.setattr(torch.cuda, "is_available", forbidden)
+
+    with pytest.raises(VerificationContractError, match="does not exist"):
+        verify_tool.execute_protocol(prepared)
+
     assert output.exists() is False
 
 
@@ -366,8 +642,9 @@ def test_dry_run_rejects_foreign_preimported_detector_host(
 
 
 def test_dry_run_rejects_wrong_checkpoint_before_any_cuda_query(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, trusted_daf_binary_contract
 ) -> None:
+    del trusted_daf_binary_contract
     checkpoint = tmp_path / "tiny.pth"
     torch.save({"state_dict": {"weight": torch.ones(1)}}, checkpoint)
     revision = verify_tool._run_git("rev-parse", "HEAD")
@@ -392,6 +669,34 @@ def test_dry_run_rejects_wrong_checkpoint_before_any_cuda_query(
     )
 
     with pytest.raises(VerificationContractError, match="checkpoint hash"):
+        verify_tool.prepare_protocol(args)
+
+
+def test_dry_run_rejects_daf_binary_hash_override_before_cuda(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr(
+        torch.cuda,
+        "is_available",
+        lambda: (_ for _ in ()).throw(AssertionError("CUDA queried")),
+    )
+    args = verify_tool.build_parser().parse_args(
+        [
+            "--checkpoint",
+            str(tmp_path / "unused.pth"),
+            "--expected-checkpoint-sha256",
+            "0" * 64,
+            "--expected-source-revision",
+            "0" * 40,
+            "--expected-daf-extension-sha256",
+            "1" * 64,
+            "--output-dir",
+            str(tmp_path / "unused-output"),
+        ]
+        + _detector_host_arguments()
+    )
+
+    with pytest.raises(VerificationContractError, match="forbids overriding"):
         verify_tool.prepare_protocol(args)
 
 

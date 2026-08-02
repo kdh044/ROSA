@@ -203,7 +203,7 @@ def test_dense_batched_tail_reduces_pointwise_launch_groups():
     assert sum("aten.exp.default" in name for name in parent_log.names) == 4
     assert sum("atan2" in name for name in candidate_log.names) == 1
     assert sum("aten.exp.default" in name for name in candidate_log.names) == 1
-    assert inspect.getsource(_decode_dense_legacy_batch).count(".cpu()") == 5
+    assert inspect.getsource(_decode_dense_legacy_batch).count(".cpu()") == 2
 
     for name in CPU_FIELDS:
         storages = {sample[name].untyped_storage()._cdata for sample in output}

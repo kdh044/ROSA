@@ -17,8 +17,10 @@ from dataclasses import dataclass
 import gc
 import hashlib
 import importlib
+from importlib.machinery import ExtensionFileLoader
 import importlib.metadata
 import importlib.util
+import inspect
 import json
 import os
 from pathlib import Path
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import time
 import traceback
+from types import ModuleType
 from typing import Any
 
 import numpy as np
@@ -37,8 +40,9 @@ from mmengine.config import Config
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
+while str(SRC_ROOT) in sys.path:
+    sys.path.remove(str(SRC_ROOT))
+sys.path.insert(0, str(SRC_ROOT))
 
 from rosa.runtime_verification import (  # noqa: E402
     BOOTSTRAP_SAMPLES,
@@ -79,9 +83,58 @@ EXPECTED_ANNOTATION_SHA256 = (
 DEFAULT_DETECTOR_HOST_ROOT = Path(
     "/home/airlab/user/kdh/ROSA_host_wt_exacte94_native_eval_p1p2_strict"
 )
+DEFAULT_OFFICIAL_ROOT = Path("/home/airlab/user/kdh/dependencies/fisheye3dod")
+EXPECTED_OFFICIAL_REVISION = "a28726ed002a02cb1328960848c0f4f2473748de"
+EXPECTED_OFFICIAL_SOURCE_SHA256 = (
+    "007f8d0f1f2645fa425085f2368215978eef0ad60467fbc9f67c331d2b1913db"
+)
+DEFAULT_DAF_EXTENSION_SHA256 = (
+    "1831505bfb68183344ec8daa60c8d4d38bc806b60516bb3389e6190f463ffa30"
+)
+DAF_EXTENSION_BASENAME = (
+    "deformable_aggregation_ext.cpython-310-x86_64-linux-gnu.so"
+)
+BLESSED_DAF_BUILD_INPUT_SHA256 = {
+    "projects/mmdet3d_plugin/ops/setup.py": (
+        "f98cc5a3b35f6d454a33968a91c5a87c49023f50c9824fe7d05d86fdd4c1d598"
+    ),
+    "projects/mmdet3d_plugin/ops/src/deformable_aggregation.cpp": (
+        "8685b1035b15c43c75914e9240681b33b2cd5fb852e56e06eb2e8812cbafd48f"
+    ),
+    "projects/mmdet3d_plugin/ops/src/deformable_aggregation_cuda.cu": (
+        "7abb58450621fbe42395953397c480f1689cf6da315075b52d8a770e44168702"
+    ),
+}
+BLESSED_DAF_WRAPPER_SHA256 = (
+    "9695730cdefc1fbaf40cd990b08716d1dfd78b0f90eaef24a1aa76b78a4215b0"
+)
+HOST_DAF_SOURCE_FILES = (
+    "projects/mmdet3d_plugin/ops/__init__.py",
+    "projects/mmdet3d_plugin/ops/deformable_aggregation.py",
+    "projects/mmdet3d_plugin/ops/setup.py",
+    "projects/mmdet3d_plugin/ops/src/deformable_aggregation.cpp",
+    "projects/mmdet3d_plugin/ops/src/deformable_aggregation_cuda.cu",
+)
+REQUIRED_DAF_EXTENSION_SYMBOLS = (
+    "deformable_aggregation_forward",
+    "deformable_aggregation_backward",
+    "deformable_aggregation_per_camera_forward",
+    "deformable_aggregation_per_camera_backward",
+    "deformable_aggregation_per_camera_deterministic_backward",
+)
+DAF_SUPPORTED_CUDA_CAPABILITIES = (
+    (8, 0),
+    (8, 6),
+    (8, 9),
+    (9, 0),
+    (12, 0),
+)
 HOST_MODULE_FILES = {
     "projects.mmdet3d_plugin": "projects/mmdet3d_plugin/__init__.py",
     "projects.mmdet3d_plugin.ops": "projects/mmdet3d_plugin/ops/__init__.py",
+    "projects.mmdet3d_plugin.ops.deformable_aggregation": (
+        "projects/mmdet3d_plugin/ops/deformable_aggregation.py"
+    ),
     "projects.mmdet3d_plugin.models.sparse4d": (
         "projects/mmdet3d_plugin/models/sparse4d.py"
     ),
@@ -123,6 +176,7 @@ class PreparedProtocol:
     state_dict: Mapping[str, torch.Tensor]
     expected_manifest: Mapping[str, Any] | None
     detector_host_root: Path
+    official_root: Path
     plan: dict[str, Any]
 
 
@@ -137,6 +191,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_DETECTOR_HOST_ROOT,
     )
     parser.add_argument("--expected-detector-host-revision", required=True)
+    parser.add_argument(
+        "--official-root",
+        type=Path,
+        default=DEFAULT_OFFICIAL_ROOT,
+    )
+    parser.add_argument(
+        "--expected-daf-extension-sha256",
+        default=DEFAULT_DAF_EXTENSION_SHA256,
+    )
     parser.add_argument("--expected-sample-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -220,6 +283,23 @@ def _resolve_directory(path: Path, label: str) -> Path:
     return resolved
 
 
+def _pin_import_roots(detector_host_root: Path) -> None:
+    roots = (str(SRC_ROOT), str(detector_host_root))
+    for root in roots:
+        while root in sys.path:
+            sys.path.remove(root)
+    sys.path.insert(0, roots[1])
+    sys.path.insert(0, roots[0])
+
+
+def _pin_official_import_roots(official_root: Path) -> None:
+    roots = (str(official_root), str(official_root.parent))
+    for root in roots:
+        while root in sys.path:
+            sys.path.remove(root)
+    sys.path[2:2] = list(roots)
+
+
 def _is_module_within(module: Any, root: Path) -> bool:
     source = getattr(module, "__file__", None)
     if source is not None:
@@ -245,6 +325,144 @@ def _reject_foreign_preimported_host(root: Path) -> None:
         )
 
 
+def _reject_foreign_preimported_rosa(root: Path) -> None:
+    foreign = [
+        name
+        for name, module in sys.modules.items()
+        if (name == "rosa" or name.startswith("rosa."))
+        and module is not None
+        and not _is_module_within(module, root)
+    ]
+    if foreign:
+        raise VerificationContractError(
+            "foreign ROSA modules were imported before protocol setup: "
+            + ", ".join(sorted(foreign)[:8])
+        )
+
+
+def _reject_foreign_preimported_official(root: Path) -> None:
+    official_prefix = root.name
+    relevant = []
+    for name, module in sys.modules.items():
+        if module is None:
+            continue
+        if not (
+            name == official_prefix
+            or name.startswith(official_prefix + ".")
+            or name == "utils"
+            or name == "utils.fisheye3dod_calib"
+        ):
+            continue
+        if not _is_module_within(module, root):
+            relevant.append(name)
+    if relevant:
+        raise VerificationContractError(
+            "foreign official Fisheye3DOD modules were pre-imported: "
+            + ", ".join(sorted(relevant)[:8])
+        )
+
+
+def _python_source_contract(root: Path, *, label: str) -> dict[str, Any]:
+    files = {}
+    for path in sorted(root.rglob("*.py")):
+        if not path.is_file():
+            continue
+        relative = str(path.relative_to(root))
+        files[relative] = file_sha256(path)
+    if not files:
+        raise VerificationContractError(f"{label} contains no Python sources")
+    return {
+        "root": str(root),
+        "files": files,
+        "sha256": canonical_sha256(files),
+    }
+
+
+def _loaded_python_module_contract(
+    root: Path,
+    *,
+    module_prefixes: tuple[str, ...],
+    exact_names: tuple[str, ...] = (),
+    label: str,
+) -> dict[str, Any]:
+    files = {}
+    identity = {}
+    for name, module in sorted(sys.modules.items()):
+        if module is None or not (
+            name in exact_names
+            or any(name == prefix or name.startswith(prefix + ".") for prefix in module_prefixes)
+        ):
+            continue
+        source = getattr(module, "__file__", None)
+        if source is None:
+            search = getattr(module, "__path__", None)
+            if search is None:
+                raise VerificationContractError(
+                    f"{label} module has no source or namespace path: {name}"
+                )
+            paths = [Path(entry).resolve() for entry in search]
+            if not paths or any(not _is_within(path, root) for path in paths):
+                raise VerificationContractError(
+                    f"{label} namespace resolved outside pinned root: {name}"
+                )
+            relative_paths = [str(path.relative_to(root)) for path in paths]
+            record = {
+                "kind": "namespace",
+                "paths": [str(path) for path in paths],
+                "relative_paths": relative_paths,
+            }
+            files[name] = record
+            identity[name] = {
+                "kind": "namespace",
+                "relative_paths": relative_paths,
+            }
+            continue
+        path = Path(source).resolve()
+        if not _is_within(path, root):
+            raise VerificationContractError(
+                f"{label} module resolved outside pinned root: {name}"
+            )
+        relative = str(path.relative_to(root))
+        record = {
+            "kind": "source",
+            "path": str(path),
+            "relative_path": relative,
+            "sha256": file_sha256(path),
+        }
+        files[name] = record
+        identity[name] = {
+            "kind": "source",
+            "relative_path": relative,
+            "sha256": record["sha256"],
+        }
+    if not files:
+        raise VerificationContractError(f"no loaded {label} modules were observed")
+    return {
+        "root": str(root),
+        "files": files,
+        "sha256": canonical_sha256(identity),
+    }
+
+
+def _loaded_rosa_module_contract(root: Path) -> dict[str, Any]:
+    _reject_foreign_preimported_rosa(root)
+    return _loaded_python_module_contract(
+        root,
+        module_prefixes=("rosa",),
+        label="ROSA",
+    )
+
+
+def _loaded_official_module_contract(root: Path) -> dict[str, Any]:
+    _reject_foreign_preimported_official(root)
+    return _loaded_python_module_contract(
+        root,
+        module_prefixes=(root.name,),
+        exact_names=("utils", "utils.fisheye3dod_calib"),
+        label="official Fisheye3DOD",
+    )
+
+
 def _host_source_contract(root: Path) -> dict[str, Any]:
     files = {}
     for module_name, relative in HOST_MODULE_FILES.items():
@@ -257,6 +475,134 @@ def _host_source_contract(root: Path) -> dict[str, Any]:
         "root": str(root),
         "files": files,
         "sha256": canonical_sha256(files),
+    }
+
+
+def _host_daf_source_contract(root: Path) -> dict[str, Any]:
+    files = {}
+    for relative in HOST_DAF_SOURCE_FILES:
+        path = _resolve_file(root / relative, f"DAF source {relative}")
+        files[relative] = file_sha256(path)
+    return {
+        "root": str(root),
+        "files": files,
+        "sha256": canonical_sha256(files),
+    }
+
+
+def _daf_binary_file_contract(
+    root: Path,
+    *,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    """Verify the pinned DAF binary without importing it or touching CUDA."""
+
+    expected_sha256 = _validate_sha256(
+        expected_sha256,
+        "expected DAF extension SHA256",
+    )
+    ops_root = _resolve_directory(
+        root / "projects/mmdet3d_plugin/ops",
+        "pinned detector-host ops root",
+    )
+    expected_path = ops_root / DAF_EXTENSION_BASENAME
+    try:
+        expected_path.lstat()
+    except FileNotFoundError as error:
+        raise VerificationContractError(
+            f"pinned DAF extension binary does not exist: {expected_path}"
+        ) from error
+    if expected_path.is_symlink():
+        raise VerificationContractError(
+            "pinned DAF extension binary must be a regular non-symlink file"
+        )
+    path = _resolve_file(expected_path, "pinned DAF extension binary")
+    if path.parent != ops_root or path.name != DAF_EXTENSION_BASENAME:
+        raise VerificationContractError(
+            "pinned DAF extension binary escaped its exact host path"
+        )
+    digest = file_sha256(path)
+    if digest != expected_sha256:
+        raise VerificationContractError(
+            f"pinned DAF extension binary hash is {digest}, "
+            f"expected {expected_sha256}"
+        )
+    return {
+        "path": str(path),
+        "basename": path.name,
+        "sha256": digest,
+        "size_bytes": path.stat().st_size,
+        "regular_non_symlink": True,
+    }
+
+
+def _loaded_daf_extension_contract(
+    root: Path,
+    *,
+    expected_sha256: str,
+) -> dict[str, Any]:
+    ops = importlib.import_module("projects.mmdet3d_plugin.ops")
+    if getattr(ops, "_DAF_BUILT", None) is not True:
+        raise VerificationContractError(
+            "pinned detector host has no loadable deformable aggregation extension"
+        )
+    extension = getattr(ops, "deformable_aggregation_ext", None)
+    expected_module_name = (
+        "projects.mmdet3d_plugin.ops.deformable_aggregation_ext"
+    )
+    if (
+        type(extension) is not ModuleType
+        or getattr(extension, "__name__", None) != expected_module_name
+        or sys.modules.get(expected_module_name) is not extension
+    ):
+        raise VerificationContractError(
+            "DAF extension module identity is not the pinned pybind module"
+        )
+    source = getattr(extension, "__file__", None)
+    if source is None:
+        raise VerificationContractError("loaded DAF extension has no binary path")
+    path = Path(source).resolve()
+    expected_parent = (root / "projects/mmdet3d_plugin/ops").resolve()
+    if path.parent != expected_parent:
+        raise VerificationContractError(
+            "DAF extension resolved outside the pinned detector host"
+        )
+    if path.name != DAF_EXTENSION_BASENAME:
+        raise VerificationContractError(
+            f"unexpected DAF extension basename: {path.name}"
+        )
+    specification = getattr(extension, "__spec__", None)
+    loader = getattr(specification, "loader", None)
+    origin = getattr(specification, "origin", None)
+    if (
+        not isinstance(loader, ExtensionFileLoader)
+        or origin is None
+        or Path(origin).resolve() != path
+    ):
+        raise VerificationContractError(
+            "DAF extension was not loaded by ExtensionFileLoader from its binary"
+        )
+    digest = file_sha256(path)
+    if digest != expected_sha256:
+        raise VerificationContractError(
+            f"DAF extension hash is {digest}, expected {expected_sha256}"
+        )
+    invalid = [
+        name
+        for name in REQUIRED_DAF_EXTENSION_SYMBOLS
+        if not callable(getattr(extension, name, None))
+        or not inspect.isbuiltin(getattr(extension, name, None))
+    ]
+    if invalid:
+        raise VerificationContractError(
+            "DAF extension lacks required builtin bindings: "
+            + ", ".join(invalid)
+        )
+    return {
+        "path": str(path),
+        "sha256": digest,
+        "required_symbols": list(REQUIRED_DAF_EXTENSION_SYMBOLS),
+        "source_contract": _host_daf_source_contract(root),
     }
 
 
@@ -395,9 +741,19 @@ def _is_within(path: Path, parent: Path) -> bool:
 def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
     """Perform CPU-only validation without constructing runtime objects."""
 
+    _reject_foreign_preimported_rosa(SRC_ROOT)
+    rosa_sources = _python_source_contract(SRC_ROOT, label="ROSA source root")
     expected_checkpoint_sha256 = _validate_sha256(
         args.expected_checkpoint_sha256, "expected checkpoint SHA256"
     )
+    expected_daf_extension_sha256 = _validate_sha256(
+        args.expected_daf_extension_sha256,
+        "expected DAF extension SHA256",
+    )
+    if expected_daf_extension_sha256 != DEFAULT_DAF_EXTENSION_SHA256:
+        raise VerificationContractError(
+            "the exact C0/C32 protocol forbids overriding the blessed DAF binary"
+        )
     expected_revision = _validate_revision(args.expected_source_revision)
     expected_host_revision = _validate_revision(
         args.expected_detector_host_revision
@@ -425,8 +781,62 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
                 f"{variable} conflicts with --detector-host-root"
             )
         os.environ[variable] = str(detector_host_root)
+    _pin_import_roots(detector_host_root)
     _reject_foreign_preimported_host(detector_host_root)
     detector_host_sources = _host_source_contract(detector_host_root)
+    detector_host_daf_sources = _host_daf_source_contract(detector_host_root)
+    for relative, expected in BLESSED_DAF_BUILD_INPUT_SHA256.items():
+        observed = detector_host_daf_sources["files"].get(relative)
+        if observed != expected:
+            raise VerificationContractError(
+                f"DAF build input drift: {relative} has {observed}, expected {expected}"
+            )
+    wrapper_relative = (
+        "projects/mmdet3d_plugin/ops/deformable_aggregation.py"
+    )
+    if detector_host_daf_sources["files"].get(wrapper_relative) != (
+        BLESSED_DAF_WRAPPER_SHA256
+    ):
+        raise VerificationContractError("DAF Python wrapper drifted")
+    daf_binary = _daf_binary_file_contract(
+        detector_host_root,
+        expected_sha256=expected_daf_extension_sha256,
+    )
+    official_root = _resolve_directory(
+        args.official_root,
+        "official Fisheye3DOD root",
+    )
+    _resolve_file(
+        official_root / "dataset/fisheye3dod_metric.py",
+        "official Fisheye3DOD metric",
+    )
+    _resolve_file(
+        official_root / "utils/fisheye3dod_calib.py",
+        "official Fisheye3DOD calibration module",
+    )
+    _pin_official_import_roots(official_root)
+    existing_official = os.environ.get("FISHEYE3DOD_OFFICIAL_ROOT")
+    if existing_official is not None and Path(existing_official).expanduser().resolve() != (
+        official_root
+    ):
+        raise VerificationContractError(
+            "FISHEYE3DOD_OFFICIAL_ROOT conflicts with --official-root"
+        )
+    os.environ["FISHEYE3DOD_OFFICIAL_ROOT"] = str(official_root)
+    _reject_foreign_preimported_official(official_root)
+    official_sources = _python_source_contract(
+        official_root,
+        label="official Fisheye3DOD root",
+    )
+    official_git = _git_snapshot_at(official_root, require_clean=False)
+    if official_git["revision"] != EXPECTED_OFFICIAL_REVISION:
+        raise VerificationContractError(
+            "official Fisheye3DOD base revision differs from the pinned revision"
+        )
+    if official_sources["sha256"] != EXPECTED_OFFICIAL_SOURCE_SHA256:
+        raise VerificationContractError(
+            "patched official Fisheye3DOD Python source contract drifted"
+        )
     if (
         not isinstance(args.device, str)
         or re.fullmatch(r"cuda:[0-9]+", args.device) is None
@@ -539,10 +949,25 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
         "cuda_queried": False,
         "output_created": False,
         "repository": repository,
+        "rosa_source": {
+            "source_contract": rosa_sources,
+            "loaded_modules": "verified after armed custom imports",
+        },
         "detector_host": {
             "git": detector_host,
             "source_contract": detector_host_sources,
+            "daf_source_contract": detector_host_daf_sources,
+            "expected_daf_extension_sha256": expected_daf_extension_sha256,
+            "daf_binary_contract": daf_binary,
+            "loaded_daf_extension": "verified only after armed custom imports",
             "loaded_modules": "verified only after armed custom imports",
+        },
+        "official_fisheye3dod": {
+            "root": str(official_root),
+            "identity": "pinned locally patched official source",
+            "git": official_git,
+            "source_contract": official_sources,
+            "loaded_modules": "verified after armed dataset capture",
         },
         "frozen_config_files": frozen_configs,
         "parent_config": {
@@ -610,6 +1035,13 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
             "synchronization": "torch.cuda.synchronize immediately before and after call",
             "stream": "current stream must equal CUDA default stream",
             "precision": "uint8 CPU ingress; FP32 model math; autocast disabled",
+            "pinned_ingress": (
+                "captured and independently cloned full-detector images must "
+                "remain pinned"
+            ),
+            "daf_supported_cuda_capabilities": [
+                list(value) for value in DAF_SUPPORTED_CUDA_CAPABILITIES
+            ],
             "paired_bootstrap": {
                 "rng": "numpy.random.PCG64",
                 "seed": BOOTSTRAP_SEED,
@@ -635,6 +1067,7 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
         state_dict=state_dict,
         expected_manifest=expected_manifest,
         detector_host_root=detector_host_root,
+        official_root=official_root,
         plan=plan,
     )
 
@@ -683,6 +1116,31 @@ def _clone_batch(batch: Any) -> Any:
     return copy.deepcopy(batch)
 
 
+def _clone_pinned_cpu_ingress_batch(batch: Mapping[str, Any]) -> Any:
+    """Deep-copy a batch while retaining an independent pinned image.
+
+    ``Tensor.__deepcopy__`` allocates ordinary CPU storage, so blindly using
+    :func:`copy.deepcopy` silently removes the pinned-memory property that the
+    full-detector timing scope is meant to measure.  Skip that one tensor in
+    the generic deepcopy, then copy it into newly allocated pinned storage.
+    This preparation remains outside the timed region.
+    """
+
+    _validate_cpu_ingress(batch, require_pinned=True, label="source")
+    source_image = batch["inputs"]["img"]
+    cloned = copy.deepcopy(batch, memo={id(source_image): source_image})
+    cloned_image = torch.empty(
+        source_image.shape,
+        dtype=source_image.dtype,
+        device="cpu",
+        pin_memory=True,
+    )
+    cloned_image.copy_(source_image)
+    cloned["inputs"]["img"] = cloned_image
+    _validate_cpu_ingress(cloned, require_pinned=True, label="cloned")
+    return cloned
+
+
 def _reset_runtime_state(model: torch.nn.Module) -> None:
     bank = getattr(getattr(model, "head", None), "instance_bank", None)
     reset = getattr(bank, "reset", None)
@@ -699,7 +1157,6 @@ def _runtime_state_snapshot(model: torch.nn.Module) -> dict[str, Any]:
         "confidence",
         "temp_confidence",
         "instance_id",
-        "prev_id",
     }
     captured = {}
     for module_name, module in model.named_modules():
@@ -709,6 +1166,59 @@ def _runtime_state_snapshot(model: torch.nn.Module) -> dict[str, Any]:
             key = f"{module_name}.{name}" if module_name else name
             captured[key] = raw_fingerprint(value)
     return captured
+
+
+def _ephemeral_id_counter_contract(
+    model: torch.nn.Module,
+    *,
+    expected_invocations: int,
+) -> dict[str, Any]:
+    """Attest the expected non-temporal ID counter separately from caches."""
+
+    bank = getattr(getattr(model, "head", None), "instance_bank", None)
+    if bank is None or getattr(bank, "num_temp_instances", None) != 0:
+        raise VerificationContractError(
+            "ephemeral ID attestation requires a zero-temporal instance bank"
+        )
+    num_anchor = getattr(bank, "num_anchor", None)
+    if type(num_anchor) is not int or num_anchor <= 0:
+        raise VerificationContractError("instance bank has an invalid anchor count")
+    expected = expected_invocations * EXPECTED_BATCH_SIZE * num_anchor
+    value = getattr(bank, "prev_id", None)
+    if expected == 0:
+        if type(value) is not int or value != 0:
+            raise VerificationContractError(
+                "reset non-temporal ID counter must be exact integer zero"
+            )
+        observed = value
+        value_type = "int"
+        value_device = "cpu"
+    else:
+        if (
+            type(value) is not torch.Tensor
+            or value.numel() != 1
+            or value.dtype != torch.long
+        ):
+            raise VerificationContractError(
+                "advanced non-temporal ID counter must be one int64 tensor"
+            )
+        observed = int(value.detach().cpu().item())
+        value_type = "torch.Tensor"
+        value_device = str(value.device)
+    if observed != expected:
+        raise VerificationContractError(
+            f"non-temporal ID counter is {observed}, expected {expected}"
+        )
+    return {
+        "expected_invocations": expected_invocations,
+        "batch_size": EXPECTED_BATCH_SIZE,
+        "num_anchor": num_anchor,
+        "expected_value": expected,
+        "observed_value": observed,
+        "value_type": value_type,
+        "value_device": value_device,
+        "persistent_temporal_state": False,
+    }
 
 
 def _module_schema(model: torch.nn.Module) -> list[dict[str, str]]:
@@ -776,6 +1286,8 @@ def _normalize_module_schema(
 
 def _build_models(prepared: PreparedProtocol, device: torch.device):
     _reject_foreign_preimported_host(prepared.detector_host_root)
+    _reject_foreign_preimported_rosa(SRC_ROOT)
+    _reject_foreign_preimported_official(prepared.official_root)
     from mmengine.utils import import_modules_from_strings
     from mmdet3d.registry import MODELS
     from mmdet3d.utils import register_all_modules
@@ -787,6 +1299,28 @@ def _build_models(prepared: PreparedProtocol, device: torch.device):
     register_all_modules(init_default_scope=True)
     import_modules_from_strings(**prepared.parent_config.custom_imports)
     import_modules_from_strings(**prepared.candidate_config.custom_imports)
+    dataset_bridge = importlib.import_module(
+        "rosa.integrations.fisheye3dod.dataset"
+    )
+    metric_bridge = importlib.import_module(
+        "rosa.integrations.fisheye3dod.metric"
+    )
+    constants = importlib.import_module(
+        "rosa.integrations.fisheye3dod.constants"
+    )
+    configured_official = Path(
+        os.environ.get("FISHEYE3DOD_OFFICIAL_ROOT", "")
+    ).resolve()
+    if (
+        configured_official != prepared.official_root
+        or Path(dataset_bridge._official_root).resolve() != prepared.official_root
+        or Path(metric_bridge.OFFICIAL_ROOT).resolve() != prepared.official_root
+        or Path(constants.DEFAULT_OFFICIAL_REPO).resolve()
+        != prepared.official_root
+    ):
+        raise VerificationContractError(
+            "loaded Fisheye3DOD bridges do not use --official-root"
+        )
     loaded_host_modules = _loaded_host_module_contract(
         prepared.detector_host_root
     )
@@ -796,6 +1330,13 @@ def _build_models(prepared: PreparedProtocol, device: torch.device):
         raise VerificationContractError(
             "loaded detector-host module hashes differ from the pinned source"
         )
+    loaded_rosa_modules = _loaded_rosa_module_contract(SRC_ROOT)
+    loaded_daf_extension = _loaded_daf_extension_contract(
+        prepared.detector_host_root,
+        expected_sha256=prepared.plan["detector_host"][
+            "expected_daf_extension_sha256"
+        ],
+    )
     expected_classes = {
         PARENT_ARM: ROSANativeBaselineHead,
         CANDIDATE_ARM: ROSAOfficialResidualNativeBaselineHead,
@@ -836,7 +1377,14 @@ def _build_models(prepared: PreparedProtocol, device: torch.device):
         models[PARENT_ARM].state_dict(),
         models[CANDIDATE_ARM].state_dict(),
     )
-    return models, contracts, state_fingerprint, loaded_host_modules
+    return (
+        models,
+        contracts,
+        state_fingerprint,
+        loaded_host_modules,
+        loaded_rosa_modules,
+        loaded_daf_extension,
+    )
 
 
 def _build_dataloader(prepared: PreparedProtocol):
@@ -848,7 +1396,12 @@ def _build_dataloader(prepared: PreparedProtocol):
     return Runner.build_dataloader(config, seed=3407, diff_rank_seed=False)
 
 
-def _validate_cpu_ingress(batch: Mapping[str, Any]) -> None:
+def _validate_cpu_ingress(
+    batch: Mapping[str, Any],
+    *,
+    require_pinned: bool = False,
+    label: str = "captured",
+) -> None:
     if not isinstance(batch, Mapping) or not isinstance(batch.get("inputs"), Mapping):
         raise VerificationContractError("captured batch must contain inputs")
     image = batch["inputs"].get("img")
@@ -861,7 +1414,11 @@ def _validate_cpu_ingress(batch: Mapping[str, Any]) -> None:
         or not image.is_contiguous()
     ):
         raise VerificationContractError(
-            "captured image must be contiguous CPU uint8 [4,4,3,800,800]"
+            f"{label} image must be contiguous CPU uint8 [4,4,3,800,800]"
+        )
+    if require_pinned and not image.is_pinned():
+        raise VerificationContractError(
+            f"{label} image must use pinned CPU storage"
         )
 
 
@@ -877,7 +1434,7 @@ def _capture_batches(prepared: PreparedProtocol):
             raise VerificationContractError(
                 "Main126 dataloader ended before two batches were captured"
             ) from error
-        _validate_cpu_ingress(batch)
+        _validate_cpu_ingress(batch, require_pinned=True, label="captured")
         manifest = build_batch_manifest(
             batch,
             batch_index=batch_index,
@@ -936,7 +1493,7 @@ def _build_common_boundary(
         outputs = {}
         for arm in (PARENT_ARM, CANDIDATE_ARM):
             outputs[arm] = models[arm].data_preprocessor(
-                _clone_batch(source), training=False
+                _clone_pinned_cpu_ingress_batch(source), training=False
             )
         boundary = require_same_fingerprint(
             f"common preprocessor boundary batch {batch_index}",
@@ -1011,6 +1568,195 @@ def _validate_detection_output(output: Any) -> dict[str, Any]:
 
 
 @torch.inference_mode()
+def _attest_native_runtime_shortcuts(
+    models: Mapping[str, torch.nn.Module],
+    source_batch: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Count required shortcut hits in an untimed, fully restored preflight."""
+
+    host_detector = importlib.import_module(
+        "projects.mmdet3d_plugin.models.sparse4d"
+    )
+    instance_module = importlib.import_module(
+        "projects.mmdet3d_plugin.models.instance_bank"
+    )
+    decoder_module = importlib.import_module(
+        "projects.mmdet3d_plugin.models.detection3d.decoder"
+    )
+    rosa_sparse4d = importlib.import_module("rosa.integrations.sparse4d")
+    originals = {
+        "feature_maps_format": host_detector.feature_maps_format,
+        "fresh_id_predicate": instance_module._fresh_non_temporal_instance_id_shape,
+        "dense_decoder_predicate": decoder_module._can_batch_dense_legacy_decode,
+        "ocam_project_points": rosa_sparse4d.ocam_project_points,
+        "inplace_residual_predicate": (
+            rosa_sparse4d._can_use_inplace_official_residual
+        ),
+    }
+    records = {}
+    for arm in (PARENT_ARM, CANDIDATE_ARM):
+        counts = {
+            "feature_maps_format_calls": 0,
+            "int32_metadata_hits": 0,
+            "fresh_id_predicate_calls": 0,
+            "fresh_id_shortcut_hits": 0,
+            "dense_decoder_predicate_calls": 0,
+            "dense_decoder_shortcut_hits": 0,
+            "ocam_projection_calls": 0,
+            "exact_homogeneous_storage_reuse_hits": 0,
+            "inplace_residual_predicate_calls": 0,
+            "inplace_residual_hits": 0,
+        }
+
+        def feature_maps_format(*args, **kwargs):
+            result = originals["feature_maps_format"](*args, **kwargs)
+            counts["feature_maps_format_calls"] += 1
+            if (
+                isinstance(result, (list, tuple))
+                and len(result) == 3
+                and type(result[1]) is torch.Tensor
+                and type(result[2]) is torch.Tensor
+                and result[1].dtype == torch.int32
+                and result[2].dtype == torch.int32
+            ):
+                counts["int32_metadata_hits"] += 1
+            return result
+
+        def fresh_id_predicate(*args, **kwargs):
+            result = originals["fresh_id_predicate"](*args, **kwargs)
+            counts["fresh_id_predicate_calls"] += 1
+            if result is not None:
+                counts["fresh_id_shortcut_hits"] += 1
+            return result
+
+        def dense_decoder_predicate(*args, **kwargs):
+            result = originals["dense_decoder_predicate"](*args, **kwargs)
+            counts["dense_decoder_predicate_calls"] += 1
+            if result is True:
+                counts["dense_decoder_shortcut_hits"] += 1
+            return result
+
+        def ocam_project_points(*args, **kwargs):
+            counts["ocam_projection_calls"] += 1
+            if (
+                kwargs.get("contract") == "full_fov"
+                and kwargs.get("camera_transform") == "homogeneous_4x4"
+                and kwargs.get("inference_storage_reuse") is True
+            ):
+                counts["exact_homogeneous_storage_reuse_hits"] += 1
+            return originals["ocam_project_points"](*args, **kwargs)
+
+        def inplace_residual_predicate(*args, **kwargs):
+            result = originals["inplace_residual_predicate"](*args, **kwargs)
+            counts["inplace_residual_predicate_calls"] += 1
+            if result is True:
+                counts["inplace_residual_hits"] += 1
+            return result
+
+        _reset_runtime_state(models[arm])
+        persistent_before = _runtime_state_snapshot(models[arm])
+        source_before = raw_fingerprint(source_batch)
+        output_contracts = []
+        try:
+            host_detector.feature_maps_format = feature_maps_format
+            instance_module._fresh_non_temporal_instance_id_shape = (
+                fresh_id_predicate
+            )
+            decoder_module._can_batch_dense_legacy_decode = (
+                dense_decoder_predicate
+            )
+            rosa_sparse4d.ocam_project_points = ocam_project_points
+            rosa_sparse4d._can_use_inplace_official_residual = (
+                inplace_residual_predicate
+            )
+            for invocation in range(2):
+                output = models[arm].test_step(
+                    _clone_pinned_cpu_ingress_batch(source_batch)
+                )
+                output_contract = _validate_detection_output(output)
+                output_contract["invocation"] = invocation
+                output_contracts.append(output_contract)
+                del output
+        finally:
+            host_detector.feature_maps_format = originals["feature_maps_format"]
+            instance_module._fresh_non_temporal_instance_id_shape = originals[
+                "fresh_id_predicate"
+            ]
+            decoder_module._can_batch_dense_legacy_decode = originals[
+                "dense_decoder_predicate"
+            ]
+            rosa_sparse4d.ocam_project_points = originals["ocam_project_points"]
+            rosa_sparse4d._can_use_inplace_official_residual = originals[
+                "inplace_residual_predicate"
+            ]
+
+        if (
+            host_detector.feature_maps_format
+            is not originals["feature_maps_format"]
+            or instance_module._fresh_non_temporal_instance_id_shape
+            is not originals["fresh_id_predicate"]
+            or decoder_module._can_batch_dense_legacy_decode
+            is not originals["dense_decoder_predicate"]
+            or rosa_sparse4d.ocam_project_points
+            is not originals["ocam_project_points"]
+            or rosa_sparse4d._can_use_inplace_official_residual
+            is not originals["inplace_residual_predicate"]
+        ):
+            raise VerificationContractError(
+                "runtime shortcut instrumentation was not exactly restored"
+            )
+        expected_twice = (
+            "feature_maps_format_calls",
+            "int32_metadata_hits",
+            "fresh_id_predicate_calls",
+            "fresh_id_shortcut_hits",
+            "dense_decoder_predicate_calls",
+            "dense_decoder_shortcut_hits",
+        )
+        if any(counts[name] != 2 for name in expected_twice):
+            raise VerificationContractError(
+                f"{arm} did not hit every required native runtime shortcut: {counts}"
+            )
+        if (
+            counts["ocam_projection_calls"] != 12
+            or counts["exact_homogeneous_storage_reuse_hits"] != 12
+        ):
+            raise VerificationContractError(
+                f"{arm} did not execute twelve exact OCam reuse projections: {counts}"
+            )
+        expected_inplace_hits = 0 if arm == PARENT_ARM else 10
+        if (
+            counts["inplace_residual_predicate_calls"] != expected_inplace_hits
+            or counts["inplace_residual_hits"] != expected_inplace_hits
+        ):
+            raise VerificationContractError(
+                f"{arm} in-place residual receipt is invalid: {counts}"
+            )
+        if persistent_before != _runtime_state_snapshot(models[arm]):
+            raise VerificationContractError(
+                f"{arm} shortcut preflight mutated persistent temporal state"
+            )
+        id_counter = _ephemeral_id_counter_contract(
+            models[arm],
+            expected_invocations=2,
+        )
+        if source_before != raw_fingerprint(source_batch):
+            raise VerificationContractError(
+                f"{arm} shortcut preflight mutated the sealed source batch"
+            )
+        records[arm] = {
+            "counts": counts,
+            "ephemeral_id_counter": id_counter,
+            "outputs": output_contracts,
+        }
+    return {
+        "timed_code_instrumented": False,
+        "instrumentation_restored_before_timing": True,
+        "arms": records,
+    }
+
+
+@torch.inference_mode()
 def _preflight_outputs_and_state(
     models: Mapping[str, torch.nn.Module],
     cpu_batches: Sequence[Any],
@@ -1023,13 +1769,18 @@ def _preflight_outputs_and_state(
     )
     initial_rng = _capture_rng()
     records = {PARENT_ARM: [], CANDIDATE_ARM: []}
+    id_counter_before = {}
+    id_counter_after = {}
     for arm in (PARENT_ARM, CANDIDATE_ARM):
         model = models[arm]
         _reset_runtime_state(model)
         runtime_before = _runtime_state_snapshot(model)
+        id_counter_before[arm] = _ephemeral_id_counter_contract(
+            model, expected_invocations=0
+        )
         _restore_rng(initial_rng)
         for batch_index, batch in enumerate(cpu_batches):
-            output = model.test_step(_clone_batch(batch))
+            output = model.test_step(_clone_pinned_cpu_ingress_batch(batch))
             record = _validate_detection_output(output)
             record.update(
                 {"batch_index": batch_index, "scope": C0_C32_FULL_DETECTOR_SCOPE}
@@ -1052,6 +1803,10 @@ def _preflight_outputs_and_state(
             raise VerificationContractError(
                 f"{arm} inference unexpectedly mutated temporal runtime state"
             )
+        id_counter_after[arm] = _ephemeral_id_counter_contract(
+            model,
+            expected_invocations=len(cpu_batches) + len(common_batches),
+        )
         if raw_fingerprint(model.state_dict()) != frozen_state:
             raise VerificationContractError(
                 f"{arm} inference unexpectedly mutated model state"
@@ -1061,6 +1816,10 @@ def _preflight_outputs_and_state(
         "outputs_are_allowed_to_differ": True,
         "model_state_before": frozen_state,
         "initial_rng": raw_fingerprint(initial_rng),
+        "ephemeral_id_counter": {
+            "before": id_counter_before,
+            "after": id_counter_after,
+        },
         "arms": records,
     }
 
@@ -1146,7 +1905,7 @@ def _memory_probe(
     _reset_runtime_state(model)
     gc.collect()
     torch.cuda.empty_cache()
-    batch = _clone_batch(source_batch)
+    batch = _clone_pinned_cpu_ingress_batch(source_batch)
     torch.cuda.synchronize(device)
     allocated_before = torch.cuda.memory_allocated(device)
     reserved_before = torch.cuda.memory_reserved(device)
@@ -1215,7 +1974,10 @@ def _timed_segment(
     stream = _require_default_stream(device)
     for local_index, entry in enumerate(entries):
         source = sources[entry.batch_index]
-        batch = _clone_batch(source)
+        if scope == C0_C32_FULL_DETECTOR_SCOPE:
+            batch = _clone_pinned_cpu_ingress_batch(source)
+        else:
+            batch = _clone_batch(source)
         torch.cuda.synchronize(device)
         start_ns = time.perf_counter_ns()
         if scope == C0_C32_FULL_DETECTOR_SCOPE:
@@ -1277,9 +2039,11 @@ def _run_scope(
     round_state = []
     for round_index, pattern in enumerate(PHYSICAL_ROUND_ORDER):
         runtime_before = {}
+        arm_invocations = {PARENT_ARM: 0, CANDIDATE_ARM: 0}
         for arm, model in models.items():
             _reset_runtime_state(model)
             runtime_before[arm] = _runtime_state_snapshot(model)
+            _ephemeral_id_counter_contract(model, expected_invocations=0)
         for phase, schedule, destination in (
             ("warmup", warmup_schedule, warmup_records),
             ("measured", measured_schedule, measured_records),
@@ -1311,6 +2075,7 @@ def _run_scope(
                         sequence_offset=len(destination),
                     )
                 )
+                arm_invocations[expected_arm] += len(segment)
         runtime_after = {
             arm: _runtime_state_snapshot(model) for arm, model in models.items()
         }
@@ -1318,11 +2083,19 @@ def _run_scope(
             raise VerificationContractError(
                 f"{scope} unexpectedly mutated temporal runtime state"
             )
+        id_counters = {
+            arm: _ephemeral_id_counter_contract(
+                model,
+                expected_invocations=arm_invocations[arm],
+            )
+            for arm, model in models.items()
+        }
         round_state.append(
             {
                 "round_index": round_index,
                 "pattern": pattern,
                 "runtime_state_sha256": canonical_sha256(runtime_after),
+                "ephemeral_id_counter": id_counters,
             }
         )
     rng_after = _capture_rng()
@@ -1496,18 +2269,48 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
     repository = _git_snapshot(require_clean=True)
     if repository["revision"] != args.expected_source_revision:
         raise VerificationContractError("source revision changed after dry-run")
+    rosa_sources = _python_source_contract(SRC_ROOT, label="ROSA source root")
+    if rosa_sources != prepared.plan["rosa_source"]["source_contract"]:
+        raise VerificationContractError("ROSA source changed after dry-run")
     detector_host = _git_snapshot_at(
         prepared.detector_host_root,
         require_clean=True,
     )
     detector_host_sources = _host_source_contract(prepared.detector_host_root)
+    detector_host_daf_sources = _host_daf_source_contract(
+        prepared.detector_host_root
+    )
+    daf_binary = _daf_binary_file_contract(
+        prepared.detector_host_root,
+        expected_sha256=DEFAULT_DAF_EXTENSION_SHA256,
+    )
     if (
         detector_host != prepared.plan["detector_host"]["git"]
         or detector_host_sources
         != prepared.plan["detector_host"]["source_contract"]
+        or detector_host_daf_sources
+        != prepared.plan["detector_host"]["daf_source_contract"]
+        or daf_binary
+        != prepared.plan["detector_host"]["daf_binary_contract"]
     ):
         raise VerificationContractError(
-            "detector-host source changed after dry-run"
+            "detector-host source or DAF binary changed after dry-run"
+        )
+    official_sources = _python_source_contract(
+        prepared.official_root,
+        label="official Fisheye3DOD root",
+    )
+    official_git = _git_snapshot_at(
+        prepared.official_root,
+        require_clean=False,
+    )
+    if (
+        official_sources
+        != prepared.plan["official_fisheye3dod"]["source_contract"]
+        or official_git != prepared.plan["official_fisheye3dod"]["git"]
+    ):
+        raise VerificationContractError(
+            "official Fisheye3DOD source changed after dry-run"
         )
     output_dir = Path(prepared.plan["output_dir"])
     if output_dir.exists():
@@ -1541,6 +2344,11 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
             raise VerificationContractError("armed run requires CUDA")
         device = torch.device(args.device)
         torch.cuda.set_device(device)
+        capability = tuple(torch.cuda.get_device_capability(device))
+        if capability not in DAF_SUPPORTED_CUDA_CAPABILITIES:
+            raise VerificationContractError(
+                f"DAF extension does not contain code for CUDA capability {capability}"
+            )
         torch.use_deterministic_algorithms(True)
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
@@ -1552,15 +2360,39 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
             model_contracts,
             checkpoint_state,
             loaded_host_modules,
+            loaded_rosa_modules,
+            loaded_daf_extension,
         ) = _build_models(prepared, device)
         cpu_batches, manifests = _capture_batches(prepared)
+        loaded_official_modules = _loaded_official_module_contract(
+            prepared.official_root
+        )
         _atomic_json(output_dir / "SAMPLE_MANIFEST.json", manifests)
+        shortcut_preflight = _attest_native_runtime_shortcuts(
+            models,
+            cpu_batches[0],
+        )
+        _atomic_json(
+            output_dir / "NATIVE_SHORTCUT_PREFLIGHT.json",
+            shortcut_preflight,
+        )
         common_batches, boundary = _build_common_boundary(
             models, cpu_batches, manifests
         )
         _atomic_json(output_dir / "COMMON_BOUNDARY.json", boundary)
         preflight = _preflight_outputs_and_state(models, cpu_batches, common_batches)
         _atomic_json(output_dir / "OUTPUT_STATE_PREFLIGHT.json", preflight)
+        loaded_rosa_modules = _loaded_rosa_module_contract(SRC_ROOT)
+        loaded_official_modules = _loaded_official_module_contract(
+            prepared.official_root
+        )
+        _atomic_json(
+            output_dir / "SOURCE_MODULE_PREFLIGHT.json",
+            {
+                "rosa": loaded_rosa_modules,
+                "official_fisheye3dod": loaded_official_modules,
+            },
+        )
 
         snapshots.append(_nvidia_smi_snapshot(device_index))
         memory = _measure_memory(models, cpu_batches[0], device)
@@ -1597,6 +2429,15 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
         _atomic_json(output_dir / "MODEL_ONLY_STATISTICS.json", diagnostic)
         snapshots.append(_nvidia_smi_snapshot(device_index))
 
+        final_repository = _git_snapshot(require_clean=True)
+        final_frozen_configs = _frozen_config_contract()
+        if (
+            final_repository != repository
+            or final_frozen_configs != prepared.plan["frozen_config_files"]
+        ):
+            raise VerificationContractError(
+                "ROSA repository or frozen configs changed during timing"
+            )
         final_detector_host = _git_snapshot_at(
             prepared.detector_host_root,
             require_clean=True,
@@ -1604,14 +2445,53 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
         final_detector_sources = _host_source_contract(
             prepared.detector_host_root
         )
+        final_detector_daf_sources = _host_daf_source_contract(
+            prepared.detector_host_root
+        )
+        final_rosa_sources = _python_source_contract(
+            SRC_ROOT,
+            label="ROSA source root",
+        )
+        final_official_sources = _python_source_contract(
+            prepared.official_root,
+            label="official Fisheye3DOD root",
+        )
+        final_official_git = _git_snapshot_at(
+            prepared.official_root,
+            require_clean=False,
+        )
         if (
             final_detector_host != detector_host
             or final_detector_sources != detector_host_sources
+            or final_detector_daf_sources != detector_host_daf_sources
             or _loaded_host_module_contract(prepared.detector_host_root)
             != loaded_host_modules
+            or _loaded_daf_extension_contract(
+                prepared.detector_host_root,
+                expected_sha256=prepared.plan["detector_host"][
+                    "expected_daf_extension_sha256"
+                ],
+            )
+            != loaded_daf_extension
         ):
             raise VerificationContractError(
                 "detector-host source or imported module closure changed during timing"
+            )
+        if (
+            final_rosa_sources != rosa_sources
+            or _loaded_rosa_module_contract(SRC_ROOT) != loaded_rosa_modules
+        ):
+            raise VerificationContractError(
+                "ROSA source or imported module closure changed during timing"
+            )
+        if (
+            final_official_sources != official_sources
+            or final_official_git != official_git
+            or _loaded_official_module_contract(prepared.official_root)
+            != loaded_official_modules
+        ):
+            raise VerificationContractError(
+                "official Fisheye3DOD source or module closure changed during timing"
             )
 
         near_native = evaluate_c0_c32_near_native_gate(full["paired_bootstrap"], memory)
@@ -1629,11 +2509,23 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
             "schema": "rosa.c0_c32_near_native_runtime_evidence.v1",
             "status": "COMPLETE",
             "protocol": C0_C32_NEAR_NATIVE_PROTOCOL,
-            "repository": repository,
+            "repository": final_repository,
+            "rosa_source": {
+                "source_contract": final_rosa_sources,
+                "loaded_modules": loaded_rosa_modules,
+            },
             "detector_host": {
                 "git": final_detector_host,
                 "source_contract": final_detector_sources,
+                "daf_source_contract": final_detector_daf_sources,
+                "loaded_daf_extension": loaded_daf_extension,
                 "loaded_modules": loaded_host_modules,
+            },
+            "official_fisheye3dod": {
+                "identity": "pinned locally patched official source",
+                "git": final_official_git,
+                "source_contract": final_official_sources,
+                "loaded_modules": loaded_official_modules,
             },
             "plan_sha256": file_sha256(output_dir / "PLAN.json"),
             "checkpoint": prepared.plan["checkpoint"],
@@ -1644,8 +2536,11 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
             "output_contract": {
                 "finite_and_well_formed": True,
                 "values_allowed_to_differ": True,
-                "state_and_rng_mutation": False,
+                "persistent_temporal_and_model_state_mutation": False,
+                "rng_mutation": False,
+                "expected_ephemeral_id_counter_attested": True,
             },
+            "native_shortcut_preflight": shortcut_preflight,
             "measurement_contract": prepared.plan["measurement"],
             "scopes": {
                 C0_C32_FULL_DETECTOR_SCOPE: full,

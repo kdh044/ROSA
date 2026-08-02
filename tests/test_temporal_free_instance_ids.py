@@ -154,6 +154,114 @@ def test_fresh_non_temporal_ids_skip_confidence_and_scatter_graph():
     assert sum("arange" in name for name in candidate_log.names) == 1
 
 
+def test_fresh_non_temporal_ids_stay_specialized_after_first_batch():
+    confidence, anchor = _fixture()
+    reference = _bank()
+    candidate = _bank()
+    operation_log = []
+
+    class Operations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            operation_log.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    with torch.inference_mode():
+        _historical_get_instance_id(reference, confidence, anchor)
+        expected = _historical_get_instance_id(reference, confidence, anchor)
+        candidate.get_instance_id(confidence, anchor)
+    with torch.inference_mode(), Operations():
+        actual = candidate.get_instance_id(confidence, anchor)
+
+    _assert_value_equal(actual, expected)
+    _assert_bank_runtime_equal(candidate, reference)
+    assert torch.equal(
+        actual,
+        torch.arange(1200, 2400, dtype=torch.long).reshape(4, 300),
+    )
+    assert not any("max.dim" in name for name in operation_log)
+    assert not any("sigmoid" in name for name in operation_log)
+    assert not any("index_put" in name for name in operation_log)
+    assert sum("arange" in name for name in operation_log) == 1
+
+
+def test_plain_no_grad_fast_path_preserves_legacy_base_storage():
+    confidence, anchor = _fixture()
+    reference = _bank()
+    candidate = _bank()
+    operation_log = []
+
+    class Operations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            operation_log.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    with torch.no_grad():
+        _historical_get_instance_id(reference, confidence, anchor)
+        candidate.get_instance_id(confidence, anchor)
+        expected = _historical_get_instance_id(reference, confidence, anchor)
+    with torch.no_grad(), Operations():
+        actual = candidate.get_instance_id(confidence, anchor)
+
+    _assert_value_equal(actual, expected)
+    _assert_bank_runtime_equal(candidate, reference)
+    assert expected._base is None
+    assert actual._base is None
+    assert expected._version == actual._version == 1
+    assert not any("max.dim" in name for name in operation_log)
+    assert not any("sigmoid" in name for name in operation_log)
+    assert not any("index_put" in name for name in operation_log)
+
+
+@pytest.mark.parametrize(
+    "case",
+    ("shape", "dtype", "requires_grad", "meta", "named"),
+)
+def test_repeated_fast_id_rejects_malformed_tensor_counter(case):
+    confidence, anchor = _fixture()
+    bank = _bank()
+    if case == "shape":
+        bank.prev_id = torch.tensor([1200], dtype=torch.long)
+    elif case == "dtype":
+        bank.prev_id = torch.tensor(1200, dtype=torch.int32)
+    elif case == "requires_grad":
+        bank.prev_id = torch.tensor(1200.0, requires_grad=True)
+    elif case == "meta":
+        bank.prev_id = torch.tensor(1200, device="meta", dtype=torch.long)
+    elif case == "named":
+        bank.prev_id = torch.tensor([1200], dtype=torch.long).refine_names("id")
+
+    with torch.inference_mode():
+        assert (
+            _fresh_non_temporal_instance_id_shape(
+                bank,
+                confidence,
+                anchor,
+                None,
+            )
+            is None
+        )
+
+
+def test_repeated_fast_id_does_not_advance_counter_when_output_copy_fails():
+    confidence, anchor = _fixture()
+    bank = _bank()
+    with torch.inference_mode():
+        bank.get_instance_id(confidence, anchor)
+    before = bank.prev_id.clone()
+
+    class FailOutputCopy(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if "aten.copy_.default" in str(func):
+                raise RuntimeError("injected output copy failure")
+            return func(*args, **(kwargs or {}))
+
+    with pytest.raises(RuntimeError, match="injected output copy failure"):
+        with torch.inference_mode(), FailOutputCopy():
+            bank.get_instance_id(confidence, anchor)
+
+    assert torch.equal(bank.prev_id, before)
+
+
 @pytest.mark.parametrize(
     "case",
     (
