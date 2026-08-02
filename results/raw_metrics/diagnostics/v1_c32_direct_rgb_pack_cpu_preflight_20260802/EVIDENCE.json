@@ -1,0 +1,78 @@
+{
+  "schema": "rosa.c32_direct_rgb_pack.cpu_preflight.v1",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "parent_commit": "8cb2ddd0dfea6ea991142cf10e220783035c3cf7",
+  "candidate_commit": "89a1ad18d7e5ec9209f8eda06390fffde7887009",
+  "change": "stack released HWC camera views directly into the final contiguous RGB-CHW uint8 output",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "gpu_execution": false,
+  "gpu_speed_claim": false,
+  "exactness": {
+    "synthetic_seeds": [3407, 7101080],
+    "synthetic_shapes": [[4, 32, 64, 3], [4, 33, 35, 3]],
+    "ingress_representations": ["ndarray", "released list"],
+    "packed_tensor_raw_bit_equal_after_channel_mapping": true,
+    "normalized_model_input_raw_bit_equal": true,
+    "caller_input_unchanged": true,
+    "direct_stack_output_required_by_test": true,
+    "real_main126_validation_indices": [0, 1953, 3905],
+    "real_packed_rgb_sha256": {
+      "0": "b329005d4cdebba5ed7eaef42f28e79d7853cc54ae2b9ed6063376f56a8ee4e8",
+      "1953": "eb250aee840c44e4240209f793245b627e6992716fdee059c13c83d25c2a8120",
+      "3905": "3f2de5701a4a1cc23a7dff4f8a041d51e6dbc181dff1889f8a19f6065469a9ec"
+    },
+    "real_normalized_input_sha256": {
+      "0": "835b2c517ed62ad7165e5fbd9517d9f5162b3c0fa20b7076aaff6489eab338d3",
+      "1953": "82bbe42fe53e82f9cb2d849c428ce425e88cac75cb9f718bc928df5ae4fe984c",
+      "3905": "8e672a60ff041d4216196941b21fcf1be78a824024ec17eeec1f2a7e817d6682"
+    }
+  },
+  "payload_inventory": {
+    "camera_count": 4,
+    "height": 800,
+    "width": 800,
+    "channels": 3,
+    "packed_output_bytes_per_sample": 7680000,
+    "parent_extra_hwc_stack_bytes_per_sample": 7680000,
+    "candidate_extra_hwc_stack_bytes_per_sample": 0,
+    "removed_payload_bytes_per_sample": 7680000,
+    "measurement_kind": "arithmetic payload inventory, not process peak"
+  },
+  "cpu_component_observation": {
+    "scope": "released list packing only; no loader I/O, H2D, CUDA, model, or end-to-end claim",
+    "warmup_per_arm": 60,
+    "physical_round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
+    "measured_per_arm_per_round": 300,
+    "rounds": [
+      {"round": 1, "order": "PC", "parent_median_ms": 2.233291, "candidate_median_ms": 1.8911865, "median_ratio": 0.8468159769595632, "parent_p95_ms": 46.1313378, "candidate_p95_ms": 2.2958032, "p95_ratio": 0.04976667292748661},
+      {"round": 2, "order": "CP", "parent_median_ms": 2.190893, "candidate_median_ms": 1.838518, "median_ratio": 0.8391637565138964, "parent_p95_ms": 2.5657821, "candidate_p95_ms": 2.10526775, "p95_ratio": 0.8205169682959438},
+      {"round": 3, "order": "PC", "parent_median_ms": 2.187458, "candidate_median_ms": 1.8269015, "median_ratio": 0.8351710067119003, "parent_p95_ms": 2.50032565, "candidate_p95_ms": 1.92176825, "p95_ratio": 0.7686071812285731},
+      {"round": 4, "order": "CP", "parent_median_ms": 2.207148, "candidate_median_ms": 1.857231, "median_ratio": 0.8414619228071701, "parent_p95_ms": 2.5780552, "candidate_p95_ms": 1.914168, "p95_ratio": 0.7424852656374463},
+      {"round": 5, "order": "PC", "parent_median_ms": 2.1571325, "candidate_median_ms": 1.8343925, "median_ratio": 0.8503847121120284, "parent_p95_ms": 2.55126875, "candidate_p95_ms": 1.8871389, "p95_ratio": 0.7396864403250344},
+      {"round": 6, "order": "CP", "parent_median_ms": 2.1486805, "candidate_median_ms": 1.8218535, "median_ratio": 0.8478940912806721, "parent_p95_ms": 2.45546255, "candidate_p95_ms": 1.85405885, "p95_ratio": 0.7550751893976146}
+    ],
+    "median_of_round_median_ratios": 0.8441389498833667,
+    "median_of_round_p95_ratios": 0.7487802275175305,
+    "worst_round_p95_ratio": 0.8205169682959438,
+    "interpretation": "component-only CPU improvement; detector and CUDA gates remain pending"
+  },
+  "tests": {
+    "focused": "27 passed, 68 warnings in 3.21s",
+    "full_cpu_suite": "248 passed, 5 skipped, 68 warnings in 16.28s",
+    "format": "black check passed",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/integrations/fisheye3dod/runtime_transforms.py": "845220896206ed566c386abac92177a99cb78066c3dcea1ea04ec460d3a078af",
+    "tests/test_rgb_uint8_fused_pack.py": "580aff1275a6fe58eb4de336e708ac5e4e7c7027864c9ed167e7fb5471262e99"
+  },
+  "pending_gates": [
+    "joint packer plus bgr_to_rgb=false representation seal",
+    "real CUDA common-boundary semantic equality",
+    "representation-aware loader/collate/H2D latency and peak-memory gate",
+    "full detector test_step latency and peak-memory non-regression"
+  ]
+}
