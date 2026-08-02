@@ -1,0 +1,57 @@
+{
+  "bytes_removed": 9484816,
+  "camera_conditioned_points": false,
+  "camera_transform": "homogeneous_4x4",
+  "candidate": {
+    "captured_output_storage_bytes_including_inputs": 14853832,
+    "captured_storages_including_inputs": 55,
+    "excluded_input_alias_bytes": 2368,
+    "excluded_input_alias_storages": 4,
+    "output_stride": [
+      31200,
+      7800,
+      26,
+      2,
+      1
+    ],
+    "owned_output_storage_bytes": 14851464,
+    "storages": 51
+  },
+  "contract": "full_fov",
+  "device": "cpu",
+  "dtype": "torch.float32",
+  "fraction_removed": 0.3897397630204781,
+  "not_measured": [
+    "peak allocator memory",
+    "RSS",
+    "CUDA",
+    "latency"
+  ],
+  "parent": {
+    "captured_output_storage_bytes_including_inputs": 24338648,
+    "captured_storages_including_inputs": 99,
+    "excluded_input_alias_bytes": 2368,
+    "excluded_input_alias_storages": 4,
+    "output_stride": [
+      31200,
+      7800,
+      26,
+      2,
+      1
+    ],
+    "owned_output_storage_bytes": 24336280,
+    "storages": 95
+  },
+  "raw_bit_equal": true,
+  "schema": "rosa.c32.exact_homogeneous.storage_probe.v1",
+  "scope": "cumulative distinct operator-output storage while every emitted tensor is retained; excludes pre-existing input storage aliases",
+  "seed": 3407,
+  "shape": {
+    "anchors": 300,
+    "batch": 4,
+    "cameras": 4,
+    "keypoints": 13
+  },
+  "storages_removed": 44,
+  "stride_equal": true
+}

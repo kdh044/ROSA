@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import importlib.util
+from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -32,6 +34,33 @@ def _config(profile: str | None) -> Config:
         }
     )
     return Config({"model": {"head": head}})
+
+
+def _native_deploy_config(
+    *,
+    head_type: str = "ROSAOfficialResidualNativeBaselineHead",
+    deformable_type: str = (
+        "ROSAInferenceReuseExactHomogeneous4x4FullFOV"
+        "DeformableFeatureAggregation"
+    ),
+) -> Config:
+    return Config(
+        {
+            "model": {
+                "head": {
+                    "type": head_type,
+                    "deformable_model": {
+                        "type": deformable_type,
+                        "projection_type": "ocam_fisheye",
+                        "kps_generator": {
+                            "type": "ROSANormalizedKeyPointsGenerator",
+                            "anchor_z_is_bottom": False,
+                        },
+                    },
+                }
+            }
+        }
+    )
 
 
 def _save_checkpoint(
@@ -180,6 +209,68 @@ def test_checkpoint_contract_override_warns(tmp_path: Path):
         )
 
 
+def test_deploy_contract_rejects_incomplete_forged_payload(tmp_path: Path):
+    checkpoint = tmp_path / "forged_deploy.pth"
+    torch.save(
+        {
+            "state_dict": {"head.decoder.weight": torch.ones(1)},
+            "meta": {
+                "deploy_contract": run_tool._OBJECT_DEPTH_DEPLOY_CONTRACT,
+                "native_deploy_behavior": run_tool._C73_DEPLOY_BEHAVIOR,
+            },
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="metadata key set changed"):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _native_deploy_config(),
+            allow_mismatch=False,
+        )
+
+
+def test_checkpoint_contract_rejects_unknown_deploy_behavior(tmp_path: Path):
+    checkpoint = tmp_path / "unknown_deploy.pth"
+    torch.save(
+        {
+            "state_dict": {"head.decoder.weight": torch.ones(1)},
+            "meta": {
+                "deploy_contract": run_tool._OBJECT_DEPTH_DEPLOY_CONTRACT,
+                "native_deploy_behavior": "unknown.behavior",
+            },
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="native_deploy_behavior"):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _native_deploy_config(),
+            allow_mismatch=False,
+        )
+
+
+def test_checkpoint_contract_rejects_behavior_without_deploy_contract(
+    tmp_path: Path,
+):
+    checkpoint = tmp_path / "missing_contract.pth"
+    torch.save(
+        {
+            "state_dict": {"head.decoder.weight": torch.ones(1)},
+            "meta": {"native_deploy_behavior": run_tool._C73_DEPLOY_BEHAVIOR},
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(ValueError, match="missing its deploy contract"):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            _native_deploy_config(),
+            allow_mismatch=False,
+        )
+
+
 def test_checkpoint_hook_records_effective_contract():
     metadata = run_tool._checkpoint_contract_metadata(_config("fast"))
     assert metadata is not None
@@ -280,3 +371,343 @@ def test_evaluate_enables_trusted_mmengine_checkpoint_load(
         ("load", None),
         ("test", None),
     ]
+
+
+def _object_depth_source_state() -> OrderedDict:
+    state = OrderedDict(
+        (f"native.layer_{index}", torch.tensor([float(index)]))
+        for index in range(run_tool._OBJECT_DEPTH_DEPLOY_STATE_KEYS)
+    )
+    for level in range(3):
+        state[f"depth_branch.depth_layers.{level}.weight"] = torch.ones(
+            1, 256, 1, 1
+        )
+        state[f"depth_branch.depth_layers.{level}.bias"] = torch.ones(1)
+    state._metadata = OrderedDict(
+        [
+            ("", {"version": 1}),
+            ("native", {"version": 1}),
+            ("depth_branch", {"version": 1}),
+            ("depth_branch.depth_layers", {"version": 1}),
+            ("depth_branch.depth_layers.0", {"version": 1}),
+            ("depth_branch.depth_layers.1", {"version": 1}),
+            ("depth_branch.depth_layers.2", {"version": 1}),
+        ]
+    )
+    return state
+
+
+def _allow_synthetic_object_depth_state(
+    monkeypatch: pytest.MonkeyPatch,
+    state: OrderedDict,
+) -> None:
+    depth_keys = set(run_tool._OBJECT_DEPTH_TRAIN_ONLY_KEYS)
+    deploy_state = OrderedDict(
+        (key, value) for key, value in state.items() if key not in depth_keys
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_DEPLOY_STATE_ELEMENTS",
+        sum(tensor.numel() for tensor in deploy_state.values()),
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_SOURCE_STRUCTURE_SHA256",
+        run_tool._state_structure_sha256(state),
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_DEPLOY_STRUCTURE_SHA256",
+        run_tool._state_structure_sha256(deploy_state),
+    )
+    source_metadata = state._metadata
+    depth_metadata_keys = set(run_tool._OBJECT_DEPTH_TRAIN_ONLY_METADATA_KEYS)
+    deploy_metadata = OrderedDict(
+        (key, value)
+        for key, value in source_metadata.items()
+        if key not in depth_metadata_keys
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_SOURCE_METADATA_KEYS",
+        len(source_metadata),
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_DEPLOY_METADATA_KEYS",
+        len(deploy_metadata),
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_SOURCE_METADATA_SHA256",
+        run_tool._state_metadata_sha256(source_metadata),
+    )
+    monkeypatch.setattr(
+        run_tool,
+        "_OBJECT_DEPTH_DEPLOY_METADATA_SHA256",
+        run_tool._state_metadata_sha256(deploy_metadata),
+    )
+
+
+def _approve_synthetic_source(
+    monkeypatch: pytest.MonkeyPatch,
+    source: Path,
+) -> None:
+    monkeypatch.setattr(
+        run_tool,
+        "_C73_APPROVED_SOURCE_SHA256",
+        frozenset({run_tool._sha256_file(source)}),
+    )
+
+
+def test_export_deploy_strips_only_train_depth_and_training_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "epoch_8.pth"
+    output = tmp_path / "deploy.pth"
+    state = _object_depth_source_state()
+    _allow_synthetic_object_depth_state(monkeypatch, state)
+    torch.save(
+        {
+            "meta": {"epoch": 8},
+            "state_dict": state,
+            "optimizer": {"large_train_only": torch.ones(4096)},
+            "param_schedulers": [{"last_epoch": 8}],
+        },
+        source,
+    )
+    _approve_synthetic_source(monkeypatch, source)
+    result = run_tool.export_deploy(
+        SimpleNamespace(checkpoint=source, output=output)
+    )
+
+    exported = torch.load(output, map_location="cpu", weights_only=True)
+    assert set(exported) == {"meta", "state_dict"}
+    assert list(exported["state_dict"]) == [
+        f"native.layer_{index}"
+        for index in range(run_tool._OBJECT_DEPTH_DEPLOY_STATE_KEYS)
+    ]
+    assert exported["meta"]["stripped_state_keys"] == list(
+        run_tool._OBJECT_DEPTH_TRAIN_ONLY_KEYS
+    )
+    assert exported["meta"]["stripped_elements"] == 771
+    assert exported["meta"]["native_deploy_behavior"] == (
+        run_tool._C73_DEPLOY_BEHAVIOR
+    )
+    assert exported["meta"]["native_deploy_target_head_type"] == (
+        "ROSAOfficialResidualNativeBaselineHead"
+    )
+    assert exported["meta"]["optimizer_state_included"] is False
+    assert exported["meta"]["scheduler_state_included"] is False
+    assert result["state_keys"] == run_tool._OBJECT_DEPTH_DEPLOY_STATE_KEYS
+    assert result["output_sha256"] == run_tool._sha256_file(output)
+    assert source.exists()
+    run_tool._validate_checkpoint_contract(
+        output,
+        _native_deploy_config(),
+        allow_mismatch=False,
+    )
+    with pytest.raises(ValueError, match="requires head"):
+        run_tool._validate_checkpoint_contract(
+            output,
+            _native_deploy_config(head_type="ROSANativeBaselineHead"),
+            allow_mismatch=False,
+        )
+    with pytest.raises(ValueError, match="exact homogeneous"):
+        run_tool._validate_checkpoint_contract(
+            output,
+            _native_deploy_config(
+                deformable_type=(
+                    "ROSAMetricGatedAffine3x3FullFOV"
+                    "DeformableFeatureAggregation"
+                )
+            ),
+            allow_mismatch=False,
+        )
+
+
+def test_deploy_validator_rejects_removed_behavior_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "epoch_8.pth"
+    output = tmp_path / "deploy.pth"
+    tampered = tmp_path / "tampered.pth"
+    state = _object_depth_source_state()
+    _allow_synthetic_object_depth_state(monkeypatch, state)
+    torch.save({"state_dict": state}, source)
+    _approve_synthetic_source(monkeypatch, source)
+    run_tool.export_deploy(SimpleNamespace(checkpoint=source, output=output))
+    payload = torch.load(output, map_location="cpu", weights_only=True)
+    payload["meta"].pop("native_deploy_behavior")
+    torch.save(payload, tampered)
+
+    with pytest.raises(ValueError, match="metadata key set changed"):
+        run_tool._validate_checkpoint_contract(
+            tampered,
+            _native_deploy_config(),
+            allow_mismatch=False,
+        )
+
+
+def test_export_deploy_fails_closed_on_changed_depth_topology(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "changed.pth"
+    state = _object_depth_source_state()
+    state["depth_branch.depth_layers.2.weight"] = torch.ones(1, 255, 1, 1)
+    _allow_synthetic_object_depth_state(monkeypatch, state)
+    torch.save({"state_dict": state}, source)
+    _approve_synthetic_source(monkeypatch, source)
+
+    with pytest.raises(ValueError, match="shape changed"):
+        run_tool.export_deploy(
+            SimpleNamespace(
+                checkpoint=source,
+                output=tmp_path / "must_not_exist.pth",
+            )
+        )
+    assert not (tmp_path / "must_not_exist.pth").exists()
+
+
+def test_export_deploy_rejects_retained_state_structure_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "mutated_native.pth"
+    expected_state = _object_depth_source_state()
+    _allow_synthetic_object_depth_state(monkeypatch, expected_state)
+    mutated_state = expected_state.copy()
+    mutated_state._metadata = expected_state._metadata.copy()
+    mutated_state["native.renamed_layer"] = mutated_state.pop("native.layer_0")
+    torch.save({"state_dict": mutated_state}, source)
+    _approve_synthetic_source(monkeypatch, source)
+
+    with pytest.raises(ValueError, match="source state structure changed"):
+        run_tool.export_deploy(
+            SimpleNamespace(
+                checkpoint=source,
+                output=tmp_path / "must_not_exist.pth",
+            )
+        )
+    assert not (tmp_path / "must_not_exist.pth").exists()
+
+
+def test_export_deploy_rejects_module_metadata_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "mutated_metadata.pth"
+    expected_state = _object_depth_source_state()
+    _allow_synthetic_object_depth_state(monkeypatch, expected_state)
+    mutated_state = expected_state.copy()
+    mutated_state._metadata = OrderedDict(
+        (key, dict(value)) for key, value in expected_state._metadata.items()
+    )
+    mutated_state._metadata["native"]["version"] = 999
+    torch.save({"state_dict": mutated_state}, source)
+    _approve_synthetic_source(monkeypatch, source)
+
+    with pytest.raises(ValueError, match="source metadata changed"):
+        run_tool.export_deploy(
+            SimpleNamespace(
+                checkpoint=source,
+                output=tmp_path / "must_not_exist.pth",
+            )
+        )
+    assert not (tmp_path / "must_not_exist.pth").exists()
+
+
+def test_export_deploy_rejects_unapproved_same_schema_checkpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "same_schema_but_unapproved.pth"
+    state = _object_depth_source_state()
+    _allow_synthetic_object_depth_state(monkeypatch, state)
+    torch.save({"state_dict": state}, source)
+
+    with pytest.raises(ValueError, match="not an approved C73"):
+        run_tool.export_deploy(
+            SimpleNamespace(
+                checkpoint=source,
+                output=tmp_path / "must_not_exist.pth",
+            )
+        )
+    assert not (tmp_path / "must_not_exist.pth").exists()
+
+
+def test_export_deploy_never_overwrites_existing_output(tmp_path: Path):
+    source = tmp_path / "source.pth"
+    output = tmp_path / "existing.pth"
+    torch.save({"state_dict": _object_depth_source_state()}, source)
+    output.write_bytes(b"keep-me")
+
+    with pytest.raises(FileExistsError):
+        run_tool.export_deploy(
+            SimpleNamespace(checkpoint=source, output=output)
+        )
+    assert output.read_bytes() == b"keep-me"
+
+
+def test_approved_source_is_deserialized_from_its_hashed_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "source.pth"
+    approved_bytes = b"approved checkpoint snapshot"
+    changed_bytes = b"path changed after snapshot"
+    source.write_bytes(approved_bytes)
+    approved_sha256 = hashlib.sha256(approved_bytes).hexdigest()
+    monkeypatch.setattr(
+        run_tool,
+        "_C73_APPROVED_SOURCE_SHA256",
+        frozenset({approved_sha256}),
+    )
+
+    def load_snapshot(snapshot):
+        source.write_bytes(changed_bytes)
+        assert snapshot.read() == approved_bytes
+        return {"state_dict": "captured"}
+
+    monkeypatch.setattr(
+        run_tool,
+        "_load_checkpoint_without_executing_code",
+        load_snapshot,
+    )
+
+    checkpoint, observed_sha256, byte_count = (
+        run_tool._load_approved_c73_checkpoint(source)
+    )
+
+    assert checkpoint == {"state_dict": "captured"}
+    assert observed_sha256 == approved_sha256
+    assert byte_count == len(approved_bytes)
+    assert source.read_bytes() == changed_bytes
+
+
+def test_unapproved_source_is_rejected_before_deserialization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    source = tmp_path / "source.pth"
+    source.write_bytes(b"unapproved checkpoint")
+    monkeypatch.setattr(
+        run_tool,
+        "_C73_APPROVED_SOURCE_SHA256",
+        frozenset({hashlib.sha256(b"approved").hexdigest()}),
+    )
+
+    def must_not_deserialize(_snapshot):
+        raise AssertionError("unapproved bytes reached deserialization")
+
+    monkeypatch.setattr(
+        run_tool,
+        "_load_checkpoint_without_executing_code",
+        must_not_deserialize,
+    )
+
+    with pytest.raises(ValueError, match="not an approved C73"):
+        run_tool._load_approved_c73_checkpoint(source)

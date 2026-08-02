@@ -18,6 +18,10 @@
   "registered_module_dtypes": ["float16", "float32", "float64"],
   "inherited_bfloat16_and_adversarial_exactness": true,
   "homogeneous_component_storage_probe": {
+    "scope": "cumulative distinct retained operator-output storage excluding input aliases",
+    "shape": {"batch": 4, "cameras": 4, "anchors": 300, "keypoints": 13},
+    "dtype": "torch.float32",
+    "seed": 3407,
     "parent_bytes": 24336280,
     "candidate_bytes": 14851464,
     "bytes_removed": 9484816,
@@ -26,16 +30,12 @@
     "candidate_distinct_storages": 51,
     "distinct_storages_removed": 44,
     "raw_bit_equal": true,
-    "stride_equal": true
-  },
-  "homogeneous_component_shared_host_cpu_probe": {
-    "rounds": 6,
-    "candidate_over_parent_median_latency_ratio_median": 0.9202797100108779,
-    "candidate_over_parent_p95_latency_ratio_median": 0.770505541505855,
-    "candidate_over_parent_p95_latency_ratio_worst": 0.9541626207741944,
-    "scope": "projection component only",
-    "cuda_claim": false,
-    "whole_model_claim": false
+    "stride_equal": true,
+    "peak_allocator_memory_claim": false,
+    "rss_claim": false,
+    "latency_claim": false,
+    "reproducer": "PROBE.py",
+    "raw_receipt": "RAW.json"
   },
   "model_identity": {
     "state_keys": 595,
@@ -52,12 +52,15 @@
   "source_sha256": {
     "src/rosa/integrations/sparse4d.py": "fe8f744a2a258208626773f465f142141fed272f35afa4e98b09acece609b231",
     "tests/test_ocam_inference_storage_reuse.py": "48000e1021bc1c999c65e36879f3e1b533c56df2e04f6e7e84a4cad984af94f5",
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_homogeneous4x4_inference_reuse_exact.py": "8a04026749427884160d25e11ece4b20eaf9b79e4d4f01293d6377fc763d06a8"
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_homogeneous4x4_inference_reuse_exact.py": "8a04026749427884160d25e11ece4b20eaf9b79e4d4f01293d6377fc763d06a8",
+    "PROBE.py": "0e948d293a2fb13427a1d9f7e01d4c9ee9e8ee643dd029b90094aa4ab5866f4a",
+    "RAW.json": "deafc834ed25f8477fd85d17bc8999693e5e0f86d8361897361513c199a2b940"
   },
   "gpu_execution": false,
   "official_metric_execution": false,
-  "component_cpu_speed_claim": true,
+  "component_cpu_speed_claim": false,
   "whole_model_speed_claim": false,
+  "withdrawn_unsealed_observation": "prior shared-host component timing aggregates lacked raw samples and a complete sealed protocol",
   "pending": [
     "independent CPU source and evidence audit",
     "CUDA projection and D0-D5 raw-bit equality",
