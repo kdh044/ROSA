@@ -1,0 +1,86 @@
+{
+  "schema": "rosa.c32_affine3x3_ocam.metric_gate_cpu_preflight.v1",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "parent_commit": "8cb2ddd0dfea6ea991142cf10e220783035c3cf7",
+  "candidate_commit": "fe034b009448eec07c45cfe46e7e7afe4bcfcc70",
+  "default_strict_path_unchanged": true,
+  "candidate_training_fails_closed": true,
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "gpu_execution": false,
+  "gpu_context_or_allocation": false,
+  "failed_device_count_probe_observed_from_cpu_profiler": true,
+  "model_state_contract": {
+    "parameters": 29667109,
+    "buffers": 10097,
+    "state_entries": 595,
+    "all_state_values_raw_bit_equal": true,
+    "post_build_rng_raw_bit_equal": true,
+    "parent_strict_deformable_layers": 6,
+    "candidate_affine_deformable_layers": 6
+  },
+  "cpu_projection_observation": {
+    "scope": "one full CPU OCam projection component; no CUDA, detector, end-to-end, or metric claim",
+    "shape": [4, 4, 300, 13],
+    "camera_points": 62400,
+    "validity_mask_mismatches": 0,
+    "common_valid_coordinates": 61868,
+    "complete_raw_bit_equal": false,
+    "differing_float_elements": 140,
+    "max_common_valid_abs_difference": 1.1920928955078125e-7,
+    "torch_threads": 1,
+    "warmup_per_arm": 60,
+    "physical_round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
+    "measured_per_arm_per_round": 300,
+    "rounds": [
+      {"round": 0, "order": "PC", "parent_median_ms": 4.0196425, "candidate_median_ms": 1.5611655, "candidate_over_parent_median_ratio": 0.3883841660048126, "parent_p95_ms": 4.19832945, "candidate_p95_ms": 1.5709970500000001},
+      {"round": 1, "order": "CP", "parent_median_ms": 4.024059, "candidate_median_ms": 1.5612355, "candidate_over_parent_median_ratio": 0.387975300560951, "parent_p95_ms": 4.190187, "candidate_p95_ms": 1.57320765},
+      {"round": 2, "order": "PC", "parent_median_ms": 4.0222809999999996, "candidate_median_ms": 1.559999, "candidate_over_parent_median_ratio": 0.3878393876509374, "parent_p95_ms": 4.1517257, "candidate_p95_ms": 1.57516505},
+      {"round": 3, "order": "CP", "parent_median_ms": 4.0223115, "candidate_median_ms": 1.5591425, "candidate_over_parent_median_ratio": 0.3876235095168537, "parent_p95_ms": 4.1433945, "candidate_p95_ms": 1.571528},
+      {"round": 4, "order": "PC", "parent_median_ms": 4.022832, "candidate_median_ms": 1.5594074999999998, "candidate_over_parent_median_ratio": 0.38763923027359826, "parent_p95_ms": 4.192255149999999, "candidate_p95_ms": 1.57093105},
+      {"round": 5, "order": "CP", "parent_median_ms": 4.035126, "candidate_median_ms": 1.5603345, "candidate_over_parent_median_ratio": 0.38668792498672905, "parent_p95_ms": 4.19786415, "candidate_p95_ms": 1.573126}
+    ],
+    "median_of_round_median_ratios": 0.3877393089622678,
+    "parent_positive_self_cpu_allocation_bytes": 21840260,
+    "candidate_positive_self_cpu_allocation_bytes": 16349636,
+    "allocation_reduction_bytes": 5490624,
+    "interpretation": "large isolated CPU component opportunity; official metrics and CUDA end-to-end behavior remain unproven"
+  },
+  "checkpoint_and_reference": {
+    "checkpoint": "/home/airlab/user/kdh/ROSA/results/raw_metrics/experiments/v2_c32_exacte94_fresh_e0_to_e20_seed3407_commitf3bc698/epoch_20.pth",
+    "checkpoint_sha256": "cb5b0956ab8357d64bbcde919d8aa10aa772d03c73252c137709529e6299e85d",
+    "checkpoint_size_bytes": 405205910,
+    "strict_official_metrics": "/home/airlab/user/kdh/ROSA/results/raw_metrics/diagnostics/v2_c32_exacte94_fresh_epoch20_selection/official_metrics.json",
+    "strict_official_metrics_sha256": "5a7d3df98f23598186f0f7ba7b0bf2637057fcad1996c215a8f107b59fe16be2",
+    "strict_raw_reference": "/home/airlab/user/kdh/ROSA/results/raw_metrics/diagnostics/v2_c32_exacte94_fresh_epoch20_global_eval/20260802_081306/20260802_081306.json",
+    "strict_raw_reference_sha256": "77f8860722e6f8d68584885a7112ed2c832f9472e6fa4d514a756fbc89e2b717",
+    "strict_global300_mAP": 0.5649954849343621,
+    "strict_global300_NDS": 0.6447228330516904,
+    "strict_global300_mAOE": 0.3207589893185303,
+    "strict_global300_mATE": 0.4549280612150785,
+    "strict_global300_mASE": 0.050962405959334885,
+    "maximum_absolute_metric_delta": 1e-9,
+    "metric_delta_scope": "mAP, NDS, mAOE, mATE, mASE, every per-class AP/AOE/ATE/ASE, and every AP distance threshold"
+  },
+  "tests": {
+    "focused": "68 passed, 68 warnings in 3.14s",
+    "full_cpu_suite": "250 passed, 5 skipped, 68 warnings in 15.43s",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/geometry.py": "36423599811e485a63804cd1aee5e2c58888dec9ea64cccf37deb1ab3b6d357c",
+    "src/rosa/integrations/sparse4d.py": "ddd4ccadac7ea6a1ab0df2fb1f8e583daae2cc7540c2793c356f0d63847ee60d",
+    "tests/test_ocam_projection_affine.py": "6fd7710670a1d7ac1d858661f2919c80108c8fa0e4918b6075cf8c431d4c20bf",
+    "tests/test_ocam_affine_metric_gate.py": "7817ea899e9a9945fb6f3c45028a54d23cf7b796fe04f63a2aeb00c00ef5d4c5",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_affine3x3_metric_gate.py": "276f0161df688dac4a1e6fb6ff4c03d0261c402a4101084e27bf27ea765046d9"
+  },
+  "pending_gates": [
+    "fresh same-checkpoint official Main126 standalone evaluation with frozen validation payload closure",
+    "primary/replay official mAP/NDS/per-class AP equality within 1e-9",
+    "all raw reference scalar metrics within absolute delta 1e-9",
+    "raw D0-D5 validity-mask and decoded-output delta report",
+    "paired CUDA full-test-step latency and peak-memory gate"
+  ]
+}
