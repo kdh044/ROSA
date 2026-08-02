@@ -15,6 +15,7 @@ from collections.abc import Mapping, Sequence
 import copy
 from dataclasses import dataclass
 import gc
+import importlib
 import importlib.metadata
 import importlib.util
 import json
@@ -74,9 +75,35 @@ EXPECTED_CLASSES = ("Car", "Van", "Truck", "Bus", "Pedestrian", "Cyclist")
 EXPECTED_ANNOTATION_SHA256 = (
     "efafe89c6dc34d116f0ce01fa818505a6387248d9a3ca6dcac035418a664da6f"
 )
-PARENT_CONFIG = ROOT / "configs/rosa_r18_main126_v2_c0_cbgs_native.py"
+DEFAULT_DETECTOR_HOST_ROOT = Path(
+    "/home/airlab/user/kdh/ROSA_host_wt_exacte94_native_eval_p1p2_strict"
+)
+HOST_MODULE_FILES = {
+    "projects.mmdet3d_plugin": "projects/mmdet3d_plugin/__init__.py",
+    "projects.mmdet3d_plugin.ops": "projects/mmdet3d_plugin/ops/__init__.py",
+    "projects.mmdet3d_plugin.models.sparse4d": (
+        "projects/mmdet3d_plugin/models/sparse4d.py"
+    ),
+    "projects.mmdet3d_plugin.models.sparse4d_head": (
+        "projects/mmdet3d_plugin/models/sparse4d_head.py"
+    ),
+    "projects.mmdet3d_plugin.models.instance_bank": (
+        "projects/mmdet3d_plugin/models/instance_bank.py"
+    ),
+    "projects.mmdet3d_plugin.models.detection3d.decoder": (
+        "projects/mmdet3d_plugin/models/detection3d/decoder.py"
+    ),
+    "projects.mmdet3d_plugin.models.blocks": (
+        "projects/mmdet3d_plugin/models/blocks.py"
+    ),
+}
+PARENT_CONFIG = ROOT / (
+    "configs/rosa_r18_main126_v2_c0_cumulative_runtime_exact.py"
+)
 CANDIDATE_CONFIG = ROOT / (
-    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py"
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_"
+    "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_"
+    "homogeneous4x4_inference_reuse_exact.py"
 )
 FROZEN_CONFIG_FILES = {
     "configs/rosa_r18_main126.py": (
@@ -94,6 +121,30 @@ FROZEN_CONFIG_FILES = {
     "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py": (
         "1659e5847703d80f545dcde34d2edf6730e779e72dd315792eb10bd77f242324"
     ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata.py": (
+        "0721c9882186bacde429ba6743266e6fc89413530a668c9c3abe1f655e213329"
+    ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader.py": (
+        "fbdd5555c357b75727fe32a78e1aa38b484654cd2c79ec8e957b42370cd2625d"
+    ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer.py": (
+        "4a49223cf9c4e2fb2eb6a392456773847af7ad4c5a59ab206903fcb2e73f41ff"
+    ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer_pinned.py": (
+        "6da64d7ff070b5abffecd64d7bd8bb388699688d2ca0d112c2cba1aae2b7eacc"
+    ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_uint8_transfer_pinned_inplace.py": (
+        "904d626a251b853b77646aac9038698f6e2f4f8f519d97de90fade6327a95c41"
+    ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace.py": (
+        "9421f2577f1bac99a0866da7eabc49d38605e0e6e530e3afbe43483ed599bac7"
+    ),
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_homogeneous4x4_inference_reuse_exact.py": (
+        "8a04026749427884160d25e11ece4b20eaf9b79e4d4f01293d6377fc763d06a8"
+    ),
+    "configs/rosa_r18_main126_v2_c0_cumulative_runtime_exact.py": (
+        "58d59fa98a253d9aff14cf02ce36150964dcaea5db7d4a60dac1577fb7707a27"
+    ),
 }
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 REVISION_PATTERN = re.compile(r"^[0-9a-f]{40}$")
@@ -107,6 +158,7 @@ class PreparedProtocol:
     checkpoint: Mapping[str, Any]
     state_dict: Mapping[str, torch.Tensor]
     expected_manifest: Mapping[str, Any] | None
+    detector_host_root: Path
     plan: dict[str, Any]
 
 
@@ -115,6 +167,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--expected-checkpoint-sha256", required=True)
     parser.add_argument("--expected-source-revision", required=True)
+    parser.add_argument(
+        "--detector-host-root",
+        type=Path,
+        default=DEFAULT_DETECTOR_HOST_ROOT,
+    )
+    parser.add_argument("--expected-detector-host-revision", required=True)
     parser.add_argument("--expected-sample-manifest", type=Path)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--device", default="cuda:0")
@@ -146,21 +204,126 @@ def _run_git(*arguments: str) -> str:
     return result.stdout.strip()
 
 
-def _git_snapshot(*, require_clean: bool) -> dict[str, Any]:
-    revision = _run_git("rev-parse", "HEAD")
-    tree = _run_git("rev-parse", "HEAD^{tree}")
-    status = _run_git("status", "--porcelain", "--untracked-files=all")
+def _run_git_at(root: Path, *arguments: str) -> str:
+    result = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    return result.stdout.strip()
+
+
+def _git_snapshot_at(root: Path, *, require_clean: bool) -> dict[str, Any]:
+    revision = _run_git_at(root, "rev-parse", "HEAD")
+    tree = _run_git_at(root, "rev-parse", "HEAD^{tree}")
+    status = _run_git_at(root, "status", "--porcelain", "--untracked-files=all")
     if require_clean and status:
         raise VerificationContractError(
-            "near-native CUDA execution requires a clean source worktree"
+            f"runtime dependency must be clean: {root}"
         )
     return {
-        "root": str(ROOT),
+        "root": str(root),
         "revision": revision,
         "tree": tree,
         "clean": not bool(status),
         "status_sha256": canonical_sha256(status.splitlines()),
     }
+
+
+def _git_snapshot(*, require_clean: bool) -> dict[str, Any]:
+    return _git_snapshot_at(ROOT, require_clean=require_clean)
+
+
+def _resolve_directory(path: Path, label: str) -> Path:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except FileNotFoundError as error:
+        raise VerificationContractError(f"{label} does not exist: {path}") from error
+    if not resolved.is_dir():
+        raise VerificationContractError(f"{label} must be a directory: {resolved}")
+    return resolved
+
+
+def _is_module_within(module: Any, root: Path) -> bool:
+    source = getattr(module, "__file__", None)
+    if source is not None:
+        return _is_within(Path(source).resolve(), root)
+    search = getattr(module, "__path__", None)
+    return search is not None and all(
+        _is_within(Path(entry).resolve(), root) for entry in search
+    )
+
+
+def _reject_foreign_preimported_host(root: Path) -> None:
+    foreign = [
+        name
+        for name, module in sys.modules.items()
+        if (name == "projects" or name.startswith("projects."))
+        and module is not None
+        and not _is_module_within(module, root)
+    ]
+    if foreign:
+        raise VerificationContractError(
+            "foreign detector-host modules were imported before protocol setup: "
+            + ", ".join(sorted(foreign)[:8])
+        )
+
+
+def _host_source_contract(root: Path) -> dict[str, Any]:
+    files = {}
+    for module_name, relative in HOST_MODULE_FILES.items():
+        path = _resolve_file(root / relative, f"detector-host source {relative}")
+        files[module_name] = {
+            "relative_path": relative,
+            "sha256": file_sha256(path),
+        }
+    return {
+        "root": str(root),
+        "files": files,
+        "sha256": canonical_sha256(files),
+    }
+
+
+def _loaded_host_module_contract(root: Path) -> dict[str, Any]:
+    files = {}
+    identity = {}
+    for module_name, relative in HOST_MODULE_FILES.items():
+        module = importlib.import_module(module_name)
+        source = getattr(module, "__file__", None)
+        if source is None:
+            raise VerificationContractError(
+                f"detector-host module has no source file: {module_name}"
+            )
+        path = Path(source).resolve()
+        expected = (root / relative).resolve()
+        if path != expected:
+            raise VerificationContractError(
+                f"detector-host module resolved outside pinned source: {module_name}"
+            )
+        files[module_name] = {
+            "path": str(path),
+            "relative_path": relative,
+            "sha256": file_sha256(path),
+        }
+        identity[module_name] = {
+            "relative_path": relative,
+            "sha256": files[module_name]["sha256"],
+        }
+    root_text = str(root)
+    if root_text not in sys.path:
+        raise VerificationContractError(
+            "pinned detector-host root is absent from sys.path"
+        )
+    contract = {
+        "root": root_text,
+        "files": files,
+        "sys_path": list(sys.path),
+        "sys_path_index": sys.path.index(root_text),
+    }
+    contract["sha256"] = canonical_sha256(identity)
+    return contract
 
 
 def _resolve_file(path: Path, label: str) -> Path:
@@ -260,11 +423,34 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
         args.expected_checkpoint_sha256, "expected checkpoint SHA256"
     )
     expected_revision = _validate_revision(args.expected_source_revision)
+    expected_host_revision = _validate_revision(
+        args.expected_detector_host_revision
+    )
     repository = _git_snapshot(require_clean=False)
     if repository["revision"] != expected_revision:
         raise VerificationContractError(
             "current source revision does not match --expected-source-revision"
         )
+    detector_host_root = _resolve_directory(
+        args.detector_host_root,
+        "detector host root",
+    )
+    detector_host = _git_snapshot_at(detector_host_root, require_clean=False)
+    if detector_host["revision"] != expected_host_revision:
+        raise VerificationContractError(
+            "detector-host revision does not match the expected revision"
+        )
+    for variable in ("ROSA_DETECTOR_HOST_ROOT", "SPARSE4D_ROOT"):
+        existing = os.environ.get(variable)
+        if existing is not None and Path(existing).expanduser().resolve() != (
+            detector_host_root
+        ):
+            raise VerificationContractError(
+                f"{variable} conflicts with --detector-host-root"
+            )
+        os.environ[variable] = str(detector_host_root)
+    _reject_foreign_preimported_host(detector_host_root)
+    detector_host_sources = _host_source_contract(detector_host_root)
     if (
         not isinstance(args.device, str)
         or re.fullmatch(r"cuda:[0-9]+", args.device) is None
@@ -377,6 +563,11 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
         "cuda_queried": False,
         "output_created": False,
         "repository": repository,
+        "detector_host": {
+            "git": detector_host,
+            "source_contract": detector_host_sources,
+            "loaded_modules": "verified only after armed custom imports",
+        },
         "frozen_config_files": frozen_configs,
         "parent_config": {
             "path": str(PARENT_CONFIG),
@@ -442,7 +633,7 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
             "clock": "time.perf_counter_ns",
             "synchronization": "torch.cuda.synchronize immediately before and after call",
             "stream": "current stream must equal CUDA default stream",
-            "precision": "FP32, autocast disabled",
+            "precision": "uint8 CPU ingress; FP32 model math; autocast disabled",
             "paired_bootstrap": {
                 "rng": "numpy.random.PCG64",
                 "seed": BOOTSTRAP_SEED,
@@ -467,6 +658,7 @@ def prepare_protocol(args: argparse.Namespace) -> PreparedProtocol:
         checkpoint=checkpoint,
         state_dict=state_dict,
         expected_manifest=expected_manifest,
+        detector_host_root=detector_host_root,
         plan=plan,
     )
 
@@ -607,6 +799,7 @@ def _normalize_module_schema(
 
 
 def _build_models(prepared: PreparedProtocol, device: torch.device):
+    _reject_foreign_preimported_host(prepared.detector_host_root)
     from mmengine.utils import import_modules_from_strings
     from mmdet3d.registry import MODELS
     from mmdet3d.utils import register_all_modules
@@ -618,6 +811,15 @@ def _build_models(prepared: PreparedProtocol, device: torch.device):
     register_all_modules(init_default_scope=True)
     import_modules_from_strings(**prepared.parent_config.custom_imports)
     import_modules_from_strings(**prepared.candidate_config.custom_imports)
+    loaded_host_modules = _loaded_host_module_contract(
+        prepared.detector_host_root
+    )
+    if loaded_host_modules["sha256"] != prepared.plan["detector_host"][
+        "source_contract"
+    ]["sha256"]:
+        raise VerificationContractError(
+            "loaded detector-host module hashes differ from the pinned source"
+        )
     expected_classes = {
         PARENT_ARM: ROSANativeBaselineHead,
         CANDIDATE_ARM: ROSAOfficialResidualNativeBaselineHead,
@@ -658,7 +860,7 @@ def _build_models(prepared: PreparedProtocol, device: torch.device):
         models[PARENT_ARM].state_dict(),
         models[CANDIDATE_ARM].state_dict(),
     )
-    return models, contracts, state_fingerprint
+    return models, contracts, state_fingerprint, loaded_host_modules
 
 
 def _build_dataloader(prepared: PreparedProtocol):
@@ -678,13 +880,12 @@ def _validate_cpu_ingress(batch: Mapping[str, Any]) -> None:
     if (
         not isinstance(image, torch.Tensor)
         or image.device.type != "cpu"
-        or image.dtype != torch.float32
+        or image.dtype != torch.uint8
         or tuple(image.shape) != expected_shape
         or not image.is_contiguous()
-        or not bool(torch.isfinite(image).all())
     ):
         raise VerificationContractError(
-            "captured image must be finite contiguous CPU FP32 [4,4,3,800,800]"
+            "captured image must be contiguous CPU uint8 [4,4,3,800,800]"
         )
 
 
@@ -1319,6 +1520,19 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
     repository = _git_snapshot(require_clean=True)
     if repository["revision"] != args.expected_source_revision:
         raise VerificationContractError("source revision changed after dry-run")
+    detector_host = _git_snapshot_at(
+        prepared.detector_host_root,
+        require_clean=True,
+    )
+    detector_host_sources = _host_source_contract(prepared.detector_host_root)
+    if (
+        detector_host != prepared.plan["detector_host"]["git"]
+        or detector_host_sources
+        != prepared.plan["detector_host"]["source_contract"]
+    ):
+        raise VerificationContractError(
+            "detector-host source changed after dry-run"
+        )
     output_dir = Path(prepared.plan["output_dir"])
     if output_dir.exists():
         raise VerificationContractError(
@@ -1357,7 +1571,12 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
         _seed_everything(3407)
         _require_default_stream(device)
 
-        models, model_contracts, checkpoint_state = _build_models(prepared, device)
+        (
+            models,
+            model_contracts,
+            checkpoint_state,
+            loaded_host_modules,
+        ) = _build_models(prepared, device)
         cpu_batches, manifests = _capture_batches(prepared)
         _atomic_json(output_dir / "SAMPLE_MANIFEST.json", manifests)
         common_batches, boundary = _build_common_boundary(
@@ -1402,6 +1621,23 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
         _atomic_json(output_dir / "MODEL_ONLY_STATISTICS.json", diagnostic)
         snapshots.append(_nvidia_smi_snapshot(device_index))
 
+        final_detector_host = _git_snapshot_at(
+            prepared.detector_host_root,
+            require_clean=True,
+        )
+        final_detector_sources = _host_source_contract(
+            prepared.detector_host_root
+        )
+        if (
+            final_detector_host != detector_host
+            or final_detector_sources != detector_host_sources
+            or _loaded_host_module_contract(prepared.detector_host_root)
+            != loaded_host_modules
+        ):
+            raise VerificationContractError(
+                "detector-host source or imported module closure changed during timing"
+            )
+
         near_native = evaluate_c0_c32_near_native_gate(full["paired_bootstrap"], memory)
         diagnostic_gate = evaluate_c32_near_native_gate(diagnostic["paired_bootstrap"])
         diagnostic_gate.update(
@@ -1418,6 +1654,11 @@ def execute_protocol(prepared: PreparedProtocol) -> dict[str, Any]:
             "status": "COMPLETE",
             "protocol": C0_C32_NEAR_NATIVE_PROTOCOL,
             "repository": repository,
+            "detector_host": {
+                "git": final_detector_host,
+                "source_contract": final_detector_sources,
+                "loaded_modules": loaded_host_modules,
+            },
             "plan_sha256": file_sha256(output_dir / "PLAN.json"),
             "checkpoint": prepared.plan["checkpoint"],
             "dataset": prepared.plan["dataset"],

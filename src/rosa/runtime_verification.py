@@ -58,11 +58,23 @@ EXPECTED_LEAN_LOADER = "LoadOfficialFisheye3DODLeanForSparse4D"
 EXPECTED_PARENT_PACKER = "PackSparse4DInputs"
 EXPECTED_CANDIDATE_PACKER = "PackFisheye3DODUint8Inputs"
 EXPECTED_RUNTIME_TRANSFORM_IMPORT = "rosa.integrations.fisheye3dod.runtime_transforms"
+EXPECTED_CUMULATIVE_PREPROCESSOR = "Fisheye3DODSingleFrameInplaceDataPreprocessor"
+EXPECTED_CUMULATIVE_LOADER = "LoadOfficialFisheye3DODLeanForSparse4D"
+EXPECTED_CUMULATIVE_PACKER = "PackFisheye3DODRGBUint8Inputs"
+EXPECTED_CUMULATIVE_DEFORMABLE_MODEL = (
+    "ROSAInferenceReuseExactHomogeneous4x4FullFOVDeformableFeatureAggregation"
+)
 REPRESENTATION_STREAM_POLICY = "torch-current-default-stream-only"
 MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM = 1.01
 MODEL_ONLY_P95_RATIO_MAXIMUM = 1.01
 NON_EXECUTABLE_CONFIG_KEYS = ("work_dir", "experiment_contract")
 C0_C32_PEAK_MEMORY_RATIO_MAXIMUM = 1.02
+_MAIN126_ANCHOR_RELATIVE_PATH = (
+    "assets/fisheye3dod_main126_train_kmeans300_seed3407.npy"
+)
+_MAIN126_ANCHOR_SHA256 = (
+    "2a08ac6a28b6eb519e59e9d9c16bae009184785f2b8745cd857576a28496b812"
+)
 
 # Representation-runtime v2 is deliberately a single immutable experiment.
 # These are equality constraints, not user-tunable defaults.  Keeping them in
@@ -82,10 +94,10 @@ REPRESENTATION_C32_E20_CHECKPOINT_SHA256 = (
     "cb5b0956ab8357d64bbcde919d8aa10aa772d03c73252c137709529e6299e85d"
 )
 REPRESENTATION_PARENT_NORMALIZED_CONFIG_SHA256 = (
-    "3496f6f0459fbf443dcc94659c5a2de35acaefd837f29f968f96437cc40d2559"
+    "8204c92a8287c67a425bad6c41c3ad16fb0e0d13c4de7ad9cdbd68be47a43147"
 )
 REPRESENTATION_CANDIDATE_NORMALIZED_CONFIG_SHA256 = (
-    "d79deb42055136c0137fa7e101dc53156899f25e9b5b85bff2146f10e9474c91"
+    "b0590a50c17894b0c6f3f839c377a637c21d49a75906dd7a22a271e4e61e8a51"
 )
 REPRESENTATION_PREREGISTRATION_SCHEMA = (
     "rosa.c32_representation_runtime_preregistration.v2"
@@ -1422,6 +1434,37 @@ def validate_config_pair(
     }
 
 
+def _normalize_main126_anchor_for_digest(config: dict[str, Any]) -> None:
+    """Replace a worktree-local anchor path with its content identity."""
+
+    anchor_file = config.get("anchor_file")
+    instance_anchor = _nested(config, "model", "head", "instance_bank", "anchor")
+    if not isinstance(anchor_file, str) or not isinstance(instance_anchor, str):
+        raise VerificationContractError("Main126 anchor paths must be strings")
+    anchor_path = Path(anchor_file).expanduser().resolve()
+    if anchor_path != Path(instance_anchor).expanduser().resolve():
+        raise VerificationContractError(
+            "top-level and instance-bank Main126 anchor paths differ"
+        )
+    if (
+        anchor_path.name != Path(_MAIN126_ANCHOR_RELATIVE_PATH).name
+        or anchor_path.parent.name != "assets"
+        or not anchor_path.is_file()
+    ):
+        raise VerificationContractError(
+            "Main126 anchor must resolve to the released project asset"
+        )
+    digest = hashlib.sha256(anchor_path.read_bytes()).hexdigest()
+    if digest != _MAIN126_ANCHOR_SHA256:
+        raise VerificationContractError("Main126 anchor content hash changed")
+    identity = {
+        "project_relative_path": _MAIN126_ANCHOR_RELATIVE_PATH,
+        "sha256": digest,
+    }
+    config["anchor_file"] = copy.deepcopy(identity)
+    config["model"]["head"]["instance_bank"]["anchor"] = copy.deepcopy(identity)
+
+
 def validate_c0_c32_near_native_config_pair(
     parent_config: Any,
     candidate_config: Any,
@@ -1432,9 +1475,9 @@ def validate_c0_c32_near_native_config_pair(
 
     The parent is exact C0 ``ROSANativeBaselineHead`` and the candidate is
     exact C32 ``ROSAOfficialResidualNativeBaselineHead``.  Both retain the
-    same R18 detector, Main126 test pipeline, preprocessor, operation order,
-    and temporal-free instance bank.  Non-executable experiment bookkeeping
-    is intentionally excluded from the equality proof.
+    same R18 detector, cumulative uint8 runtime path, exact OCam projection,
+    operation order, and temporal-free instance bank.  Non-executable
+    experiment bookkeeping is intentionally excluded from the equality proof.
     """
 
     expected_batch_size = _exact_integer(
@@ -1521,19 +1564,41 @@ def validate_c0_c32_near_native_config_pair(
         if (
             not isinstance(pipeline[0], Mapping)
             or pipeline[0].get("type")
-            != "LoadOfficialFisheye3DODForSparse4D"
-            or pipeline[0].get("to_float32") is not True
+            != EXPECTED_CUMULATIVE_LOADER
+            or pipeline[0].get("to_float32") is not False
             or not isinstance(pipeline[1], Mapping)
-            or pipeline[1].get("type") != "PackSparse4DInputs"
+            or pipeline[1].get("type") != EXPECTED_CUMULATIVE_PACKER
         ):
             raise VerificationContractError(
-                f"{label} must retain the frozen FP32 Main126 input pipeline"
+                f"{label} must retain the frozen cumulative uint8 input pipeline"
             )
         if _nested(config, "model", "data_preprocessor", "type") != (
-            EXPECTED_PARENT_PREPROCESSOR
+            EXPECTED_CUMULATIVE_PREPROCESSOR
         ):
             raise VerificationContractError(
-                f"{label} must use {EXPECTED_PARENT_PREPROCESSOR}"
+                f"{label} must use {EXPECTED_CUMULATIVE_PREPROCESSOR}"
+            )
+        preprocessor = _nested(config, "model", "data_preprocessor")
+        if (
+            preprocessor.get("non_blocking") is not True
+            or preprocessor.get("bgr_to_rgb") is not False
+            or any(
+                key in preprocessor
+                for key in ("stream", "cuda_stream", "transfer_stream")
+            )
+        ):
+            raise VerificationContractError(
+                f"{label} must retain nonblocking default-stream RGB preprocessing"
+            )
+        if dataloader.get("pin_memory") is not True:
+            raise VerificationContractError(
+                f"{label} cumulative test dataloader must pin host memory"
+            )
+        if _nested(config, "model", "head", "deformable_model", "type") != (
+            EXPECTED_CUMULATIVE_DEFORMABLE_MODEL
+        ):
+            raise VerificationContractError(
+                f"{label} must use the exact homogeneous OCam reuse path"
             )
         for forbidden in ("tta_model", "tta_pipeline"):
             if forbidden in config:
@@ -1547,6 +1612,7 @@ def validate_c0_c32_near_native_config_pair(
     for config in (normalized_parent, normalized_candidate):
         for key in NON_EXECUTABLE_CONFIG_KEYS:
             config.pop(key, None)
+        _normalize_main126_anchor_for_digest(config)
     if normalized_parent != normalized_candidate:
         raise VerificationContractError(
             "C0/C32 executable configs differ beyond the audited head type"
@@ -1560,6 +1626,11 @@ def validate_c0_c32_near_native_config_pair(
         "parent_head_type": EXPECTED_C0_HEAD_TYPE,
         "candidate_head_type": EXPECTED_HEAD_TYPE,
         "backbone": "mmdet.ResNet-18",
+        "input_dtype": "torch.uint8",
+        "loader": EXPECTED_CUMULATIVE_LOADER,
+        "packer": EXPECTED_CUMULATIVE_PACKER,
+        "preprocessor": EXPECTED_CUMULATIVE_PREPROCESSOR,
+        "deformable_model": EXPECTED_CUMULATIVE_DEFORMABLE_MODEL,
         "preprocessor_sha256": canonical_sha256(normalized_preprocessor),
         "test_batch_size": expected_batch_size,
         "gnn_stages": 5,
@@ -1615,6 +1686,7 @@ def validate_representation_config_pair(
     for config in (digest_parent, digest_candidate):
         for key in NON_EXECUTABLE_CONFIG_KEYS:
             config.pop(key, None)
+        _normalize_main126_anchor_for_digest(config)
     parent_normalized_config_sha256 = canonical_sha256(digest_parent)
     candidate_normalized_config_sha256 = canonical_sha256(digest_candidate)
     for label, config in ((PARENT_ARM, parent), (CANDIDATE_ARM, candidate)):
@@ -1776,6 +1848,7 @@ def validate_representation_config_pair(
     for config in (normalized_parent, normalized_candidate):
         for key in NON_EXECUTABLE_CONFIG_KEYS:
             config.pop(key, None)
+        _normalize_main126_anchor_for_digest(config)
     if normalized_parent != normalized_candidate:
         raise VerificationContractError(
             "representation configs differ beyond the audited lean FP32/uint8 "

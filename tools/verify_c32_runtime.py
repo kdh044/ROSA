@@ -122,7 +122,7 @@ DEFAULT_REPRESENTATION_PREREGISTRATION_DIR = ROOT / (
 # This pins the default placeholder directory.  A future sealed directory must
 # be supplied together with its explicit SHA256SUMS digest.
 DEFAULT_REPRESENTATION_PREREGISTRATION_SHA256 = (
-    "cb0f613f7021d61c73fa46ba562caff34cf2b87c1744058c491eaa638b408aab"
+    "11a93d2b8db8604e66f2b0e1364153f471448dc48641f706e83b80489f67f2be"
 )
 DEFAULT_DETECTOR_HOST_ROOT = Path(
     os.environ.get(

@@ -22,8 +22,8 @@
       "CPPC"
     ],
     "checkpoint_sha256": "cb5b0956ab8357d64bbcde919d8aa10aa772d03c73252c137709529e6299e85d",
-    "parent_normalized_config_sha256": "3496f6f0459fbf443dcc94659c5a2de35acaefd837f29f968f96437cc40d2559",
-    "candidate_normalized_config_sha256": "d79deb42055136c0137fa7e101dc53156899f25e9b5b85bff2146f10e9474c91"
+    "parent_normalized_config_sha256": "8204c92a8287c67a425bad6c41c3ad16fb0e0d13c4de7ad9cdbd68be47a43147",
+    "candidate_normalized_config_sha256": "b0590a50c17894b0c6f3f839c377a637c21d49a75906dd7a22a271e4e61e8a51"
   },
   "sequence_manifest": {
     "status": "MISSING"

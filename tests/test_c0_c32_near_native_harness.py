@@ -6,6 +6,7 @@ import copy
 import importlib.util
 from pathlib import Path
 import sys
+from types import ModuleType
 
 from mmengine.config import Config
 import pytest
@@ -36,15 +37,36 @@ sys.modules[_SPEC.name] = verify_tool
 _SPEC.loader.exec_module(verify_tool)
 
 
+def _detector_host_arguments() -> list[str]:
+    root = verify_tool.DEFAULT_DETECTOR_HOST_ROOT.resolve()
+    revision = verify_tool._run_git_at(root, "rev-parse", "HEAD")
+    return [
+        "--detector-host-root",
+        str(root),
+        "--expected-detector-host-revision",
+        revision,
+    ]
+
+
+def _clear_preimported_projects(monkeypatch) -> None:
+    for name in tuple(sys.modules):
+        if name == "projects" or name.startswith("projects."):
+            monkeypatch.delitem(sys.modules, name)
+
+
 def _configs() -> tuple[Config, Config]:
     return (
         Config.fromfile(
-            ROOT / "configs/rosa_r18_main126_v2_c0_cbgs_native.py",
+            ROOT / "configs/rosa_r18_main126_v2_c0_cumulative_runtime_exact.py",
             import_custom_modules=False,
         ),
         Config.fromfile(
             ROOT
-            / "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py",
+            / (
+                "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_"
+                "residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_"
+                "inplace_homogeneous4x4_inference_reuse_exact.py"
+            ),
             import_custom_modules=False,
         ),
     )
@@ -89,6 +111,11 @@ def test_real_configs_differ_only_by_exact_head_type() -> None:
     assert contract["candidate_head_type"] == ("ROSAOfficialResidualNativeBaselineHead")
     assert contract["backbone"] == "mmdet.ResNet-18"
     assert contract["gnn_stages"] == 5
+    assert contract["input_dtype"] == "torch.uint8"
+    assert contract["packer"] == "PackFisheye3DODRGBUint8Inputs"
+    assert contract["deformable_model"].startswith(
+        "ROSAInferenceReuseExactHomogeneous4x4"
+    )
     assert contract["only_executable_delta"] == "model.head.type"
 
 
@@ -210,6 +237,7 @@ def test_dry_run_never_queries_cuda_or_creates_output(tmp_path, monkeypatch) -> 
     torch.save({"state_dict": {"weight": torch.ones(1)}}, checkpoint)
     output = tmp_path / "never-created"
     revision = verify_tool._run_git("rev-parse", "HEAD")
+    _clear_preimported_projects(monkeypatch)
 
     def forbidden(*args, **kwargs):
         del args, kwargs
@@ -229,6 +257,7 @@ def test_dry_run_never_queries_cuda_or_creates_output(tmp_path, monkeypatch) -> 
             "--output-dir",
             str(output),
         ]
+        + _detector_host_arguments()
     )
 
     prepared = verify_tool.prepare_protocol(args)
@@ -237,7 +266,39 @@ def test_dry_run_never_queries_cuda_or_creates_output(tmp_path, monkeypatch) -> 
     assert prepared.plan["output_created"] is False
     assert prepared.plan["parameters"]["warmup_iterations_per_arm"] == 60
     assert prepared.plan["parameters"]["measured_iterations_per_arm"] == 300
+    assert prepared.plan["detector_host"]["git"]["revision"] == (
+        args.expected_detector_host_revision
+    )
+    assert prepared.plan["detector_host"]["source_contract"]["files"]
     assert output.exists() is False
+
+
+def test_dry_run_rejects_foreign_preimported_detector_host(
+    tmp_path, monkeypatch
+) -> None:
+    checkpoint = tmp_path / "tiny.pth"
+    torch.save({"state_dict": {"weight": torch.ones(1)}}, checkpoint)
+    revision = verify_tool._run_git("rev-parse", "HEAD")
+    _clear_preimported_projects(monkeypatch)
+    foreign = ModuleType("projects.mmdet3d_plugin")
+    foreign.__file__ = str(tmp_path / "foreign" / "__init__.py")
+    monkeypatch.setitem(sys.modules, foreign.__name__, foreign)
+    args = verify_tool.build_parser().parse_args(
+        [
+            "--checkpoint",
+            str(checkpoint),
+            "--expected-checkpoint-sha256",
+            file_sha256(checkpoint),
+            "--expected-source-revision",
+            revision,
+            "--output-dir",
+            str(tmp_path / "never-created"),
+        ]
+        + _detector_host_arguments()
+    )
+
+    with pytest.raises(VerificationContractError, match="foreign detector-host"):
+        verify_tool.prepare_protocol(args)
 
 
 def test_dry_run_rejects_wrong_checkpoint_before_any_cuda_query(
@@ -246,6 +307,7 @@ def test_dry_run_rejects_wrong_checkpoint_before_any_cuda_query(
     checkpoint = tmp_path / "tiny.pth"
     torch.save({"state_dict": {"weight": torch.ones(1)}}, checkpoint)
     revision = verify_tool._run_git("rev-parse", "HEAD")
+    _clear_preimported_projects(monkeypatch)
     monkeypatch.setattr(
         torch.cuda,
         "is_available",
@@ -262,6 +324,7 @@ def test_dry_run_rejects_wrong_checkpoint_before_any_cuda_query(
             "--output-dir",
             str(tmp_path / "never-created"),
         ]
+        + _detector_host_arguments()
     )
 
     with pytest.raises(VerificationContractError, match="checkpoint hash"):
@@ -290,7 +353,7 @@ def test_execute_requires_both_exact_arming_controls(monkeypatch, arguments) -> 
         "0" * 40,
         "--output-dir",
         "/does/not/matter",
-    ]
+    ] + _detector_host_arguments()
 
     with pytest.raises(SystemExit) as caught:
         verify_tool.main(base + arguments)
