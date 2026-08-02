@@ -228,6 +228,38 @@ class ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation(
 
 
 @MODELS.register_module()
+class ROSAInferenceReuseExactHomogeneous4x4FullFOVDeformableFeatureAggregation(
+    ROSAFullFOVDeformableFeatureAggregation
+):
+    """Exact homogeneous OCam projection with no-grad owned-storage reuse."""
+
+    inference_storage_reuse = True
+
+    def project_points(
+        self,
+        key_points: Tensor,
+        projection_mat: Tensor,
+        image_wh: Tensor | None = None,
+        metas: dict | None = None,
+    ) -> Tensor:
+        if self.training:
+            raise RuntimeError(
+                "the exact homogeneous storage-reuse path is evaluation-only"
+            )
+        if torch.is_grad_enabled():
+            raise RuntimeError(
+                "exact homogeneous OCam storage reuse requires "
+                "torch.no_grad() or torch.inference_mode()"
+            )
+        return super().project_points(
+            key_points,
+            projection_mat,
+            image_wh=image_wh,
+            metas=metas,
+        )
+
+
+@MODELS.register_module()
 class ROSAEvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
     """Sparse4D box loss with a detached BEV-centerness target."""
 
@@ -918,6 +950,7 @@ __all__ = [
     "ClosedLoopROSAHead",
     "ROSAEvaluatorAlignedSparseBox3DLoss",
     "ROSAFullFOVDeformableFeatureAggregation",
+    "ROSAInferenceReuseExactHomogeneous4x4FullFOVDeformableFeatureAggregation",
     "ROSAMetricGatedAffine3x3FullFOVDeformableFeatureAggregation",
     "ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation",
     "ROSANativeBaselineHead",

@@ -16,6 +16,7 @@ from rosa.geometry import (
     ocam_project_points,
 )
 from rosa.integrations.sparse4d import (
+    ROSAInferenceReuseExactHomogeneous4x4FullFOVDeformableFeatureAggregation,
     ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation,
 )
 
@@ -30,6 +31,15 @@ CANDIDATE_CONFIG = (
     "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_"
     "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_"
     "affine3x3_inference_reuse_metric_gate.py"
+)
+EXACT_HOMOGENEOUS_CONFIG = (
+    "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_"
+    "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_"
+    "homogeneous4x4_inference_reuse_exact.py"
+)
+EXACT_HOMOGENEOUS_PARENT_CONFIG = (
+    "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_"
+    "cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace.py"
 )
 
 
@@ -356,6 +366,53 @@ def test_inference_reuse_class_is_registered_stateless_and_eval_only():
     assert output.shape == (2, 4, 17, 13, 2)
 
 
+@pytest.mark.parametrize("dtype", (torch.float16, torch.float32, torch.float64))
+def test_exact_homogeneous_reuse_class_is_registered_stateless_and_raw_equal(dtype):
+    module_type = (
+        ROSAInferenceReuseExactHomogeneous4x4FullFOVDeformableFeatureAggregation
+    )
+    assert MODELS.get(module_type.__name__) is module_type
+    module = module_type.__new__(module_type)
+    torch.nn.Module.__init__(module)
+    assert tuple(module.parameters()) == ()
+    assert tuple(module.buffers()) == ()
+    points, metas, image_wh = _projection_fixture(
+        dtype,
+        camera_conditioned=False,
+    )
+    with pytest.raises(RuntimeError, match="evaluation-only"):
+        module.project_points(
+            points,
+            torch.empty(0),
+            image_wh=image_wh,
+            metas=metas,
+        )
+    module.eval()
+    with pytest.raises(RuntimeError, match="requires torch.no_grad"):
+        module.project_points(
+            points,
+            torch.empty(0),
+            image_wh=image_wh,
+            metas=metas,
+        )
+    with torch.no_grad():
+        expected = ocam_project_points(
+            points,
+            metas,
+            image_wh,
+            contract="full_fov",
+            camera_transform="homogeneous_4x4",
+        )
+        actual = module.project_points(
+            points,
+            torch.empty(0),
+            image_wh=image_wh,
+            metas=metas,
+        )
+    assert torch.equal(actual, expected)
+    assert actual.stride() == expected.stride()
+
+
 def test_inference_reuse_config_changes_only_deformable_type():
     parent = Config.fromfile(
         CONFIG_DIR / PARENT_CONFIG,
@@ -386,3 +443,33 @@ def test_inference_reuse_config_changes_only_deformable_type():
     assert contract["buffers_added"] == 0
     assert contract["checkpoint_keys_added"] == 0
     assert contract["user_numeric_hyperparameters_added"] == 0
+
+
+def test_exact_homogeneous_reuse_config_changes_only_deformable_type():
+    parent = Config.fromfile(
+        CONFIG_DIR / EXACT_HOMOGENEOUS_PARENT_CONFIG,
+        import_custom_modules=False,
+    ).to_dict()
+    candidate = Config.fromfile(
+        CONFIG_DIR / EXACT_HOMOGENEOUS_CONFIG,
+        import_custom_modules=False,
+    ).to_dict()
+    parent_type = parent["model"]["head"]["deformable_model"]["type"]
+    candidate_type = candidate["model"]["head"]["deformable_model"]["type"]
+    assert parent_type == "ROSAFullFOVDeformableFeatureAggregation"
+    assert candidate_type == (
+        "ROSAInferenceReuseExactHomogeneous4x4FullFOV" "DeformableFeatureAggregation"
+    )
+    normalized = deepcopy(candidate)
+    normalized["model"]["head"]["deformable_model"]["type"] = parent_type
+    for view in (parent, normalized):
+        view.pop("work_dir")
+        view.pop("experiment_contract")
+    assert normalized == parent
+    contract = candidate["experiment_contract"]
+    assert contract["training"] == "fail closed"
+    assert contract["grad_enabled_evaluation"] == "fail closed"
+    assert contract["learned_parameters_added"] == 0
+    assert contract["buffers_added"] == 0
+    assert contract["checkpoint_keys_added"] == 0
+    assert contract["new_user_exposed_numeric_dimensions"] == 0
