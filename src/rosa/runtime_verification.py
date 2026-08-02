@@ -25,6 +25,24 @@ PARENT_ARM = "parent"
 CANDIDATE_ARM = "candidate"
 PCCP = "PCCP"
 CPPC = "CPPC"
+PHYSICAL_ROUND_ORDER = (PCCP, CPPC, PCCP, CPPC, PCCP, CPPC)
+PHYSICAL_ROUND_COUNT = len(PHYSICAL_ROUND_ORDER)
+INVOCATIONS_PER_ARM_PER_BLOCK = 2
+ITERATIONS_PER_ARM_GRANULARITY = (
+    PHYSICAL_ROUND_COUNT * INVOCATIONS_PER_ARM_PER_BLOCK
+)
+MINIMUM_WARMUP_ITERATIONS_PER_ARM = 50
+MINIMUM_MEASURED_ITERATIONS_PER_ARM = 300
+DEFAULT_WARMUP_ITERATIONS_PER_ARM = 60
+DEFAULT_MEASURED_ITERATIONS_PER_ARM = 300
+BOOTSTRAP_SEED = 3407
+BOOTSTRAP_SAMPLES = 20_000
+STRICT_MEDIAN_REDUCTION_MINIMUM = 0.02
+STRICT_MEDIAN_RATIO_CI95_UPPER_EXCLUSIVE = 1.0
+STRICT_P95_REGRESSION_MAXIMUM = 0.01
+STRICT_P95_RATIO_MAXIMUM = 1.0 + STRICT_P95_REGRESSION_MAXIMUM
+NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM = 1.10
+NEAR_NATIVE_P95_RATIO_MAXIMUM = 1.10
 HOST_METADATA_KEYS = ("T_global", "T_global_inv", "timestamp")
 EXPECTED_MODEL_TYPE = "Fisheye3DODGravityCenterSparse4D"
 EXPECTED_HEAD_TYPE = "ROSAOfficialResidualNativeBaselineHead"
@@ -44,8 +62,10 @@ class ScheduleEntry:
     phase: str
     round_index: int
     pattern: str
-    batch_index: int
     slot_index: int
+    segment_iteration_index: int
+    batch_index: int
+    pair_index: int
     arm: str
 
     def to_dict(self) -> dict[str, Any]:
@@ -69,8 +89,8 @@ def _exact_integer(name: str, value: Any, *, minimum: int) -> int:
 def validate_runtime_parameters(
     *,
     capture_batches: int,
-    warmup_rounds: int,
-    measured_rounds: int,
+    warmup_iterations_per_arm: int,
+    measured_iterations_per_arm: int,
     expected_batch_size: int,
     profile_batch_index: int,
 ) -> dict[str, int]:
@@ -79,9 +99,15 @@ def validate_runtime_parameters(
     capture_batches = _exact_integer(
         "capture_batches", capture_batches, minimum=1
     )
-    warmup_rounds = _exact_integer("warmup_rounds", warmup_rounds, minimum=0)
-    measured_rounds = _exact_integer(
-        "measured_rounds", measured_rounds, minimum=2
+    warmup_iterations_per_arm = _exact_integer(
+        "warmup_iterations_per_arm",
+        warmup_iterations_per_arm,
+        minimum=MINIMUM_WARMUP_ITERATIONS_PER_ARM,
+    )
+    measured_iterations_per_arm = _exact_integer(
+        "measured_iterations_per_arm",
+        measured_iterations_per_arm,
+        minimum=MINIMUM_MEASURED_ITERATIONS_PER_ARM,
     )
     expected_batch_size = _exact_integer(
         "expected_batch_size", expected_batch_size, minimum=1
@@ -89,13 +115,17 @@ def validate_runtime_parameters(
     profile_batch_index = _exact_integer(
         "profile_batch_index", profile_batch_index, minimum=0
     )
-    if warmup_rounds % 2:
+    if warmup_iterations_per_arm % ITERATIONS_PER_ARM_GRANULARITY:
         raise VerificationContractError(
-            "warmup_rounds must be even to balance PCCP and CPPC"
+            "warmup_iterations_per_arm must be a multiple of "
+            f"{ITERATIONS_PER_ARM_GRANULARITY} so all six physical rounds "
+            "have equal PCCP/CPPC arm segments"
         )
-    if measured_rounds % 2:
+    if measured_iterations_per_arm % ITERATIONS_PER_ARM_GRANULARITY:
         raise VerificationContractError(
-            "measured_rounds must be even to balance PCCP and CPPC"
+            "measured_iterations_per_arm must be a multiple of "
+            f"{ITERATIONS_PER_ARM_GRANULARITY} so all six physical rounds "
+            "have equal PCCP/CPPC arm segments"
         )
     if profile_batch_index >= capture_batches:
         raise VerificationContractError(
@@ -103,8 +133,15 @@ def validate_runtime_parameters(
         )
     return {
         "capture_batches": capture_batches,
-        "warmup_rounds": warmup_rounds,
-        "measured_rounds": measured_rounds,
+        "warmup_iterations_per_arm": warmup_iterations_per_arm,
+        "measured_iterations_per_arm": measured_iterations_per_arm,
+        "physical_rounds": PHYSICAL_ROUND_COUNT,
+        "warmup_iterations_per_segment": (
+            warmup_iterations_per_arm // ITERATIONS_PER_ARM_GRANULARITY
+        ),
+        "measured_iterations_per_segment": (
+            measured_iterations_per_arm // ITERATIONS_PER_ARM_GRANULARITY
+        ),
         "expected_batch_size": expected_batch_size,
         "profile_batch_index": profile_batch_index,
     }
@@ -112,37 +149,53 @@ def validate_runtime_parameters(
 
 def build_alternating_schedule(
     *,
-    rounds: int,
+    iterations_per_arm: int,
     batch_count: int,
     phase: str,
 ) -> tuple[ScheduleEntry, ...]:
-    """Return balanced same-batch PCCP/CPPC invocation order.
+    """Return six physical rounds of contiguous P/C arm segments.
 
-    Every captured batch is run in all four slots of a round before advancing
-    to the next batch.  Even rounds use PCCP and odd rounds use CPPC.
+    A physical round contains four contiguous arm segments in its PCCP or CPPC
+    order.  Matched iteration indices in adjacent segments replay the same
+    captured batch and form a pair.  Equal segment lengths require per-arm
+    iterations to be a multiple of twelve.
     """
 
-    rounds = _exact_integer("rounds", rounds, minimum=0)
+    iterations_per_arm = _exact_integer(
+        "iterations_per_arm", iterations_per_arm, minimum=1
+    )
     batch_count = _exact_integer("batch_count", batch_count, minimum=1)
-    if rounds % 2:
+    if iterations_per_arm % ITERATIONS_PER_ARM_GRANULARITY:
         raise VerificationContractError(
-            "rounds must be even to balance PCCP and CPPC"
+            "iterations_per_arm must be a multiple of "
+            f"{ITERATIONS_PER_ARM_GRANULARITY}"
         )
     if not isinstance(phase, str) or not phase:
         raise VerificationContractError("phase must be a nonempty string")
     entries: list[ScheduleEntry] = []
     arm_for_token = {"P": PARENT_ARM, "C": CANDIDATE_ARM}
-    for round_index in range(rounds):
-        pattern = PCCP if round_index % 2 == 0 else CPPC
-        for batch_index in range(batch_count):
-            for slot_index, token in enumerate(pattern):
+    iterations_per_segment = (
+        iterations_per_arm // ITERATIONS_PER_ARM_GRANULARITY
+    )
+    for round_index, pattern in enumerate(PHYSICAL_ROUND_ORDER):
+        pairs_per_round = 2 * iterations_per_segment
+        for slot_index, token in enumerate(pattern):
+            pair_group = 0 if slot_index < 2 else 1
+            for segment_iteration_index in range(iterations_per_segment):
+                pair_index = (
+                    round_index * pairs_per_round
+                    + pair_group * iterations_per_segment
+                    + segment_iteration_index
+                )
                 entries.append(
                     ScheduleEntry(
                         phase=phase,
                         round_index=round_index,
                         pattern=pattern,
-                        batch_index=batch_index,
                         slot_index=slot_index,
+                        segment_iteration_index=segment_iteration_index,
+                        batch_index=pair_index % batch_count,
+                        pair_index=pair_index,
                         arm=arm_for_token[token],
                     )
                 )
@@ -200,6 +253,386 @@ def summarize_timings(
     }
 
 
+def _timing_pairs(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    expected_pairs: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    expected_pairs = _exact_integer(
+        "expected_pairs", expected_pairs, minimum=1
+    )
+    if expected_pairs % ITERATIONS_PER_ARM_GRANULARITY:
+        raise VerificationContractError(
+            "expected_pairs must preserve equal six-round arm segments"
+        )
+    grouped: dict[int, dict[str, Mapping[str, Any]]] = {}
+    for record in records:
+        arm = record.get("arm")
+        if arm not in (PARENT_ARM, CANDIDATE_ARM):
+            raise VerificationContractError("timing record has an invalid arm")
+        pair_index = _exact_integer(
+            "pair_index", record.get("pair_index"), minimum=0
+        )
+        pair = grouped.setdefault(pair_index, {})
+        if arm in pair:
+            raise VerificationContractError(
+                f"timing pair {pair_index} repeats arm {arm}"
+            )
+        pair[arm] = record
+    if sorted(grouped) != list(range(expected_pairs)):
+        raise VerificationContractError(
+            f"timing pairs must be contiguous 0..{expected_pairs - 1}"
+        )
+
+    parent_ns: list[int] = []
+    candidate_ns: list[int] = []
+    sample_counts: list[int] = []
+    round_pair_counts = [0] * PHYSICAL_ROUND_COUNT
+    comparable_fields = (
+        "phase",
+        "round_index",
+        "pattern",
+        "segment_iteration_index",
+        "batch_index",
+        "pair_index",
+    )
+    for pair_index in range(expected_pairs):
+        pair = grouped[pair_index]
+        if set(pair) != {PARENT_ARM, CANDIDATE_ARM}:
+            raise VerificationContractError(
+                f"timing pair {pair_index} must contain exactly one P and one C"
+            )
+        parent = pair[PARENT_ARM]
+        candidate = pair[CANDIDATE_ARM]
+        if any(parent.get(name) != candidate.get(name) for name in comparable_fields):
+            raise VerificationContractError(
+                f"timing pair {pair_index} does not share schedule metadata"
+            )
+        round_index = _exact_integer(
+            "round_index", parent.get("round_index"), minimum=0
+        )
+        if round_index >= PHYSICAL_ROUND_COUNT:
+            raise VerificationContractError("timing record has an invalid round")
+        if parent.get("pattern") != PHYSICAL_ROUND_ORDER[round_index]:
+            raise VerificationContractError(
+                "timing record violates the physical PCCP/CPPC order"
+            )
+        if parent.get("phase") != "measured":
+            raise VerificationContractError(
+                "paired bootstrap accepts measured timing records only"
+            )
+        pairs_per_round = expected_pairs // PHYSICAL_ROUND_COUNT
+        iterations_per_segment = pairs_per_round // 2
+        pair_position_in_round = pair_index % pairs_per_round
+        first_slot = 0 if pair_position_in_round < iterations_per_segment else 2
+        expected_slots = {first_slot, first_slot + 1}
+        observed_slots = {
+            _exact_integer("slot_index", parent.get("slot_index"), minimum=0),
+            _exact_integer(
+                "slot_index", candidate.get("slot_index"), minimum=0
+            ),
+        }
+        if observed_slots != expected_slots:
+            raise VerificationContractError(
+                f"timing pair {pair_index} does not match adjacent arm segments"
+            )
+        parent_slot = operator.index(parent["slot_index"])
+        candidate_slot = operator.index(candidate["slot_index"])
+        pattern = PHYSICAL_ROUND_ORDER[round_index]
+        if pattern[parent_slot] != "P" or pattern[candidate_slot] != "C":
+            raise VerificationContractError(
+                f"timing pair {pair_index} assigns arms to the wrong segment"
+            )
+        parent_elapsed = _exact_integer(
+            "elapsed_ns", parent.get("elapsed_ns"), minimum=1
+        )
+        candidate_elapsed = _exact_integer(
+            "elapsed_ns", candidate.get("elapsed_ns"), minimum=1
+        )
+        parent_samples = _exact_integer(
+            "sample_count", parent.get("sample_count"), minimum=1
+        )
+        candidate_samples = _exact_integer(
+            "sample_count", candidate.get("sample_count"), minimum=1
+        )
+        if parent_samples != candidate_samples:
+            raise VerificationContractError(
+                f"timing pair {pair_index} has different sample counts"
+            )
+        parent_ns.append(parent_elapsed)
+        candidate_ns.append(candidate_elapsed)
+        sample_counts.append(parent_samples)
+        round_pair_counts[round_index] += 1
+
+    expected_per_round, remainder = divmod(
+        expected_pairs, PHYSICAL_ROUND_COUNT
+    )
+    if remainder or round_pair_counts != [expected_per_round] * PHYSICAL_ROUND_COUNT:
+        raise VerificationContractError(
+            "timing pairs must be equally distributed across all six rounds"
+        )
+    return (
+        np.asarray(parent_ns, dtype=np.float64),
+        np.asarray(candidate_ns, dtype=np.float64),
+        np.asarray(sample_counts, dtype=np.float64),
+    )
+
+
+def _confidence_interval(values: Sequence[float]) -> dict[str, float]:
+    return {
+        "lower": percentile(values, 0.025),
+        "upper": percentile(values, 0.975),
+    }
+
+
+def paired_bootstrap_confidence_intervals(
+    records: Sequence[Mapping[str, Any]],
+    *,
+    expected_pairs: int,
+    bootstrap_samples: int = BOOTSTRAP_SAMPLES,
+    seed: int = BOOTSTRAP_SEED,
+) -> dict[str, Any]:
+    """Compute deterministic percentile CIs by resampling paired P/C calls."""
+
+    bootstrap_samples = _exact_integer(
+        "bootstrap_samples", bootstrap_samples, minimum=1
+    )
+    seed = _exact_integer("bootstrap seed", seed, minimum=0)
+    parent_ns, candidate_ns, sample_counts = _timing_pairs(
+        records,
+        expected_pairs=expected_pairs,
+    )
+    point_estimates = {
+        "median_candidate_over_parent": (
+            percentile(candidate_ns.tolist(), 0.5)
+            / percentile(parent_ns.tolist(), 0.5)
+        ),
+        "p95_candidate_over_parent": (
+            percentile(candidate_ns.tolist(), 0.95)
+            / percentile(parent_ns.tolist(), 0.95)
+        ),
+        "throughput_candidate_over_parent": (
+            float(parent_ns.sum()) / float(candidate_ns.sum())
+        ),
+    }
+    pairs_per_round = len(parent_ns) // PHYSICAL_ROUND_COUNT
+    per_round = []
+    for round_index, pattern in enumerate(PHYSICAL_ROUND_ORDER):
+        start = round_index * pairs_per_round
+        stop = start + pairs_per_round
+        round_parent = parent_ns[start:stop]
+        round_candidate = candidate_ns[start:stop]
+        per_round.append(
+            {
+                "round_index": round_index,
+                "pattern": pattern,
+                "pairs": pairs_per_round,
+                "median_candidate_over_parent": (
+                    percentile(round_candidate.tolist(), 0.5)
+                    / percentile(round_parent.tolist(), 0.5)
+                ),
+                "p95_candidate_over_parent": (
+                    percentile(round_candidate.tolist(), 0.95)
+                    / percentile(round_parent.tolist(), 0.95)
+                ),
+                "throughput_candidate_over_parent": (
+                    float(round_parent.sum()) / float(round_candidate.sum())
+                ),
+            }
+        )
+
+    generated = np.random.Generator(np.random.PCG64(seed))
+    bootstrap_values: dict[str, list[float]] = {
+        name: [] for name in point_estimates
+    }
+    remaining = bootstrap_samples
+    chunk_size = 512
+    while remaining:
+        count = min(chunk_size, remaining)
+        within_round_indices = generated.integers(
+            0,
+            pairs_per_round,
+            size=(count, PHYSICAL_ROUND_COUNT, pairs_per_round),
+            endpoint=False,
+        )
+        round_offsets = (
+            np.arange(PHYSICAL_ROUND_COUNT, dtype=np.int64)
+            .reshape(1, PHYSICAL_ROUND_COUNT, 1)
+            * pairs_per_round
+        )
+        indices = (within_round_indices + round_offsets).reshape(
+            count, len(parent_ns)
+        )
+        parent_samples_ns = parent_ns[indices]
+        candidate_samples_ns = candidate_ns[indices]
+        sampled_counts = sample_counts[indices]
+        parent_medians = np.median(parent_samples_ns, axis=1)
+        candidate_medians = np.median(candidate_samples_ns, axis=1)
+        parent_p95 = np.quantile(
+            parent_samples_ns, 0.95, axis=1, method="linear"
+        )
+        candidate_p95 = np.quantile(
+            candidate_samples_ns, 0.95, axis=1, method="linear"
+        )
+        sample_totals = sampled_counts.sum(axis=1)
+        parent_throughput = sample_totals / parent_samples_ns.sum(axis=1)
+        candidate_throughput = sample_totals / candidate_samples_ns.sum(axis=1)
+        values = {
+            "median_candidate_over_parent": candidate_medians / parent_medians,
+            "p95_candidate_over_parent": candidate_p95 / parent_p95,
+            "throughput_candidate_over_parent": (
+                candidate_throughput / parent_throughput
+            ),
+        }
+        for name, array in values.items():
+            bootstrap_values[name].extend(float(value) for value in array)
+        remaining -= count
+
+    metrics = {}
+    for name, point in point_estimates.items():
+        metrics[name] = {
+            "point_estimate": point,
+            "ci95": _confidence_interval(bootstrap_values[name]),
+        }
+    return {
+        "method": (
+            "six-round-stratified paired percentile bootstrap of matched "
+            "iterations in adjacent P/C arm segments"
+        ),
+        "rng": "numpy.random.PCG64",
+        "seed": seed,
+        "bootstrap_samples": bootstrap_samples,
+        "pairs": len(parent_ns),
+        "pairs_per_round": pairs_per_round,
+        "physical_round_order": list(PHYSICAL_ROUND_ORDER),
+        "per_round_point_estimates": per_round,
+        "metrics": metrics,
+    }
+
+
+def evaluate_strict_lightweight_gate(
+    paired_bootstrap: Mapping[str, Any],
+    memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply the preregistered strict lightweight adoption decision."""
+
+    metrics = _nested(paired_bootstrap, "metrics")
+    median_ratio = float(
+        _nested(metrics, "median_candidate_over_parent", "point_estimate")
+    )
+    median_upper = float(
+        _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
+    )
+    p95_ratio = float(
+        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
+    )
+    parent_memory = _nested(memory, PARENT_ARM)
+    candidate_memory = _nested(memory, CANDIDATE_ARM)
+    parent_peak_allocated = _exact_integer(
+        "parent peak_allocated_bytes",
+        _nested(parent_memory, "peak_allocated_bytes"),
+        minimum=0,
+    )
+    candidate_peak_allocated = _exact_integer(
+        "candidate peak_allocated_bytes",
+        _nested(candidate_memory, "peak_allocated_bytes"),
+        minimum=0,
+    )
+    parent_peak_reserved = _exact_integer(
+        "parent peak_reserved_bytes",
+        _nested(parent_memory, "peak_reserved_bytes"),
+        minimum=0,
+    )
+    candidate_peak_reserved = _exact_integer(
+        "candidate peak_reserved_bytes",
+        _nested(candidate_memory, "peak_reserved_bytes"),
+        minimum=0,
+    )
+    if not all(math.isfinite(value) for value in (median_ratio, median_upper, p95_ratio)):
+        raise VerificationContractError("decision metrics must be finite")
+    checks = {
+        "median_reduction_at_least_2_percent": {
+            "observed_candidate_over_parent": median_ratio,
+            "threshold_max_inclusive": 1.0 - STRICT_MEDIAN_REDUCTION_MINIMUM,
+            "passed": median_ratio <= 1.0 - STRICT_MEDIAN_REDUCTION_MINIMUM,
+        },
+        "median_ratio_ci95_upper_below_1": {
+            "observed": median_upper,
+            "threshold_max_exclusive": STRICT_MEDIAN_RATIO_CI95_UPPER_EXCLUSIVE,
+            "passed": median_upper < STRICT_MEDIAN_RATIO_CI95_UPPER_EXCLUSIVE,
+        },
+        "p95_regression_at_most_1_percent": {
+            "observed_candidate_over_parent": p95_ratio,
+            "threshold_max_inclusive": STRICT_P95_RATIO_MAXIMUM,
+            "passed": p95_ratio <= STRICT_P95_RATIO_MAXIMUM,
+        },
+        "peak_allocated_memory_not_worse": {
+            "parent_bytes": parent_peak_allocated,
+            "candidate_bytes": candidate_peak_allocated,
+            "passed": candidate_peak_allocated <= parent_peak_allocated,
+        },
+        "peak_reserved_memory_not_worse": {
+            "parent_bytes": parent_peak_reserved,
+            "candidate_bytes": candidate_peak_reserved,
+            "passed": candidate_peak_reserved <= parent_peak_reserved,
+        },
+    }
+    passed = all(check["passed"] for check in checks.values())
+    return {
+        "gate": "strict_lightweight_adoption",
+        "passed": passed,
+        "decision": (
+            "ADOPT_CANDIDATE"
+            if passed
+            else "RETAIN_PARENT_AND_REPORT_INCONCLUSIVE"
+        ),
+        "checks": checks,
+    }
+
+
+def evaluate_c32_near_native_gate(
+    paired_bootstrap: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Apply the preregistered C32/C0 near-native statement gate."""
+
+    metrics = _nested(paired_bootstrap, "metrics")
+    median_upper = float(
+        _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
+    )
+    p95_ratio = float(
+        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
+    )
+    if not all(math.isfinite(value) for value in (median_upper, p95_ratio)):
+        raise VerificationContractError("near-native metrics must be finite")
+    checks = {
+        "median_ratio_ci95_upper_at_most_1_10": {
+            "observed": median_upper,
+            "threshold_max_inclusive": (
+                NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
+            ),
+            "passed": (
+                median_upper <= NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
+            ),
+        },
+        "p95_ratio_at_most_1_10": {
+            "observed_candidate_over_parent": p95_ratio,
+            "threshold_max_inclusive": NEAR_NATIVE_P95_RATIO_MAXIMUM,
+            "passed": p95_ratio <= NEAR_NATIVE_P95_RATIO_MAXIMUM,
+        },
+    }
+    passed = all(check["passed"] for check in checks.values())
+    return {
+        "gate": "c32_vs_c0_near_native_statement",
+        "passed": passed,
+        "decision": (
+            "NEAR_NATIVE_SUPPORTED"
+            if passed
+            else "NEAR_NATIVE_NOT_SUPPORTED"
+        ),
+        "checks": checks,
+    }
+
+
 def _mapping(config: Any) -> dict[str, Any]:
     if hasattr(config, "to_dict"):
         config = config.to_dict()
@@ -217,6 +650,132 @@ def _nested(mapping: Mapping[str, Any], *keys: str) -> Any:
             )
         value = value[key]
     return value
+
+
+def validate_preregistration_plan(plan: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind the harness to the exact v1 future-CUDA measurement contract."""
+
+    if not isinstance(plan, Mapping):
+        raise VerificationContractError("preregistration plan must be a mapping")
+    expected_schema = (
+        "rosa.exacte94_lightweight_fresh30_runtime_preregistration.v1"
+    )
+    if plan.get("schema") != expected_schema:
+        raise VerificationContractError("unexpected preregistration schema")
+    if plan.get("status") != "PREPARATION_ONLY_DISARMED":
+        raise VerificationContractError("preregistration status is not frozen")
+    if plan.get("execution_authorized") is not False:
+        raise VerificationContractError(
+            "preregistration must remain non-authorizing"
+        )
+    gate = _nested(plan, "future_cuda_gate")
+    if _nested(gate, "correctness_before_timing") is not True:
+        raise VerificationContractError(
+            "preregistration must require correctness before timing"
+        )
+    model_benchmark = _nested(gate, "model_test_step_benchmark")
+    if _nested(model_benchmark, "warmup_min") != MINIMUM_WARMUP_ITERATIONS_PER_ARM:
+        raise VerificationContractError("preregistration warmup minimum changed")
+    if (
+        _nested(model_benchmark, "measured_iterations_per_arm_min")
+        != MINIMUM_MEASURED_ITERATIONS_PER_ARM
+    ):
+        raise VerificationContractError(
+            "preregistration measured-iteration minimum changed"
+        )
+    observed_order = tuple(_nested(gate, "alternating_round_order"))
+    if observed_order != PHYSICAL_ROUND_ORDER:
+        raise VerificationContractError(
+            "preregistration physical PCCP/CPPC order changed"
+        )
+    required_reporting = _nested(gate, "required_reporting")
+    expected_reporting = {
+        "raw per-iteration samples",
+        "paired median",
+        "p95",
+        "throughput",
+        "95% paired-bootstrap confidence interval",
+        "allocated/reserved/peak memory",
+        "full environment and hashes",
+    }
+    if not isinstance(required_reporting, (list, tuple)) or set(
+        required_reporting
+    ) != expected_reporting:
+        raise VerificationContractError(
+            "preregistration reporting requirements changed"
+        )
+    expected_environment_pins = {
+        "GPU model",
+        "driver",
+        "CUDA",
+        "PyTorch",
+        "precision/autocast",
+        "TF32/matmul settings",
+        "determinism",
+        "source/config/checkpoint hashes",
+        "captured sample IDs",
+        "batch size",
+        "clock/power observations",
+        "no concurrent GPU workload",
+    }
+    environment_pins = _nested(gate, "environment_pins")
+    if not isinstance(environment_pins, (list, tuple)) or set(
+        environment_pins
+    ) != expected_environment_pins:
+        raise VerificationContractError(
+            "preregistration environment pins changed"
+        )
+    strict_gate = _nested(gate, "strict_lightweight_adoption_gate")
+    expected_gate = {
+        "same_checkpoint_and_exact_outputs": True,
+        "median_reduction_min_fraction": STRICT_MEDIAN_REDUCTION_MINIMUM,
+        "upper_95ci_candidate_over_parent_ratio_max_exclusive": (
+            STRICT_MEDIAN_RATIO_CI95_UPPER_EXCLUSIVE
+        ),
+        "p95_regression_max_fraction": STRICT_P95_REGRESSION_MAXIMUM,
+        "peak_memory_regression_allowed": False,
+    }
+    if dict(strict_gate) != expected_gate:
+        raise VerificationContractError(
+            "preregistration strict-lightweight gate changed"
+        )
+    near_native_gate = _nested(gate, "c32_vs_c0_near_native_gate")
+    expected_near_native_gate = {
+        "same_checkpoint_and_inputs": True,
+        "upper_95ci_median_ratio_max": (
+            NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
+        ),
+        "p95_ratio_max": NEAR_NATIVE_P95_RATIO_MAXIMUM,
+    }
+    if dict(near_native_gate) != expected_near_native_gate:
+        raise VerificationContractError(
+            "preregistration C32/C0 near-native gate changed"
+        )
+    if gate.get("historical_062d236_random_weight_gpu_numbers_eligible") is not False:
+        raise VerificationContractError(
+            "historical random-weight GPU timings must remain ineligible"
+        )
+    return {
+        "schema": expected_schema,
+        "execution_authorized": False,
+        "correctness_before_timing": True,
+        "minimum_warmup_iterations_per_arm": MINIMUM_WARMUP_ITERATIONS_PER_ARM,
+        "minimum_measured_iterations_per_arm": (
+            MINIMUM_MEASURED_ITERATIONS_PER_ARM
+        ),
+        "physical_round_order": list(PHYSICAL_ROUND_ORDER),
+        "environment_pins": sorted(expected_environment_pins),
+        "strict_lightweight_gate": expected_gate,
+        "c32_vs_c0_near_native_gate": expected_near_native_gate,
+        "bootstrap": {
+            "method": (
+                "six-round-stratified paired percentile bootstrap of matched "
+                "iterations in adjacent P/C arm segments"
+            ),
+            "seed": BOOTSTRAP_SEED,
+            "samples": BOOTSTRAP_SAMPLES,
+        },
+    }
 
 
 def _require_zero_temporal_slots(config: Mapping[str, Any], label: str) -> None:
@@ -606,15 +1165,25 @@ def validate_transfer_reduction(
 
 
 __all__ = [
+    "BOOTSTRAP_SAMPLES",
+    "BOOTSTRAP_SEED",
     "CANDIDATE_ARM",
     "CPPC",
+    "DEFAULT_MEASURED_ITERATIONS_PER_ARM",
+    "DEFAULT_WARMUP_ITERATIONS_PER_ARM",
     "EXPECTED_CANDIDATE_PREPROCESSOR",
     "EXPECTED_HEAD_TYPE",
     "EXPECTED_MODEL_TYPE",
     "EXPECTED_PARENT_PREPROCESSOR",
     "HOST_METADATA_KEYS",
+    "ITERATIONS_PER_ARM_GRANULARITY",
+    "MINIMUM_MEASURED_ITERATIONS_PER_ARM",
+    "MINIMUM_WARMUP_ITERATIONS_PER_ARM",
+    "NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM",
+    "NEAR_NATIVE_P95_RATIO_MAXIMUM",
     "PARENT_ARM",
     "PCCP",
+    "PHYSICAL_ROUND_ORDER",
     "ScheduleEntry",
     "VerificationContractError",
     "build_alternating_schedule",
@@ -622,7 +1191,10 @@ __all__ = [
     "canonical_json",
     "canonical_sha256",
     "classify_transfer_event",
+    "evaluate_c32_near_native_gate",
+    "evaluate_strict_lightweight_gate",
     "file_sha256",
+    "paired_bootstrap_confidence_intervals",
     "percentile",
     "raw_fingerprint",
     "require_same_fingerprint",
@@ -630,6 +1202,7 @@ __all__ = [
     "summarize_transfer_event_names",
     "validate_config_pair",
     "validate_expected_manifest",
+    "validate_preregistration_plan",
     "validate_runtime_parameters",
     "validate_transfer_reduction",
 ]

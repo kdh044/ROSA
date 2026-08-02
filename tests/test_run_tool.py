@@ -4,6 +4,7 @@ import hashlib
 import importlib.util
 from collections import OrderedDict
 from pathlib import Path
+import pickle
 from types import SimpleNamespace
 
 import numpy as np
@@ -275,7 +276,8 @@ def test_checkpoint_hook_records_effective_contract():
     metadata = run_tool._checkpoint_contract_metadata(_config("fast"))
     assert metadata is not None
     checkpoint = {"meta": {"epoch": 2}}
-    run_tool._CheckpointContractHook(metadata).before_save_checkpoint(
+    hook = run_tool._CheckpointContractHook(metadata)
+    hook.before_save_checkpoint(
         SimpleNamespace(),
         checkpoint,
     )
@@ -284,6 +286,8 @@ def test_checkpoint_hook_records_effective_contract():
     assert checkpoint["meta"]["projection_contract"] == "full_fov"
     assert checkpoint["meta"]["refinement_profile"] == "fast"
     assert checkpoint["meta"]["rosa_config"]["architecture_profile"] == "compact"
+    restored = pickle.loads(pickle.dumps(hook))
+    assert restored.metadata == hook.metadata
 
 
 class _FakeRefiner:

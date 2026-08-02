@@ -23,6 +23,9 @@ from mmengine.config import Config, DictAction
 from mmengine.logging.history_buffer import HistoryBuffer
 
 
+Runner = None
+
+
 _FAST_PROFILES = frozenset({"fast", "compact_v2_fast"})
 _KNOWN_RELEASE_ARCHITECTURE = "ROSA R18 Main126"
 _ROSA_TOPOLOGY_FIELDS = (
@@ -122,17 +125,19 @@ _C73_DEPLOY_META_KEYS = frozenset(
 def _CheckpointContractHook(metadata: Mapping):
     """Build the hook lazily so checkpoint inspection stays device-agnostic."""
 
-    from mmengine.hooks import Hook
-
-    class CheckpointContractHook(Hook):
-        def __init__(self, hook_metadata: Mapping) -> None:
-            self.metadata = dict(hook_metadata)
-
-        def before_save_checkpoint(self, runner, checkpoint: dict) -> None:
-            del runner
-            checkpoint.setdefault("meta", {}).update(self.metadata)
+    from rosa.mmengine_hooks import CheckpointContractHook
 
     return CheckpointContractHook(metadata)
+
+
+def _runner_class():
+    """Resolve Runner lazily while preserving the module test seam."""
+
+    if Runner is not None:
+        return Runner
+    from mmengine.runner import Runner as MMEngineRunner
+
+    return MMEngineRunner
 
 
 def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
@@ -799,10 +804,10 @@ def _validate_checkpoint_contract(
 def _compile_fast_inference(runner, config: Config) -> bool:
     """Compile only the latency-oriented sidecar after weights are loaded."""
 
-    from mmengine.model import is_model_wrapper
-
     if _rosa_profile(config) not in _FAST_PROFILES:
         return False
+    from mmengine.model import is_model_wrapper
+
     model = runner.model.module if is_model_wrapper(runner.model) else runner.model
     refiner = getattr(getattr(model, "head", None), "rosa_refiner", None)
     if refiner is None:
@@ -813,8 +818,6 @@ def _compile_fast_inference(runner, config: Config) -> bool:
 
 
 def train(args: argparse.Namespace, config: Config) -> None:
-    from mmengine.runner import Runner
-
     if args.resume:
         os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
         config.resume = True
@@ -824,7 +827,7 @@ def train(args: argparse.Namespace, config: Config) -> None:
             raise ValueError("--amp requires a plain OptimWrapper")
         config.optim_wrapper.type = "AmpOptimWrapper"
         config.optim_wrapper.setdefault("loss_scale", "dynamic")
-    runner = Runner.from_cfg(config)
+    runner = _runner_class().from_cfg(config)
     provenance = None
     if getattr(runner, "rank", 0) == 0:
         from rosa.provenance import capture_external_provenance
@@ -846,8 +849,6 @@ def train(args: argparse.Namespace, config: Config) -> None:
 
 
 def evaluate(args: argparse.Namespace, config: Config) -> None:
-    from mmengine.runner import Runner
-
     _validate_checkpoint_contract(
         args.checkpoint.resolve(),
         config,
@@ -870,7 +871,7 @@ def evaluate(args: argparse.Namespace, config: Config) -> None:
             if isinstance(evaluator, (list, tuple))
             else [evaluator, dump_metric]
         )
-    runner = Runner.from_cfg(config)
+    runner = _runner_class().from_cfg(config)
     runner.load_or_resume()
     _compile_fast_inference(runner, config)
     runner.test()
@@ -878,8 +879,6 @@ def evaluate(args: argparse.Namespace, config: Config) -> None:
 
 def benchmark(args: argparse.Namespace, config: Config) -> None:
     """Measure end-to-end single-GPU ``test_step`` latency."""
-
-    from mmengine.runner import Runner
 
     if not torch.cuda.is_available():
         raise RuntimeError("benchmark requires CUDA")
@@ -909,7 +908,7 @@ def benchmark(args: argparse.Namespace, config: Config) -> None:
     if args.work_dir is None:
         config.work_dir = str(args.output.resolve().parent / "_benchmark")
 
-    runner = Runner.from_cfg(config)
+    runner = _runner_class().from_cfg(config)
     runner.load_or_resume()
     compiled = _compile_fast_inference(runner, config)
     model = runner.model.eval()

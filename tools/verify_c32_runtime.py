@@ -39,14 +39,23 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from rosa.runtime_verification import (  # noqa: E402
+    BOOTSTRAP_SAMPLES,
+    BOOTSTRAP_SEED,
     CANDIDATE_ARM,
+    DEFAULT_MEASURED_ITERATIONS_PER_ARM,
+    DEFAULT_WARMUP_ITERATIONS_PER_ARM,
     HOST_METADATA_KEYS,
+    ITERATIONS_PER_ARM_GRANULARITY,
     PARENT_ARM,
+    PHYSICAL_ROUND_ORDER,
     VerificationContractError,
     build_alternating_schedule,
     build_batch_manifest,
     canonical_sha256,
+    evaluate_c32_near_native_gate,
+    evaluate_strict_lightweight_gate,
     file_sha256,
+    paired_bootstrap_confidence_intervals,
     raw_fingerprint,
     require_same_fingerprint,
     summarize_timings,
@@ -54,6 +63,7 @@ from rosa.runtime_verification import (  # noqa: E402
     validate_config_pair,
     validate_expected_manifest,
     validate_runtime_parameters,
+    validate_preregistration_plan,
     validate_transfer_reduction,
 )
 
@@ -66,6 +76,15 @@ DEFAULT_CANDIDATE_CONFIG = ROOT / (
     "configs/"
     "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata.py"
 )
+DEFAULT_PREREGISTRATION_DIR = Path(
+    "/home/airlab/user/kdh/ROSA/results/raw_metrics/diagnostics/"
+    "v1_exacte94_lightweight_fresh30_runtime_preregistration_20260802"
+)
+EXPECTED_PREREGISTRATION_HASHES = {
+    "PLAN.json": "f82b46f0dfdec8d1482d9b0dc219aada2f4288b7eab322dd87e64b5478cb616d",
+    "REPORT.md": "93550205c0b330509d3340126f072c39850062324fd22da0ffbb354a4fca7ed5",
+    "SHA256SUMS": "9423422f81f0956ec5fdf65f8d6acc318d2ccd0082b84287dea82274b801cb1a",
+}
 
 
 @dataclass
@@ -87,12 +106,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
+    parser.add_argument(
+        "--preregistration-dir",
+        type=Path,
+        default=DEFAULT_PREREGISTRATION_DIR,
+    )
     parser.add_argument("--expected-sample-manifest", type=Path)
     parser.add_argument("--capture-batches", type=int, default=2)
     parser.add_argument("--expected-batch-size", type=int, default=4)
     parser.add_argument("--profile-batch-index", type=int, default=0)
-    parser.add_argument("--warmup-rounds", type=int, default=2)
-    parser.add_argument("--measured-rounds", type=int, default=10)
+    parser.add_argument(
+        "--warmup-iterations-per-arm",
+        type=int,
+        default=DEFAULT_WARMUP_ITERATIONS_PER_ARM,
+    )
+    parser.add_argument(
+        "--measured-iterations-per-arm",
+        type=int,
+        default=DEFAULT_MEASURED_ITERATIONS_PER_ARM,
+    )
     parser.add_argument("--dataloader-workers", type=int, default=0)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--device", default="cuda:0")
@@ -144,6 +176,39 @@ def _load_json_mapping(path: Path, label: str) -> Mapping[str, Any]:
     return value
 
 
+def _load_preregistration(directory: Path) -> tuple[Mapping[str, Any], dict[str, Any]]:
+    try:
+        resolved = directory.expanduser().resolve(strict=True)
+    except FileNotFoundError as error:
+        raise VerificationContractError(
+            f"preregistration directory does not exist: {directory}"
+        ) from error
+    if not resolved.is_dir():
+        raise VerificationContractError(
+            f"preregistration path must be a directory: {resolved}"
+        )
+    files = {}
+    for name, expected_sha256 in EXPECTED_PREREGISTRATION_HASHES.items():
+        path = _resolve_file(resolved / name, f"preregistration {name}")
+        observed_sha256 = file_sha256(path)
+        if observed_sha256 != expected_sha256:
+            raise VerificationContractError(
+                f"preregistration {name} hash mismatch: "
+                f"{observed_sha256} != {expected_sha256}"
+            )
+        files[name] = {
+            "path": str(path),
+            "sha256": observed_sha256,
+        }
+    plan = _load_json_mapping(resolved / "PLAN.json", "preregistration PLAN.json")
+    contract = validate_preregistration_plan(plan)
+    return plan, {
+        "directory": str(resolved),
+        "files": files,
+        "contract": contract,
+    }
+
+
 def _checkpoint_schema(state_dict: Mapping[str, torch.Tensor]) -> dict[str, Any]:
     schema = []
     for name, value in state_dict.items():
@@ -173,8 +238,8 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
 
     parameters = validate_runtime_parameters(
         capture_batches=args.capture_batches,
-        warmup_rounds=args.warmup_rounds,
-        measured_rounds=args.measured_rounds,
+        warmup_iterations_per_arm=args.warmup_iterations_per_arm,
+        measured_iterations_per_arm=args.measured_iterations_per_arm,
         expected_batch_size=args.expected_batch_size,
         profile_batch_index=args.profile_batch_index,
     )
@@ -206,6 +271,13 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         or minimum_htod < 0
     ):
         raise VerificationContractError("transfer minima must be nonnegative")
+
+    preregistration_plan, preregistration = _load_preregistration(
+        args.preregistration_dir
+    )
+    preregistration["parsed_plan_sha256"] = canonical_sha256(
+        preregistration_plan
+    )
 
     parent_path = _resolve_file(args.parent_config, "parent config")
     candidate_path = _resolve_file(args.candidate_config, "candidate config")
@@ -242,24 +314,50 @@ def prepare_verification(args: argparse.Namespace) -> PreparedVerification:
         )
 
     warmup_schedule = build_alternating_schedule(
-        rounds=parameters["warmup_rounds"],
+        iterations_per_arm=parameters["warmup_iterations_per_arm"],
         batch_count=parameters["capture_batches"],
         phase="warmup",
     )
     measured_schedule = build_alternating_schedule(
-        rounds=parameters["measured_rounds"],
+        iterations_per_arm=parameters["measured_iterations_per_arm"],
         batch_count=parameters["capture_batches"],
         phase="measured",
     )
+    def schedule_contract(schedule, iterations_per_arm):
+        serialized = [entry.to_dict() for entry in schedule]
+        return {
+            "iterations_per_arm": iterations_per_arm,
+            "total_invocations": len(schedule),
+            "iterations_per_arm_segment": (
+                iterations_per_arm // ITERATIONS_PER_ARM_GRANULARITY
+            ),
+            "sha256": canonical_sha256(serialized),
+        }
+
     schedule_payload = {
-        "warmup": [entry.to_dict() for entry in warmup_schedule],
-        "measured": [entry.to_dict() for entry in measured_schedule],
+        "physical_round_order": list(PHYSICAL_ROUND_ORDER),
+        "batch_mapping": (
+            "matched iteration indices in adjacent P/C arm segments use "
+            "pair_index modulo capture_batches"
+        ),
+        "pair_mapping": (
+            "same iteration index across adjacent arm segments 0/1 and 2/3"
+        ),
+        "warmup": schedule_contract(
+            warmup_schedule,
+            parameters["warmup_iterations_per_arm"],
+        ),
+        "measured": schedule_contract(
+            measured_schedule,
+            parameters["measured_iterations_per_arm"],
+        ),
     }
     plan = {
-        "schema_version": 1,
+        "schema_version": 2,
         "status": "DRY_RUN",
         "execution_requested": bool(args.execute),
         "cuda_queried": False,
+        "preregistration": preregistration,
         "parent_config": {
             "path": str(parent_path),
             "sha256": file_sha256(parent_path),
@@ -555,12 +653,10 @@ def _runtime_state_snapshot(model: torch.nn.Module) -> dict[str, Any]:
             path = f"{module_name}.{name}" if module_name else name
             try:
                 captured[path] = raw_fingerprint(value)
-            except VerificationContractError:
-                captured[path] = {
-                    "unsupported_type": (
-                        f"{type(value).__module__}.{type(value).__qualname__}"
-                    )
-                }
+            except VerificationContractError as error:
+                raise VerificationContractError(
+                    f"cannot fingerprint selected runtime state {path}: {error}"
+                ) from error
     return captured
 
 
@@ -569,6 +665,12 @@ def _run_output_sequence(model: torch.nn.Module, batches: Sequence[Any]):
     output_records = []
     for batch_index, batch in enumerate(batches):
         output = model.test_step(_clone_batch(batch))
+        expected_samples = len(batch["data_samples"])
+        if len(output) != expected_samples:
+            raise VerificationContractError(
+                f"parity output has {len(output)} samples, expected "
+                f"{expected_samples}"
+            )
         output_records.append(
             {
                 "batch_index": batch_index,
@@ -586,6 +688,11 @@ def _verify_outputs_and_state(
 ) -> dict[str, Any]:
     for model in models.values():
         _reset_runtime_state(model)
+    state_dict_before = require_same_fingerprint(
+        "pre-inference model state_dict",
+        models[PARENT_ARM].state_dict(),
+        models[CANDIDATE_ARM].state_dict(),
+    )
     initial_rng = _capture_rng(cuda=True)
     _restore_rng(initial_rng, cuda=True)
     parent = _run_output_sequence(models[PARENT_ARM], batches)
@@ -598,9 +705,16 @@ def _verify_outputs_and_state(
             "parent/candidate raw output or runtime-state fingerprints differ"
         )
     require_same_fingerprint("post-inference RNG", parent_rng, candidate_rng)
+    state_dict_after = require_same_fingerprint(
+        "post-inference model state_dict",
+        models[PARENT_ARM].state_dict(),
+        models[CANDIDATE_ARM].state_dict(),
+    )
     _restore_rng(initial_rng, cuda=True)
     return {
         "batches": parent,
+        "state_dict_before": state_dict_before,
+        "state_dict_after": state_dict_after,
         "initial_rng": _rng_digest(initial_rng),
         "final_rng": _rng_digest(parent_rng),
     }
@@ -646,20 +760,31 @@ def _memory_probe(model: torch.nn.Module, batch: Any) -> dict[str, int]:
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
-    before = torch.cuda.memory_allocated()
+    allocated_before = torch.cuda.memory_allocated()
+    reserved_before = torch.cuda.memory_reserved()
     torch.cuda.reset_peak_memory_stats()
     output = model.test_step(_clone_batch(batch))
     torch.cuda.synchronize()
-    peak = torch.cuda.max_memory_allocated()
-    after = torch.cuda.memory_allocated()
+    peak_allocated = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+    allocated_after = torch.cuda.memory_allocated()
+    reserved_after = torch.cuda.memory_reserved()
     sample_count = len(output)
     del output
     torch.cuda.synchronize()
     return {
-        "allocated_before_bytes": before,
-        "allocated_after_output_bytes": after,
-        "peak_allocated_bytes": peak,
-        "peak_increment_over_before_bytes": max(0, peak - before),
+        "allocated_before_bytes": allocated_before,
+        "reserved_before_bytes": reserved_before,
+        "allocated_after_output_bytes": allocated_after,
+        "reserved_after_output_bytes": reserved_after,
+        "peak_allocated_bytes": peak_allocated,
+        "peak_reserved_bytes": peak_reserved,
+        "peak_allocated_increment_over_before_bytes": max(
+            0, peak_allocated - allocated_before
+        ),
+        "peak_reserved_increment_over_before_bytes": max(
+            0, peak_reserved - reserved_before
+        ),
         "sample_count": sample_count,
     }
 
@@ -671,9 +796,11 @@ def _run_schedule(
     batches: Sequence[Any],
     *,
     expected_batch_size: int,
+    sequence_offset: int = 0,
 ) -> list[dict[str, Any]]:
     records = []
-    for sequence_index, entry in enumerate(schedule):
+    for local_index, entry in enumerate(schedule):
+        sequence_index = sequence_offset + local_index
         batch = _clone_batch(batches[entry.batch_index])
         model = models[entry.arm]
         torch.cuda.synchronize()
@@ -707,8 +834,90 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _environment(device: torch.device) -> dict[str, Any]:
+def _nvidia_smi_snapshot(device_index: int) -> dict[str, Any]:
+    gpu_fields = (
+        "timestamp",
+        "index",
+        "uuid",
+        "name",
+        "driver_version",
+        "pstate",
+        "power.draw",
+        "power.limit",
+        "clocks.current.graphics",
+        "clocks.current.memory",
+    )
+    gpu_result = subprocess.run(
+        [
+            "nvidia-smi",
+            f"--id={device_index}",
+            "--query-gpu=" + ",".join(gpu_fields),
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    gpu_rows = [
+        row.strip() for row in gpu_result.stdout.splitlines() if row.strip()
+    ]
+    if len(gpu_rows) != 1:
+        raise VerificationContractError(
+            "nvidia-smi must return exactly one selected GPU row"
+        )
+    app_fields = ("pid", "process_name", "used_gpu_memory", "gpu_uuid")
+    app_result = subprocess.run(
+        [
+            "nvidia-smi",
+            f"--id={device_index}",
+            "--query-compute-apps=" + ",".join(app_fields),
+            "--format=csv,noheader,nounits",
+        ],
+        check=True,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    app_rows = [
+        row.strip() for row in app_result.stdout.splitlines() if row.strip()
+    ]
+    foreign_rows = []
+    for row in app_rows:
+        try:
+            pid = int(row.split(",", 1)[0].strip())
+        except ValueError as error:
+            raise VerificationContractError(
+                f"could not parse nvidia-smi compute-app row: {row}"
+            ) from error
+        if pid != os.getpid():
+            foreign_rows.append(row)
+    if foreign_rows:
+        raise VerificationContractError(
+            "concurrent GPU compute process detected by nvidia-smi"
+        )
+    return {
+        "gpu_fields": list(gpu_fields),
+        "gpu_row": gpu_rows[0],
+        "compute_app_fields": list(app_fields),
+        "compute_app_rows": app_rows,
+        "current_pid": os.getpid(),
+        "foreign_compute_processes": 0,
+    }
+
+
+def _environment(
+    device: torch.device,
+    *,
+    nvidia_smi_start: Mapping[str, Any],
+) -> dict[str, Any]:
     properties = torch.cuda.get_device_properties(device)
+    get_autocast_dtype = getattr(torch, "get_autocast_dtype", None)
+    autocast_dtype = (
+        str(get_autocast_dtype("cuda"))
+        if callable(get_autocast_dtype)
+        else None
+    )
     return {
         "platform": platform.platform(),
         "python": sys.version,
@@ -731,6 +940,18 @@ def _environment(device: torch.device) -> dict[str, Any]:
             "cudnn_benchmark": torch.backends.cudnn.benchmark,
             "cublas_workspace_config": os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
         },
+        "precision": {
+            "default_dtype": str(torch.get_default_dtype()),
+            "autocast_enabled": torch.is_autocast_enabled(),
+            "autocast_dtype": autocast_dtype,
+            "float32_matmul_precision": torch.get_float32_matmul_precision(),
+            "cuda_matmul_allow_tf32": torch.backends.cuda.matmul.allow_tf32,
+            "cudnn_allow_tf32": torch.backends.cudnn.allow_tf32,
+        },
+        "nvidia_smi": {
+            "start": dict(nvidia_smi_start),
+            "end": _nvidia_smi_snapshot(device.index),
+        },
         "environment": {
             name: os.environ.get(name)
             for name in (
@@ -739,6 +960,31 @@ def _environment(device: torch.device) -> dict[str, Any]:
                 "SPARSE4D_ROOT",
                 "FISHEYE3DOD_OFFICIAL_ROOT",
             )
+        },
+    }
+
+
+def _preregistered_decisions(
+    paired_bootstrap: Mapping[str, Any],
+    memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    strict_decision = evaluate_strict_lightweight_gate(
+        paired_bootstrap,
+        memory,
+    )
+    near_native_calculation = evaluate_c32_near_native_gate(
+        paired_bootstrap
+    )
+    return {
+        "strict_lightweight": strict_decision,
+        "c32_vs_c0_near_native": {
+            "numerical_gate_on_current_pair": near_native_calculation,
+            "claim_eligible": False,
+            "decision": "NOT_APPLICABLE_TO_CURRENT_ARM_PAIR",
+            "reason": (
+                "this sealed CLI compares frozen C32 against the C32 "
+                "CPU-metadata candidate, not C0 against C32"
+            ),
         },
     }
 
@@ -796,6 +1042,8 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         _seed_everything(prepared.plan["seed"], cuda=True)
+        nvidia_smi_start = _nvidia_smi_snapshot(device_index)
+        _atomic_json(output_dir / "environment_start.json", nvidia_smi_start)
 
         models, model_contracts = _build_models(prepared, device)
         batches, sample_manifest = _capture_batches(prepared)
@@ -844,37 +1092,83 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         }
         _atomic_json(output_dir / "memory.json", memory)
 
-        for model in models.values():
-            _reset_runtime_state(model)
         warmup_schedule = build_alternating_schedule(
-            rounds=prepared.plan["parameters"]["warmup_rounds"],
+            iterations_per_arm=prepared.plan["parameters"][
+                "warmup_iterations_per_arm"
+            ],
             batch_count=len(batches),
             phase="warmup",
         )
-        warmup_records = _run_schedule(
-            warmup_schedule,
-            models,
-            batches,
-            expected_batch_size=prepared.plan["parameters"]["expected_batch_size"],
-        )
-        _write_jsonl(output_dir / "warmup_timings.jsonl", warmup_records)
-
         measured_schedule = build_alternating_schedule(
-            rounds=prepared.plan["parameters"]["measured_rounds"],
+            iterations_per_arm=prepared.plan["parameters"][
+                "measured_iterations_per_arm"
+            ],
             batch_count=len(batches),
             phase="measured",
         )
+        warmup_records = []
+        measured_records = []
         timing_rng_before = _capture_rng(cuda=True)
-        measured_records = _run_schedule(
-            measured_schedule,
-            models,
-            batches,
-            expected_batch_size=prepared.plan["parameters"]["expected_batch_size"],
-        )
+        for round_index, expected_pattern in enumerate(PHYSICAL_ROUND_ORDER):
+            for model in models.values():
+                _reset_runtime_state(model)
+            for slot_index, token in enumerate(expected_pattern):
+                expected_arm = (
+                    PARENT_ARM if token == "P" else CANDIDATE_ARM
+                )
+                segment_warmup = tuple(
+                    entry
+                    for entry in warmup_schedule
+                    if entry.round_index == round_index
+                    and entry.slot_index == slot_index
+                )
+                segment_measured = tuple(
+                    entry
+                    for entry in measured_schedule
+                    if entry.round_index == round_index
+                    and entry.slot_index == slot_index
+                )
+                if not segment_warmup or not segment_measured:
+                    raise VerificationContractError(
+                        f"physical round {round_index} slot {slot_index} "
+                        "has no timing entries"
+                    )
+                if any(
+                    entry.pattern != expected_pattern
+                    or entry.arm != expected_arm
+                    for entry in segment_warmup + segment_measured
+                ):
+                    raise VerificationContractError(
+                        "runtime schedule violates the preregistered "
+                        "physical arm-segment order"
+                    )
+                warmup_records.extend(
+                    _run_schedule(
+                        segment_warmup,
+                        models,
+                        batches,
+                        expected_batch_size=prepared.plan["parameters"][
+                            "expected_batch_size"
+                        ],
+                        sequence_offset=len(warmup_records),
+                    )
+                )
+                measured_records.extend(
+                    _run_schedule(
+                        segment_measured,
+                        models,
+                        batches,
+                        expected_batch_size=prepared.plan["parameters"][
+                            "expected_batch_size"
+                        ],
+                        sequence_offset=len(measured_records),
+                    )
+                )
         timing_rng_after = _capture_rng(cuda=True)
         require_same_fingerprint(
             "timing RNG stability", timing_rng_before, timing_rng_after
         )
+        _write_jsonl(output_dir / "warmup_timings.jsonl", warmup_records)
         _write_jsonl(output_dir / "raw_timings.jsonl", measured_records)
 
         statistics = {
@@ -895,12 +1189,28 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
                 / statistics[PARENT_ARM]["samples_per_second"]
             ),
         }
+        paired_bootstrap = paired_bootstrap_confidence_intervals(
+            measured_records,
+            expected_pairs=prepared.plan["parameters"][
+                "measured_iterations_per_arm"
+            ],
+            bootstrap_samples=BOOTSTRAP_SAMPLES,
+            seed=BOOTSTRAP_SEED,
+        )
+        decisions = _preregistered_decisions(paired_bootstrap, memory)
+        _atomic_json(output_dir / "paired_bootstrap.json", paired_bootstrap)
+        _atomic_json(output_dir / "preregistered_decision.json", decisions)
+        environment = _environment(
+            device,
+            nvidia_smi_start=nvidia_smi_start,
+        )
+        _atomic_json(output_dir / "environment.json", environment)
         summary = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "COMPLETE",
             "plan_sha256": file_sha256(output_dir / "plan.json"),
             "repository": repository,
-            "environment": _environment(device),
+            "environment": environment,
             "model_contracts": model_contracts,
             "captured_batches": sample_manifest,
             "parity": {
@@ -909,7 +1219,26 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
             },
             "transfer_profile": profile_summary,
             "memory": memory,
+            "measurement_contract": {
+                "physical_round_order": list(PHYSICAL_ROUND_ORDER),
+                "warmup_invocations_per_arm_excluded": prepared.plan[
+                    "parameters"
+                ]["warmup_iterations_per_arm"],
+                "measured_invocations_per_arm": prepared.plan["parameters"][
+                    "measured_iterations_per_arm"
+                ],
+                "warmup_iterations_per_arm_segment": prepared.plan[
+                    "parameters"
+                ]["warmup_iterations_per_segment"],
+                "measured_iterations_per_arm_segment": prepared.plan[
+                    "parameters"
+                ]["measured_iterations_per_segment"],
+                "dataloader_io_in_primary_timing": False,
+                "evaluator_serialization_in_primary_timing": False,
+            },
             "timing_statistics": statistics,
+            "paired_bootstrap": paired_bootstrap,
+            "preregistered_decisions": decisions,
             "raw_artifacts": {
                 name: {
                     "path": str(output_dir / name),
@@ -925,6 +1254,10 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
                     "memory.json",
                     "warmup_timings.jsonl",
                     "raw_timings.jsonl",
+                    "paired_bootstrap.json",
+                    "preregistered_decision.json",
+                    "environment_start.json",
+                    "environment.json",
                 )
             },
         }
@@ -932,7 +1265,7 @@ def execute_verification(prepared: PreparedVerification) -> dict[str, Any]:
         return summary
     except Exception as error:
         failure = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": "FAILED",
             "error_type": type(error).__name__,
             "error": str(error),
