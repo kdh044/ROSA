@@ -244,6 +244,9 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
         "owned_pointwise_consistency": (
             attention_module._mean_pairwise_camera_cosine_owned_inference.__code__
         ),
+        "owned_masked_softmax": (
+            attention_module._masked_softmax_owned_inference.__code__
+        ),
     }
     owned_pointwise_check_code = attention_module._is_owned_plain_fp32_tensor.__code__
 
@@ -303,6 +306,7 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
             "single_ocam_transform": 2,
             "owned_pointwise_check_True": 9,
             "owned_pointwise_consistency": 1,
+            "owned_masked_softmax": 4,
         }
     )
     assert parent_calls == Counter()

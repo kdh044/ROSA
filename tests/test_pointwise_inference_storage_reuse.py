@@ -11,7 +11,9 @@ import rosa.attention as attention_module
 from rosa.attention import (
     PointwiseROSA,
     _is_owned_plain_fp32_tensor,
+    _masked_softmax_owned_inference,
     _mean_pairwise_camera_cosine_owned_inference,
+    masked_softmax,
     mean_pairwise_camera_cosine,
 )
 from rosa.config import ROSAConfig
@@ -148,6 +150,60 @@ def test_owned_tensor_check_requires_independent_plain_storage():
         device=source.device,
         protected=(source,),
     )
+
+
+@pytest.mark.parametrize(
+    ("shape", "dim"),
+    (((2, 3, 4, 13), 2), ((2, 3, 4, 13), 3), ((2, 3, 13), 2)),
+)
+def test_owned_masked_softmax_is_raw_exact_and_consumes_logits(shape, dim):
+    generator = torch.Generator().manual_seed(7_101_080 + dim)
+    logits = torch.randn(shape, generator=generator)
+    valid = torch.rand(shape, generator=generator) > 0.25
+    _inject_fp32_special_values(logits)
+    valid[0, 0] = False
+    expected = masked_softmax(logits, valid, dim)
+    expected_consumed = logits.masked_fill(
+        ~valid,
+        torch.finfo(logits.dtype).min,
+    )
+
+    consumed = logits.clone()
+    pointer = consumed.data_ptr()
+    actual = _masked_softmax_owned_inference(consumed, valid, dim)
+
+    assert _raw_equal(actual, expected)
+    assert _raw_equal(consumed, expected_consumed)
+    assert consumed.data_ptr() == pointer
+    assert actual._base is None
+    assert actual.is_contiguous()
+
+
+def test_owned_masked_softmax_avoids_full_size_zero_and_quotient_outputs():
+    logits = torch.randn(2, 3, 4, 13)
+    valid = torch.rand(2, 3, 4, 13) > 0.25
+
+    class OperationLog(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.operations = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            self.operations.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    log = OperationLog()
+    with log:
+        _masked_softmax_owned_inference(logits, valid, 2)
+    counts = Counter(log.operations)
+    assert counts["aten.masked_fill_.Scalar"] == 2
+    assert counts["aten.clamp_min_.default"] == 1
+    assert counts["aten.div_.Tensor"] == 1
+    assert counts["aten.where.self_out"] == 1
+    assert counts["aten.zeros_like.default"] == 0
+    assert counts["aten.div.Tensor"] == 0
+    assert counts["aten.where.self"] == 0
 
 
 def test_owned_camera_consistency_is_raw_exact_and_consumes_its_input():
@@ -549,6 +605,103 @@ def test_public_normalize_override_is_observed_on_private_fallback(monkeypatch):
 
     assert len(observed_out) == expected_calls
     assert all(value is None for value in observed_out)
+    _assert_encoding_raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("owner", "name"),
+    (
+        (attention_module, "masked_softmax"),
+        (torch, "finfo"),
+        (torch, "softmax"),
+        (torch, "where"),
+        (torch, "zeros_like"),
+    ),
+)
+def test_masked_softmax_primitive_override_disables_owned_route(
+    monkeypatch,
+    owner,
+    name,
+):
+    module, features, geometry, relation, valid, query = _fixture()
+    released = getattr(owner, name)
+    calls = []
+
+    def overridden(*args, **kwargs):
+        calls.append(None)
+        return released(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, overridden)
+    with torch.no_grad():
+        assert not module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+        assert calls
+        calls.clear()
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    assert calls
+    _assert_encoding_raw_equal(actual, expected)
+
+
+def test_owned_masked_softmax_override_is_not_invoked(monkeypatch):
+    module, features, geometry, relation, valid, query = _fixture()
+    with torch.no_grad():
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden owned masked softmax executed")
+
+    monkeypatch.setattr(
+        attention_module,
+        "_masked_softmax_owned_inference",
+        must_not_run,
+    )
+    with torch.no_grad():
+        assert not module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
     _assert_encoding_raw_equal(actual, expected)
 
 

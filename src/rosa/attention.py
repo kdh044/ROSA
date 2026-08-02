@@ -30,6 +30,30 @@ def masked_softmax(logits: Tensor, valid: Tensor, dim: int) -> Tensor:
     )
 
 
+def _masked_softmax_owned_inference(
+    logits: Tensor,
+    valid: Tensor,
+    dim: int,
+) -> Tensor:
+    """Consume owned FP32 logits while preserving masked-softmax bit patterns."""
+
+    if logits.shape != valid.shape or valid.dtype != torch.bool:
+        raise ValueError("masked softmax tensors are misaligned")
+    invalid = ~valid
+    logits.masked_fill_(invalid, torch.finfo(logits.dtype).min)
+    weights = torch.softmax(logits.float(), dim=dim).to(logits.dtype)
+    weights.masked_fill_(invalid, 0)
+    denominator = weights.sum(dim=dim, keepdim=True)
+    positive = denominator > 0
+    denominator.clamp_min_(1e-8)
+    weights.div_(denominator)
+    # A NaN denominator makes the released comparison false and selects a
+    # freshly allocated positive zero. Retain that behavior without another
+    # full-size quotient, zero, and final-output allocation.
+    torch.where(positive, weights, weights.new_zeros(()), out=weights)
+    return weights
+
+
 def mean_pairwise_camera_cosine(values: Tensor, valid: Tensor) -> Tensor:
     """Average valid camera-pair cosine without materializing ``C x C``."""
 
@@ -263,7 +287,13 @@ class PointwiseROSA(nn.Module):
             or _mean_pairwise_camera_cosine_owned_inference
             is not _RELEASED_OWNED_CONSISTENCY
             or mean_pairwise_camera_cosine is not _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE
+            or masked_softmax is not _RELEASED_MASKED_SOFTMAX
+            or _masked_softmax_owned_inference is not _RELEASED_OWNED_MASKED_SOFTMAX
             or F.normalize is not _RELEASED_FUNCTIONAL_NORMALIZE
+            or torch.finfo is not _RELEASED_TORCH_FINFO
+            or torch.softmax is not _RELEASED_TORCH_SOFTMAX
+            or torch.where is not _RELEASED_TORCH_WHERE
+            or torch.zeros_like is not _RELEASED_TORCH_ZEROS_LIKE
             or any(
                 "_call_impl" in module.__dict__
                 or type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
@@ -758,7 +788,12 @@ class PointwiseROSA(nn.Module):
         if self.cfg.uniform_camera_fusion:
             logits = logits * 0.0
 
-        camera_weights = masked_softmax(logits, valid, dim=2)
+        if reuse_owned_pointwise_storage:
+            # Every admitted branch above ends in released out-of-place
+            # arithmetic, so ``logits`` is a fresh private tensor here.
+            camera_weights = _masked_softmax_owned_inference(logits, valid, dim=2)
+        else:
+            camera_weights = masked_softmax(logits, valid, dim=2)
         values = self.value_proj(lifted)
         if reuse_owned_pointwise_storage and values is not lifted:
             reuse_owned_pointwise_storage = False
@@ -816,7 +851,16 @@ class PointwiseROSA(nn.Module):
             point_logits = point_logits / math.sqrt(self.cfg.embed_dims)
         if self.cfg.uniform_point_fusion:
             point_logits = point_logits * 0.0
-        point_weights = masked_softmax(point_logits, point_valid, dim=2)
+        if reuse_owned_pointwise_storage:
+            # The owned normalized-point reduction creates these logits and
+            # neither diagnostics nor a public return retain them.
+            point_weights = _masked_softmax_owned_inference(
+                point_logits,
+                point_valid,
+                dim=2,
+            )
+        else:
+            point_weights = masked_softmax(point_logits, point_valid, dim=2)
         if reuse_owned_pointwise_storage:
             torch.mul(point_weights[..., None], point_features, out=point_features)
             object_feature = point_features.sum(dim=2)
@@ -956,7 +1000,13 @@ _RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
 _RELEASED_OWNED_TENSOR_CHECK = _is_owned_plain_fp32_tensor
 _RELEASED_OWNED_CONSISTENCY = _mean_pairwise_camera_cosine_owned_inference
 _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE = mean_pairwise_camera_cosine
+_RELEASED_MASKED_SOFTMAX = masked_softmax
+_RELEASED_OWNED_MASKED_SOFTMAX = _masked_softmax_owned_inference
 _RELEASED_FUNCTIONAL_NORMALIZE = F.normalize
+_RELEASED_TORCH_FINFO = torch.finfo
+_RELEASED_TORCH_SOFTMAX = torch.softmax
+_RELEASED_TORCH_WHERE = torch.where
+_RELEASED_TORCH_ZEROS_LIKE = torch.zeros_like
 _RELEASED_RFL_REUSE_GUARD = SphericalRayFeatureLifting._can_reuse_owned_delta
 _RELEASED_MODULE_CALL = nn.Module.__call__
 _RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
