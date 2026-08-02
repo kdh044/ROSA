@@ -9,8 +9,10 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from projects.mmdet3d_plugin.models.instance_bank import InstanceBank
-
+from projects.mmdet3d_plugin.models.instance_bank import (
+    InstanceBank,
+    _fresh_non_temporal_instance_id_shape,
+)
 
 RESET_STATE = (
     "cached_feature",
@@ -92,7 +94,10 @@ def _assert_bank_runtime_equal(actual, expected):
         )
 
 
-@pytest.mark.parametrize("dtype", (torch.float16, torch.float32, torch.float64))
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+)
 def test_fresh_non_temporal_ids_are_integer_view_exact(dtype):
     confidence, anchor = _fixture()
     confidence = confidence.to(dtype)
@@ -147,6 +152,82 @@ def test_fresh_non_temporal_ids_skip_confidence_and_scatter_graph():
     assert not any("sigmoid" in name for name in candidate_log.names)
     assert not any("index_put" in name for name in candidate_log.names)
     assert sum("arange" in name for name in candidate_log.names) == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    (
+        "integer",
+        "boolean",
+        "complex",
+        "quantized",
+        "mkldnn",
+        "sparse",
+        "meta",
+        "named",
+    ),
+)
+def test_fresh_id_specialization_rejects_nonconventional_tensors(case):
+    confidence, anchor = _fixture()
+    if case == "integer":
+        confidence = confidence.to(torch.int64)
+    elif case == "boolean":
+        confidence = confidence > 0
+    elif case == "complex":
+        confidence = confidence.to(torch.complex64)
+    elif case == "quantized":
+        confidence = torch.quantize_per_tensor(
+            confidence,
+            scale=0.1,
+            zero_point=0,
+            dtype=torch.qint8,
+        )
+    elif case == "mkldnn":
+        confidence = confidence.to_mkldnn()
+    elif case == "sparse":
+        confidence = torch.sparse_coo_tensor(
+            torch.empty((3, 0), dtype=torch.long),
+            torch.empty((0,), dtype=torch.float32),
+            size=confidence.shape,
+        )
+    elif case == "meta":
+        confidence = torch.empty(confidence.shape, device="meta")
+    elif case == "named":
+        confidence = confidence.refine_names("batch", "query", "class")
+
+    with torch.inference_mode():
+        assert (
+            _fresh_non_temporal_instance_id_shape(
+                _bank(),
+                confidence,
+                anchor,
+                None,
+            )
+            is None
+        )
+
+
+@pytest.mark.parametrize("dtype", (torch.int64, torch.bool))
+def test_supported_nonfloating_ids_use_the_historical_route(dtype):
+    confidence, anchor = _fixture()
+    confidence = confidence.to(dtype)
+    reference = _bank()
+    candidate = _bank()
+    operation_log = []
+
+    class Operations(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            operation_log.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    with torch.inference_mode():
+        expected = _historical_get_instance_id(reference, confidence, anchor)
+    with torch.inference_mode(), Operations():
+        actual = candidate.get_instance_id(confidence, anchor)
+
+    _assert_value_equal(actual, expected)
+    _assert_bank_runtime_equal(candidate, reference)
+    assert any("max.dim" in name for name in operation_log)
 
 
 @pytest.mark.parametrize(
@@ -213,4 +294,3 @@ def test_fresh_id_specialization_fails_closed(case):
     _assert_value_equal(actual, expected)
     _assert_bank_runtime_equal(candidate, reference)
     assert any("max.dim" in name for name in operation_log)
-
