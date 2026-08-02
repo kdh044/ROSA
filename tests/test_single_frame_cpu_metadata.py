@@ -23,6 +23,7 @@ from rosa.integrations.fisheye3dod.model import (
 from rosa.integrations.sparse4d import (
     ROSANativeBaselineHead,
     ROSAOfficialResidualNativeBaselineHead,
+    ROSARefinementHead,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -199,26 +200,31 @@ def _audited_head(
     return head
 
 
-def test_only_exact_audited_non_temporal_c0_c32_heads_are_accepted():
+def test_only_exact_audited_non_temporal_heads_are_accepted():
     class ExtendedC0Head(ROSANativeBaselineHead):
+        pass
+
+    class ExtendedROSAHead(ROSARefinementHead):
         pass
 
     for head_type in (
         ROSANativeBaselineHead,
         ROSAOfficialResidualNativeBaselineHead,
+        ROSARefinementHead,
     ):
         _require_temporal_free_metadata_path(_audited_head(head_type=head_type))
-    with pytest.raises(TypeError, match="exact C0/C32"):
-        _require_temporal_free_metadata_path(
-            _audited_head(head_type=ExtendedC0Head)
-        )
+    for extended_type in (ExtendedC0Head, ExtendedROSAHead):
+        with pytest.raises(TypeError, match="exact audited temporal-free"):
+            _require_temporal_free_metadata_path(
+                _audited_head(head_type=extended_type)
+            )
 
     with pytest.raises(ValueError, match="num_temp_instances=0"):
         _require_temporal_free_metadata_path(_audited_head(count=1))
     for invalid in (0.5, "0", True, None):
         with pytest.raises(TypeError, match="exact integer zero"):
             _require_temporal_free_metadata_path(_audited_head(count=invalid))
-    with pytest.raises(TypeError, match="exact C0/C32"):
+    with pytest.raises(TypeError, match="exact audited temporal-free"):
         _require_temporal_free_metadata_path(
             SimpleNamespace(instance_bank=SimpleNamespace(num_temp_instances=0))
         )

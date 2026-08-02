@@ -15,6 +15,7 @@ from projects.mmdet3d_plugin.models.sparse4d import Sparse4D
 from rosa.integrations.sparse4d import (
     ROSANativeBaselineHead,
     ROSAOfficialResidualNativeBaselineHead,
+    ROSARefinementHead,
 )
 
 
@@ -140,10 +141,11 @@ def _require_temporal_free_metadata_path(head) -> None:
     if type(head) not in (
         ROSANativeBaselineHead,
         ROSAOfficialResidualNativeBaselineHead,
+        ROSARefinementHead,
     ):
         raise TypeError(
             "single-frame CPU metadata is sealed to the exact "
-            "C0/C32 native baseline heads"
+            "audited temporal-free heads"
         )
     instance_bank = getattr(head, "instance_bank", None)
     raw_count = getattr(instance_bank, "num_temp_instances", None)
