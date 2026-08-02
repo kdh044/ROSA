@@ -311,6 +311,7 @@ def test_private_pointwise_impl_reuses_only_the_requested_outputs(
     assert counts["aten.mul_.Tensor"] == expected_mask_mul
     assert counts["aten.nan_to_num_.default"] == expected_mask_mul
     assert counts["aten.pow_.Scalar"] == 2 * expected_mask_mul
+    assert counts["aten.div.out"] == expected_mask_mul
 
 
 def test_pointwise_storage_guard_rejects_dtype_layout_alias_and_module_drift():
@@ -503,6 +504,51 @@ def test_public_consistency_override_is_observed_on_private_fallback(monkeypatch
         )
 
     assert calls == [None]
+    _assert_encoding_raw_equal(actual, expected)
+
+
+def test_public_normalize_override_is_observed_on_private_fallback(monkeypatch):
+    module, features, geometry, relation, valid, query = _fixture()
+    released_normalize = torch.nn.functional.normalize
+    observed_out = []
+
+    def overridden(*args, **kwargs):
+        observed_out.append(kwargs.get("out"))
+        return released_normalize(*args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "normalize", overridden)
+    with torch.no_grad():
+        assert not module._can_reuse_owned_pointwise_storage(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            "candidate",
+        )
+        expected = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+        expected_calls = len(observed_out)
+        assert expected_calls > 0
+        assert all(value is None for value in observed_out)
+        observed_out.clear()
+        actual = module._forward_compact_lean_inference(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+
+    assert len(observed_out) == expected_calls
+    assert all(value is None for value in observed_out)
     _assert_encoding_raw_equal(actual, expected)
 
 

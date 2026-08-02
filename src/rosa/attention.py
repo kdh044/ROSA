@@ -263,6 +263,7 @@ class PointwiseROSA(nn.Module):
             or _mean_pairwise_camera_cosine_owned_inference
             is not _RELEASED_OWNED_CONSISTENCY
             or mean_pairwise_camera_cosine is not _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE
+            or F.normalize is not _RELEASED_FUNCTIONAL_NORMALIZE
             or any(
                 "_call_impl" in module.__dict__
                 or type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
@@ -834,7 +835,16 @@ class PointwiseROSA(nn.Module):
         else:
             if reuse_owned_pointwise_storage:
                 values.nan_to_num_()
-                normalized_values = F.normalize(values, dim=-1, eps=1e-6)
+                # Candidate camera fusion has already consumed ``values`` and
+                # no returned field retains it. Normalize that private RFL
+                # output in place instead of allocating another complete
+                # [B,N,C,P,D] buffer solely for the consistency reduction.
+                normalized_values = F.normalize(
+                    values,
+                    dim=-1,
+                    eps=1e-6,
+                    out=values,
+                )
             else:
                 normalized_values = F.normalize(
                     torch.nan_to_num(values.float()),
@@ -842,11 +852,15 @@ class PointwiseROSA(nn.Module):
                     eps=1e-6,
                 )
             if self.cfg.architecture_profile == "compact":
-                if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
-                    normalized_values,
-                    shape=values.shape,
-                    device=features.device,
-                    protected=(values, valid),
+                if (
+                    reuse_owned_pointwise_storage
+                    and normalized_values is values
+                    and _is_owned_plain_fp32_tensor(
+                        normalized_values,
+                        shape=values.shape,
+                        device=features.device,
+                        protected=(valid,),
+                    )
                 ):
                     point_consistency = _mean_pairwise_camera_cosine_owned_inference(
                         normalized_values,
@@ -942,6 +956,7 @@ _RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
 _RELEASED_OWNED_TENSOR_CHECK = _is_owned_plain_fp32_tensor
 _RELEASED_OWNED_CONSISTENCY = _mean_pairwise_camera_cosine_owned_inference
 _RELEASED_MEAN_PAIRWISE_CAMERA_COSINE = mean_pairwise_camera_cosine
+_RELEASED_FUNCTIONAL_NORMALIZE = F.normalize
 _RELEASED_RFL_REUSE_GUARD = SphericalRayFeatureLifting._can_reuse_owned_delta
 _RELEASED_MODULE_CALL = nn.Module.__call__
 _RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
