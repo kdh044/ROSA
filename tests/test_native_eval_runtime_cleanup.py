@@ -93,6 +93,28 @@ def _assert_nested_raw_equal(left, right) -> None:
         assert left == right
 
 
+def _snapshot_rng():
+    return (
+        torch.get_rng_state().clone(),
+        random.getstate(),
+        np.random.get_state(),
+    )
+
+
+def _restore_rng(state) -> None:
+    torch.set_rng_state(state[0])
+    random.setstate(state[1])
+    np.random.set_state(state[2])
+
+
+def _assert_rng_equal(left, right) -> None:
+    assert torch.equal(left[0], right[0])
+    assert left[1] == right[1]
+    assert left[2][0] == right[2][0]
+    assert np.array_equal(left[2][1], right[2][1])
+    assert left[2][2:] == right[2][2:]
+
+
 def _install_cpu_daf(monkeypatch) -> None:
     from projects.mmdet3d_plugin.models import blocks
 
@@ -189,24 +211,55 @@ def test_native_eval_cleanup_is_raw_exact_and_releases_d0_d4_queries(
     )
     feature_maps, metas = _head_fixture()
 
-    torch_rng = torch.get_rng_state().clone()
-    python_rng = random.getstate()
-    numpy_rng = np.random.get_state()
+    # Fresh native DAFs historically create three debug attributes on their
+    # first call.  The cleanup must fail closed until that exact __dict__
+    # schema exists, so both sides take the historical warm-up path.
+    candidate_deformable = [
+        layer
+        for operation, layer in zip(
+            candidate.head.operation_order, candidate.head.layers
+        )
+        if operation == "deformable"
+    ]
+    assert not candidate.head._strict_native_eval_cleanup_enabled(False)
+    assert any(
+        name not in layer.__dict__
+        for layer in candidate_deformable
+        for name in layer._STRICT_NATIVE_EVAL_CLEAR_ONLY_ATTRIBUTES
+    )
+    warmup_rng = _snapshot_rng()
+    reference_warmup, reference_warmup_decoded, reference_warmup_alive = (
+        _run_eval_with_liveness(reference.head, feature_maps, metas)
+    )
+    reference_warmup_rng_after = _snapshot_rng()
+    _restore_rng(warmup_rng)
+    candidate_warmup, candidate_warmup_decoded, candidate_warmup_alive = (
+        _run_eval_with_liveness(candidate.head, feature_maps, metas)
+    )
+    candidate_warmup_rng_after = _snapshot_rng()
+    _assert_nested_raw_equal(reference_warmup, candidate_warmup)
+    _assert_nested_raw_equal(
+        reference_warmup_decoded, candidate_warmup_decoded
+    )
+    _assert_rng_equal(reference_warmup_rng_after, candidate_warmup_rng_after)
+    assert reference_warmup_alive == candidate_warmup_alive == [0, 1, 2, 3, 4, 5]
+    assert candidate.head._strict_native_eval_cleanup_enabled(False)
+
+    # The second call is the first eligible cleanup call.
+    second_call_rng = _snapshot_rng()
     reference_output, reference_decoded, reference_alive = (
         _run_eval_with_liveness(reference.head, feature_maps, metas)
     )
-    reference_rng_after = torch.get_rng_state().clone()
-    random.setstate(python_rng)
-    np.random.set_state(numpy_rng)
-    torch.set_rng_state(torch_rng)
+    reference_rng_after = _snapshot_rng()
+    _restore_rng(second_call_rng)
     candidate_output, candidate_decoded, candidate_alive = (
         _run_eval_with_liveness(candidate.head, feature_maps, metas)
     )
-    candidate_rng_after = torch.get_rng_state().clone()
+    candidate_rng_after = _snapshot_rng()
 
     _assert_nested_raw_equal(reference_output, candidate_output)
     _assert_nested_raw_equal(reference_decoded, candidate_decoded)
-    assert torch.equal(reference_rng_after, candidate_rng_after)
+    _assert_rng_equal(reference_rng_after, candidate_rng_after)
     _assert_nested_raw_equal(reference.state_dict(), candidate.state_dict())
     assert len(reference.state_dict()) == len(candidate.state_dict()) == 595
     assert sum(value.numel() for value in reference.parameters()) == 29_667_109
@@ -244,9 +297,11 @@ def test_native_eval_cleanup_is_raw_exact_and_releases_d0_d4_queries(
             continue
         assert candidate_layer._strict_native_eval_diagnostics_are_clear()
         for name in candidate_layer._STRICT_NATIVE_EVAL_CLEAR_ONLY_ATTRIBUTES:
+            assert name in reference_layer.__dict__
+            assert name in candidate_layer.__dict__
             _assert_nested_raw_equal(
-                getattr(reference_layer, name, None),
-                getattr(candidate_layer, name, None),
+                reference_layer.__dict__[name],
+                candidate_layer.__dict__[name],
             )
         _assert_nested_raw_equal(
             reference_layer._last_base_key_points,
@@ -266,6 +321,10 @@ def test_native_eval_cleanup_fails_closed_for_training_extensions_and_stale_stat
         "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py"
     )
     head = model.head
+    feature_maps, metas = _head_fixture()
+    assert not head._strict_native_eval_cleanup_enabled(False)
+    with torch.inference_mode():
+        head(feature_maps, metas)
     assert head._strict_native_eval_cleanup_enabled(False)
     head.train()
     assert not head._strict_native_eval_cleanup_enabled(False)
@@ -292,11 +351,22 @@ def test_native_eval_cleanup_fails_closed_for_training_extensions_and_stale_stat
     )
     deformable._last_view_support = torch.ones(1)
     assert not deformable._strict_native_eval_diagnostics_are_clear()
-    feature_maps, metas = _head_fixture()
     with torch.inference_mode():
         head(feature_maps, metas)
     assert deformable._last_view_support is None
     assert deformable._strict_native_eval_diagnostics_are_clear()
+
+    missing_name = "_last_aggregation_weights"
+    del deformable.__dict__[missing_name]
+    assert not hasattr(deformable, missing_name)
+    assert not deformable._strict_native_eval_diagnostics_are_clear()
+    assert not head._strict_native_eval_cleanup_enabled(False)
+    with torch.inference_mode():
+        head(feature_maps, metas)
+    assert missing_name in deformable.__dict__
+    assert deformable.__dict__[missing_name] is None
+    assert deformable._strict_native_eval_diagnostics_are_clear()
+    assert head._strict_native_eval_cleanup_enabled(False)
 
     # The fallback must retain the historical external-subclass call
     # signature: an explicit forward accepting the established spherical-RoI
@@ -324,19 +394,236 @@ def test_native_eval_cleanup_fails_closed_for_training_extensions_and_stale_stat
         )
 
     deformable.forward = MethodType(explicit_forward, deformable)
-    head._diagnostic_return_all_cls = True
+    assert not head._strict_native_eval_cleanup_enabled(False)
     with torch.inference_mode():
         head(feature_maps, metas)
 
 
-def test_training_forward_gradients_and_one_step_stay_raw_exact(monkeypatch):
+def test_native_eval_cleanup_rejects_instance_shadowed_callables(monkeypatch):
+    _install_cpu_daf(monkeypatch)
+    model = _build_exact_model(
+        "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py"
+    )
+    head = model.head
+    feature_maps, metas = _head_fixture()
+    with torch.inference_mode():
+        head(feature_maps, metas)
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+    # Instance-level head extension hooks must be resolved, not inferred from
+    # the class alone.
+    for name in (
+        "_post_deformable_query_feature",
+        "_pre_refine_query_feature",
+        "_post_refine_task_outputs",
+    ):
+        original = getattr(head, name)
+        calls = []
+
+        def shadowed_head_hook(_self, *args, _original=original, **kwargs):
+            calls.append(True)
+            return _original(*args, **kwargs)
+
+        setattr(head, name, MethodType(shadowed_head_hook, head))
+        assert name in head.__dict__
+        assert not head._strict_native_eval_cleanup_enabled(False)
+        with torch.inference_mode():
+            head(feature_maps, metas)
+        assert calls
+        delattr(head, name)
+        assert head._strict_native_eval_cleanup_enabled(False)
+
+    deformable = next(
+        layer
+        for operation, layer in zip(head.operation_order, head.layers)
+        if operation == "deformable"
+    )
+
+    # A shadowed forward with the historical explicit signature must never
+    # receive the private cleanup keyword.
+    original_forward = deformable.forward
+    forward_calls = []
+
+    def shadowed_forward(
+        _self,
+        instance_feature,
+        anchor,
+        anchor_embed,
+        maps,
+        metadata,
+        spherical_object_roi_query_confidence=None,
+    ):
+        forward_calls.append(True)
+        return original_forward(
+            instance_feature,
+            anchor,
+            anchor_embed,
+            maps,
+            metadata,
+            spherical_object_roi_query_confidence=(
+                spherical_object_roi_query_confidence
+            ),
+        )
+
+    deformable.forward = MethodType(shadowed_forward, deformable)
+    assert not head._strict_native_eval_cleanup_enabled(False)
+    with torch.inference_mode():
+        head(feature_maps, metas)
+    assert forward_calls
+    delattr(deformable, "forward")
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+    # The two DAF helpers also retain their historical signatures whenever an
+    # instance extension shadows the audited implementation.
+    original_keypoints = deformable._get_camera_conditioned_key_points
+    keypoint_calls = []
+
+    def shadowed_keypoints(
+        _self,
+        key_points,
+        anchor,
+        metadata,
+        instance_feature=None,
+    ):
+        keypoint_calls.append(True)
+        return original_keypoints(
+            key_points,
+            anchor,
+            metadata,
+            instance_feature,
+        )
+
+    deformable._get_camera_conditioned_key_points = MethodType(
+        shadowed_keypoints, deformable
+    )
+    assert not head._strict_native_eval_cleanup_enabled(False)
+    with torch.inference_mode():
+        head(feature_maps, metas)
+    assert keypoint_calls
+    delattr(deformable, "_get_camera_conditioned_key_points")
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+    original_weights = deformable._get_weights
+    weight_calls = []
+
+    def shadowed_weights(
+        _self,
+        instance_feature,
+        anchor_embed,
+        metadata=None,
+        geometry_confidence=None,
+        geometry_relation=None,
+        view_features=None,
+    ):
+        weight_calls.append(True)
+        return original_weights(
+            instance_feature,
+            anchor_embed,
+            metadata,
+            geometry_confidence,
+            geometry_relation,
+            view_features,
+        )
+
+    deformable._get_weights = MethodType(shadowed_weights, deformable)
+    assert not head._strict_native_eval_cleanup_enabled(False)
+    with torch.inference_mode():
+        head(feature_maps, metas)
+    assert weight_calls
+    delattr(deformable, "_get_weights")
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+
+def test_native_eval_cleanup_hides_private_keyword_from_daf_hooks(monkeypatch):
+    _install_cpu_daf(monkeypatch)
+    model = _build_exact_model("rosa_r18_main126_v2_c0_cbgs_native.py")
+    head = model.head
+    feature_maps, metas = _head_fixture()
+    with torch.inference_mode():
+        head(feature_maps, metas)
+    assert head._strict_native_eval_cleanup_enabled(False)
+    deformable = next(
+        layer
+        for operation, layer in zip(head.operation_order, head.layers)
+        if operation == "deformable"
+    )
+
+    observed_pre_kwargs = []
+
+    def pre_hook(_module, _args, kwargs):
+        observed_pre_kwargs.append(dict(kwargs))
+
+    handle = deformable.register_forward_pre_hook(pre_hook, with_kwargs=True)
+    try:
+        assert not head._strict_native_eval_cleanup_enabled(False)
+        with torch.inference_mode():
+            head(feature_maps, metas)
+    finally:
+        handle.remove()
+    assert observed_pre_kwargs
+    assert all(
+        "_strict_native_eval_cleanup" not in kwargs
+        for kwargs in observed_pre_kwargs
+    )
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+    observed_post_kwargs = []
+
+    def post_hook(_module, _args, kwargs, output):
+        del output
+        observed_post_kwargs.append(dict(kwargs))
+
+    handle = deformable.register_forward_hook(post_hook, with_kwargs=True)
+    try:
+        assert not head._strict_native_eval_cleanup_enabled(False)
+        with torch.inference_mode():
+            head(feature_maps, metas)
+    finally:
+        handle.remove()
+    assert observed_post_kwargs
+    assert all(
+        "_strict_native_eval_cleanup" not in kwargs
+        for kwargs in observed_post_kwargs
+    )
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+    from torch.nn.modules import module as torch_module
+
+    observed_global_kwargs = []
+
+    def global_post_hook(module, _args, kwargs, output):
+        del output
+        if module is deformable:
+            observed_global_kwargs.append(dict(kwargs))
+
+    handle = torch_module.register_module_forward_hook(
+        global_post_hook,
+        with_kwargs=True,
+    )
+    try:
+        assert not head._strict_native_eval_cleanup_enabled(False)
+        with torch.inference_mode():
+            head(feature_maps, metas)
+    finally:
+        handle.remove()
+    assert observed_global_kwargs
+    assert all(
+        "_strict_native_eval_cleanup" not in kwargs
+        for kwargs in observed_global_kwargs
+    )
+    assert head._strict_native_eval_cleanup_enabled(False)
+
+
+def test_training_fallback_is_repeatable_within_candidate_revision(monkeypatch):
+    """Check determinism only; this is not a frozen-parent differential."""
+
     _install_cpu_daf(monkeypatch)
     baseline = _build_exact_model(
         "rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual.py"
     ).head
-    reference = copy.deepcopy(baseline).train()
-    candidate = baseline.train()
-    for head in (reference, candidate):
+    first = copy.deepcopy(baseline).train()
+    second = baseline.train()
+    for head in (first, second):
         head.sampler.get_dn_anchors = MethodType(
             lambda _self, *_args, **_kwargs: None,
             head.sampler,
@@ -344,10 +631,10 @@ def test_training_forward_gradients_and_one_step_stay_raw_exact(monkeypatch):
         assert not head._strict_native_eval_cleanup_enabled(False)
     feature_maps, metas = _head_fixture()
     metas.update(gt_labels_3d=[], gt_bboxes_3d=[])
-    initial_rng = torch.get_rng_state().clone()
+    initial_rng = _snapshot_rng()
 
     def train_step(head):
-        torch.set_rng_state(initial_rng)
+        _restore_rng(initial_rng)
         optimizer = torch.optim.SGD(head.parameters(), lr=1e-4)
         optimizer.zero_grad(set_to_none=True)
         output = head(feature_maps, metas)
@@ -363,20 +650,20 @@ def test_training_forward_gradients_and_one_step_stay_raw_exact(monkeypatch):
             for name, parameter in head.named_parameters()
         }
         optimizer.step()
-        return loss.detach(), gradients, torch.get_rng_state().clone()
+        return loss.detach(), gradients, _snapshot_rng()
 
-    reference_loss, reference_gradients, reference_rng = train_step(reference)
-    candidate_loss, candidate_gradients, candidate_rng = train_step(candidate)
-    assert _raw_equal(reference_loss, candidate_loss)
-    assert torch.equal(reference_rng, candidate_rng)
-    assert reference_gradients.keys() == candidate_gradients.keys()
-    for name in reference_gradients:
-        left = reference_gradients[name]
-        right = candidate_gradients[name]
+    first_loss, first_gradients, first_rng = train_step(first)
+    second_loss, second_gradients, second_rng = train_step(second)
+    assert _raw_equal(first_loss, second_loss)
+    _assert_rng_equal(first_rng, second_rng)
+    assert first_gradients.keys() == second_gradients.keys()
+    for name in first_gradients:
+        left = first_gradients[name]
+        right = second_gradients[name]
         assert (left is None) == (right is None)
         if left is not None:
             assert _raw_equal(left, right)
-    _assert_nested_raw_equal(reference.state_dict(), candidate.state_dict())
+    _assert_nested_raw_equal(first.state_dict(), second.state_dict())
 
 
 @pytest.mark.parametrize(
@@ -400,10 +687,12 @@ def test_backbone_signature_route_survives_pickle_and_cpu_ddp(
         use_deformable_func=False,
     )
     assert model._img_backbone_accepts_metas is accepts_metas
+    assert "_img_backbone_forward_identity_cache" in model.__dict__
     original_keys = tuple(model.state_dict())
     payload = pickle.dumps(model)
     restored = pickle.loads(payload)
     assert restored._img_backbone_accepts_metas is accepts_metas
+    assert "_img_backbone_forward_identity_cache" in restored.__dict__
     assert tuple(restored.state_dict()) == original_keys
 
     import projects.mmdet3d_plugin.models.sparse4d as sparse4d_module
@@ -439,3 +728,91 @@ def test_backbone_signature_route_survives_pickle_and_cpu_ddp(
         assert tuple(wrapped.module.state_dict()) == original_keys
     finally:
         dist.destroy_process_group()
+
+
+def test_backbone_signature_route_refreshes_only_after_forward_rebind(
+    monkeypatch,
+):
+    model = Sparse4D(
+        img_backbone=dict(type="RuntimeCleanupBackbonePlain"),
+        head=dict(type="RuntimeCleanupHead"),
+        use_grid_mask=False,
+        use_deformable_func=False,
+    )
+    import projects.mmdet3d_plugin.models.sparse4d as sparse4d_module
+
+    real_signature = sparse4d_module.signature
+    inspected = []
+
+    def counted_signature(method):
+        inspected.append(method)
+        return real_signature(method)
+
+    monkeypatch.setattr(sparse4d_module, "signature", counted_signature)
+    image = torch.ones(1, 1, 1, 2, 2)
+    metas = {"backbone_offset": torch.tensor(3.0)}
+
+    plain = model.extract_feat(image, metas=metas)
+    assert plain[0].mean().item() == 2.0
+    assert inspected == []
+
+    model.img_backbone.forward = MethodType(
+        _RuntimeCleanupBackboneMetas.forward,
+        model.img_backbone,
+    )
+    routed = model.extract_feat(image, metas=metas)
+    assert routed[0].mean().item() == 5.0
+    assert len(inspected) == 1
+    model.extract_feat(image, metas=metas)
+    assert len(inspected) == 1
+
+    model.img_backbone.forward = MethodType(
+        _RuntimeCleanupBackbonePlain.forward,
+        model.img_backbone,
+    )
+    plain_again = model.extract_feat(image, metas=metas)
+    assert plain_again[0].mean().item() == 2.0
+    assert len(inspected) == 2
+    model.extract_feat(image, metas=metas)
+    assert len(inspected) == 2
+
+
+def test_backbone_signature_route_lazily_migrates_legacy_full_module_pickle(
+    monkeypatch,
+):
+    model = Sparse4D(
+        img_backbone=dict(type="RuntimeCleanupBackbonePlain"),
+        head=dict(type="RuntimeCleanupHead"),
+        use_grid_mask=False,
+        use_deformable_func=False,
+    )
+    del model.__dict__["_img_backbone_forward_identity_cache"]
+    del model.__dict__["_img_backbone_accepts_metas"]
+    restored = pickle.loads(pickle.dumps(model))
+    assert "_img_backbone_forward_identity_cache" not in restored.__dict__
+    assert "_img_backbone_accepts_metas" not in restored.__dict__
+
+    import projects.mmdet3d_plugin.models.sparse4d as sparse4d_module
+
+    real_signature = sparse4d_module.signature
+    inspected = []
+
+    def counted_signature(method):
+        inspected.append(method)
+        return real_signature(method)
+
+    monkeypatch.setattr(sparse4d_module, "signature", counted_signature)
+    image = torch.ones(1, 1, 1, 2, 2)
+    output = restored.extract_feat(
+        image,
+        metas={"backbone_offset": torch.tensor(3.0)},
+    )
+    assert output[0].mean().item() == 2.0
+    assert len(inspected) == 1
+    assert restored._img_backbone_accepts_metas is False
+    assert "_img_backbone_forward_identity_cache" in restored.__dict__
+    restored.extract_feat(
+        image,
+        metas={"backbone_offset": torch.tensor(3.0)},
+    )
+    assert len(inspected) == 1
