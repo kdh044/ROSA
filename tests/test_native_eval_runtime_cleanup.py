@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 import pickle
 import random
@@ -21,7 +22,12 @@ pytest.importorskip("mmengine")
 pytest.importorskip("mmdet3d")
 
 ROOT = Path(__file__).resolve().parents[1]
-HOST = ROOT / "external" / "detector_host"
+HOST = Path(
+    os.environ.get(
+        "ROSA_DETECTOR_HOST_ROOT",
+        ROOT / "external" / "detector_host",
+    )
+).resolve()
 if not HOST.is_dir():
     pytest.skip(
         "optional Sparse4D detector host is not available",
