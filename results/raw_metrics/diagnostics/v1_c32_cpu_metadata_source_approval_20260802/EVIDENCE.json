@@ -1,0 +1,35 @@
+{
+  "schema": "rosa.c32_cpu_metadata_source_approval.v1",
+  "date_utc": "2026-08-02",
+  "status": "SOURCE_CPU_APPROVED_CUDA_PENDING",
+  "base_commit": "f3bc69889d4588c3f7b76f6a2a5bdd01bbda5863",
+  "branch": "optimize/c32-cpu-temporal-metadata",
+  "scientific_model": "C32 official Sparse4D self-attention residual",
+  "parameter_count": 29667109,
+  "parameter_delta": 0,
+  "buffer_delta": 0,
+  "checkpoint_key_delta": 0,
+  "numeric_hyperparameter_delta": 0,
+  "training_path_changed": false,
+  "prediction_tta_supported": false,
+  "expected_batch4_transfer_removal": {
+    "batched_h2d_tensors": 3,
+    "pose_d2h_copies": 8,
+    "cuda_scalar_reads": 4
+  },
+  "tests": {
+    "focused_passed": 9,
+    "full_passed": 166,
+    "full_skipped": 5
+  },
+  "independent_source_review": "APPROVE",
+  "cuda_parity": "PENDING",
+  "cuda_profiler": "PENDING",
+  "paired_latency": "PENDING",
+  "speed_claim_authorized": false,
+  "file_sha256": {
+    "src/rosa/integrations/fisheye3dod/model.py": "8528b7d8af858201c88d86ff9c8dd16888c342226b99cc99953f6eef51fdb6cf",
+    "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata.py": "0721c9882186bacde429ba6743266e6fc89413530a668c9c3abe1f655e213329",
+    "tests/test_single_frame_cpu_metadata.py": "b444db3822b6fc475d90761a450d3a8ec931897313ae915a42cbe5766205c4b4"
+  }
+}
