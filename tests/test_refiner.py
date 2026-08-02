@@ -74,6 +74,56 @@ def _fixture(cfg=None):
     return stage, anchor, query, fpn, metas, keypoint_generator
 
 
+def test_compact_lean_refiner_uses_only_private_prepared_sampling(monkeypatch):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    private_calls = []
+    public_calls = []
+    released_private = refiner_module._sample_multiscale_features_prepared_inference
+    released_public = refiner_module.sample_multiscale_features
+
+    def private(*args, **kwargs):
+        private_calls.append(True)
+        return released_private(*args, **kwargs)
+
+    def public(*args, **kwargs):
+        public_calls.append(True)
+        return released_public(*args, **kwargs)
+
+    monkeypatch.setattr(
+        refiner_module,
+        "_sample_multiscale_features_prepared_inference",
+        private,
+    )
+    monkeypatch.setattr(refiner_module, "sample_multiscale_features", public)
+
+    stage.eval()
+    with torch.no_grad():
+        stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+    assert len(private_calls) == 2
+    assert public_calls == []
+
+    private_calls.clear()
+    stage.train()
+    stage(anchor, query, fpn, metas, generator)
+    assert private_calls == []
+    assert len(public_calls) == 2
+
+
 def test_closed_loop_is_exact_native_identity_at_initialization():
     stage, anchor, query, fpn, metas, generator = _fixture()
     output = stage(anchor, query, fpn, metas, generator)

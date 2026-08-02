@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from .attention import PointwiseROSA, masked_softmax
 from .config import ROSAConfig
 from .observation import (
+    _sample_multiscale_features_prepared_inference,
     project_and_describe,
     sample_multiscale_features,
 )
@@ -440,7 +441,17 @@ class ROSARefiner(nn.Module):
                 released_relation_surface and not relation_hooks_active
             ),
         )
-        features = sample_multiscale_features(
+        private_prepared_inference = bool(
+            observation_usage != "full"
+            and released_relation_surface
+            and not relation_hooks_active
+        )
+        sample_features = (
+            _sample_multiscale_features_prepared_inference
+            if private_prepared_inference
+            else sample_multiscale_features
+        )
+        features = sample_features(
             fpn,
             uv,
             query,

@@ -1,8 +1,12 @@
+import pytest
 import torch
+from torch.overrides import TorchFunctionMode
 from torch.utils import _python_dispatch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from rosa.observation import (
     _can_use_prepared_multiscale,
+    _sample_multiscale_features_prepared_inference,
     sample_multiscale_features,
 )
 from rosa.sampling import (
@@ -307,6 +311,157 @@ def test_eager_multiscale_sampling_preserves_public_sampler_hooks():
     assert _raw_equal(actual, expected)
 
 
+def test_private_eager_prepared_grid_is_raw_exact_and_fail_closed_on_hooks():
+    fpn, uv, query, level_head, sampler = _prepared_fixture()
+    uv[0, 0, 0, 0] = torch.tensor((float("nan"), 0.5))
+    uv[0, 1, 1, 1] = torch.tensor((float("inf"), float("-inf")))
+
+    with torch.no_grad():
+        expected = _released_multiscale(fpn, uv, query, sampler, level_head)
+        assert not _can_use_prepared_multiscale(fpn, uv, sampler)
+        assert _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+    calls = []
+    handle = sampler.register_forward_hook(lambda *_args: calls.append("hook"))
+    try:
+        with torch.no_grad():
+            assert not _can_use_prepared_multiscale(
+                fpn,
+                uv,
+                sampler,
+                private_eager_inference=True,
+            )
+            hooked = _sample_multiscale_features_prepared_inference(
+                fpn,
+                uv,
+                query,
+                sampler,
+                level_head,
+            )
+    finally:
+        handle.remove()
+    assert calls == ["hook"] * 4
+    assert _raw_equal(hooked, expected)
+
+
+def test_private_eager_prepared_grid_requires_exact_bool_opt_in():
+    fpn, uv, _query, _level_head, sampler = _prepared_fixture()
+    with pytest.raises(TypeError, match="private_eager_inference"):
+        _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=1,
+        )
+
+
+def test_private_eager_prepared_grid_falls_back_under_dispatch_modes():
+    fpn, uv, query, level_head, sampler = _prepared_fixture()
+
+    class CountDispatch(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.nan_to_num_calls = 0
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            if "nan_to_num" in str(func):
+                self.nan_to_num_calls += 1
+            return func(*args, **(kwargs or {}))
+
+    dispatch = CountDispatch()
+    with torch.no_grad(), dispatch:
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
+        dispatch_output = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert dispatch.nan_to_num_calls == 4
+
+    class CountFunction(TorchFunctionMode):
+        def __init__(self):
+            super().__init__()
+            self.nan_to_num_calls = 0
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            del types
+            if func is torch.nan_to_num:
+                self.nan_to_num_calls += 1
+            return func(*args, **(kwargs or {}))
+
+    function = CountFunction()
+    with torch.no_grad(), function:
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
+        function_output = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert function.nan_to_num_calls == 4
+    assert _raw_equal(dispatch_output, function_output)
+
+
+def test_private_eager_prepared_grid_falls_back_for_tracing_training_and_grad(
+    monkeypatch,
+):
+    fpn, uv, _query, _level_head, sampler = _prepared_fixture()
+
+    with torch.no_grad():
+        monkeypatch.setattr(torch.jit, "is_tracing", lambda: True)
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
+        monkeypatch.undo()
+
+        sampler.train()
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
+
+    sampler.eval()
+    assert not _can_use_prepared_multiscale(
+        fpn,
+        uv,
+        sampler,
+        private_eager_inference=True,
+    )
+
+
 def test_prepared_guard_supports_torch_without_new_dispatch_mode_flag(
     monkeypatch,
 ):
@@ -319,6 +474,12 @@ def test_prepared_guard_supports_torch_without_new_dispatch_mode_flag(
 
     with torch.no_grad():
         assert not _can_use_prepared_multiscale(fpn, uv, sampler)
+        assert not _can_use_prepared_multiscale(
+            fpn,
+            uv,
+            sampler,
+            private_eager_inference=True,
+        )
         monkeypatch.setattr(torch._dynamo, "is_compiling", lambda: True)
         assert _can_use_prepared_multiscale(fpn, uv, sampler)
 

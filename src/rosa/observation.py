@@ -7,6 +7,7 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
+from torch.utils import _python_dispatch
 
 from . import geometry as _geometry
 from .geometry import (
@@ -259,12 +260,45 @@ def _can_use_prepared_multiscale(
     fpn: Sequence[Tensor],
     uv: Tensor,
     sampler: nn.Module,
+    *,
+    private_eager_inference: bool = False,
 ) -> bool:
-    """Select the private sampler only inside an unobserved outer Dynamo graph."""
+    """Select one-grid sampling only on an unobserved inference surface."""
+
+    if not isinstance(private_eager_inference, bool):
+        raise TypeError("private_eager_inference must be a bool")
+
+    compiling = torch._dynamo.is_compiling()
+    if not compiling:
+        torch_function_mode_state = getattr(
+            torch.overrides,
+            "_is_torch_function_mode_enabled",
+            None,
+        )
+        if not callable(torch_function_mode_state):
+            return False
+        dispatch_mode_state = getattr(
+            _python_dispatch,
+            "_is_in_non_infra_torch_dispatch_mode",
+            None,
+        )
+        if type(dispatch_mode_state) is bool:
+            dispatch_mode_active = dispatch_mode_state
+        elif callable(dispatch_mode_state):
+            dispatch_mode_active = bool(dispatch_mode_state())
+        else:
+            return False
+        if (
+            not private_eager_inference
+            or torch.jit.is_scripting()
+            or torch.jit.is_tracing()
+            or torch_function_mode_state()
+            or dispatch_mode_active
+        ):
+            return False
 
     if (
-        not torch._dynamo.is_compiling()
-        or type(fpn) not in (list, tuple)
+        type(fpn) not in (list, tuple)
         or len(fpn) != 4
         or type(sampler) is not FusedBilinearSampler
         or sampler.training
@@ -310,21 +344,28 @@ def _can_use_prepared_multiscale(
     return True
 
 
-def sample_multiscale_features(
+def _sample_multiscale_features_impl(
     fpn: Sequence[Tensor],
     uv: Tensor,
     query: Tensor,
     sampler: nn.Module,
     level_head: nn.Linear,
+    *,
+    private_prepared_inference: bool = False,
 ) -> Tensor:
-    """Sample each FPN level and fuse it with query-specific weights."""
+    """Internal implementation with an explicit private eager opt-in."""
 
     if len(fpn) != level_head.out_features:
         raise ValueError(
             f"expected {level_head.out_features} FPN levels, " f"got {len(fpn)}"
         )
     sample_uv = uv.unsqueeze(4)
-    if _can_use_prepared_multiscale(fpn, uv, sampler):
+    if _can_use_prepared_multiscale(
+        fpn,
+        uv,
+        sampler,
+        private_eager_inference=private_prepared_inference,
+    ):
         sampled = [
             value.squeeze(4)
             for value in sampler._sample_multiscale_prepared(fpn, sample_uv)
@@ -358,6 +399,43 @@ def sample_multiscale_features(
         levels.mul_(expanded_weights)
         return levels.sum(dim=2)
     return (levels * expanded_weights).sum(dim=2)
+
+
+def sample_multiscale_features(
+    fpn: Sequence[Tensor],
+    uv: Tensor,
+    query: Tensor,
+    sampler: nn.Module,
+    level_head: nn.Linear,
+) -> Tensor:
+    """Sample each FPN level and fuse it with query-specific weights."""
+
+    return _sample_multiscale_features_impl(
+        fpn,
+        uv,
+        query,
+        sampler,
+        level_head,
+    )
+
+
+def _sample_multiscale_features_prepared_inference(
+    fpn: Sequence[Tensor],
+    uv: Tensor,
+    query: Tensor,
+    sampler: nn.Module,
+    level_head: nn.Linear,
+) -> Tensor:
+    """Use one prepared grid on the refiner's private eager inference edge."""
+
+    return _sample_multiscale_features_impl(
+        fpn,
+        uv,
+        query,
+        sampler,
+        level_head,
+        private_prepared_inference=True,
+    )
 
 
 __all__ = ["project_and_describe", "sample_multiscale_features"]
