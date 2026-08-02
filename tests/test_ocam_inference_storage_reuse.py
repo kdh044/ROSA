@@ -1,5 +1,6 @@
 """Contracts for no-grad OCam projection storage reuse."""
 
+from collections import Counter
 from copy import deepcopy
 from pathlib import Path
 
@@ -7,6 +8,7 @@ from mmengine import Config
 from mmdet3d.registry import MODELS
 import pytest
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from rosa.geometry import (
     _horner,
@@ -260,6 +262,60 @@ def test_inference_storage_reuse_preserves_polynomial_dtype_promotion():
     assert candidate.dtype == parent.dtype
     assert torch.equal(candidate, parent)
     assert candidate.stride() == parent.stride()
+
+
+@pytest.mark.parametrize(
+    ("contract", "expected_inplace_conjunctions"),
+    (("full_fov", 7), ("legacy_front_only", 8)),
+)
+def test_inference_storage_reuse_owns_incidence_and_validity_buffers(
+    contract,
+    expected_inplace_conjunctions,
+):
+    class OperatorLog(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.operations = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            self.operations.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    points, metas, image_wh = _projection_fixture(
+        torch.float32,
+        camera_conditioned=False,
+    )
+    parent_log = OperatorLog()
+    candidate_log = OperatorLog()
+    with torch.no_grad(), parent_log:
+        parent = ocam_project_points(
+            points,
+            metas,
+            image_wh,
+            contract=contract,
+            camera_transform="affine_3x3",
+        )
+    with torch.no_grad(), candidate_log:
+        candidate = ocam_project_points(
+            points,
+            metas,
+            image_wh,
+            contract=contract,
+            camera_transform="affine_3x3",
+            inference_storage_reuse=True,
+        )
+
+    assert torch.equal(candidate, parent)
+    parent_counts = Counter(parent_log.operations)
+    candidate_counts = Counter(candidate_log.operations)
+    assert parent_counts["aten.atan2.default"] == 2
+    assert parent_counts["aten.atan2.out"] == 0
+    assert parent_counts["aten.logical_and_.default"] == 0
+    assert candidate_counts["aten.atan2.default"] == 1
+    assert candidate_counts["aten.atan2.out"] == 1
+    assert (
+        candidate_counts["aten.logical_and_.default"] == expected_inplace_conjunctions
+    )
 
 
 def test_inference_reuse_class_is_registered_stateless_and_eval_only():

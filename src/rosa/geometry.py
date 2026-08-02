@@ -281,22 +281,44 @@ def ocam_project_points(
         cameras=lidar2cam.shape[1],
         reference=points,
     )
-    incidence = torch.atan2(planar_norm, -z)
-    valid = geometry_valid & (incidence <= half_fov)
-    if contract == "legacy_front_only":
-        valid = valid & (z < 0)
+    if inference_storage_reuse:
+        # Horner evaluation no longer reads ``theta_ocam`` once ``rho`` has
+        # been formed.  Reuse that owned buffer for incidence instead of
+        # allocating another full camera/query/keypoint tensor.
+        torch.atan2(planar_norm, -z, out=theta_ocam)
+        incidence = theta_ocam
+        # ``geometry_valid`` is also owned by this call.  Accumulate the
+        # remaining validity predicates into it so each chained conjunction
+        # does not allocate and discard another full-size boolean result.
+        valid = geometry_valid
+        valid.logical_and_(incidence <= half_fov)
+        if contract == "legacy_front_only":
+            valid.logical_and_(z < 0)
+    else:
+        incidence = torch.atan2(planar_norm, -z)
+        valid = geometry_valid & (incidence <= half_fov)
+        if contract == "legacy_front_only":
+            valid = valid & (z < 0)
 
     width = image_wh[..., 0][:, :, None, None]
     height = image_wh[..., 1][:, :, None, None]
-    valid = (
-        valid
-        & torch.isfinite(pixel_u)
-        & torch.isfinite(pixel_v)
-        & pixel_u.ge(0)
-        & pixel_u.lt(width)
-        & pixel_v.ge(0)
-        & pixel_v.lt(height)
-    )
+    if inference_storage_reuse:
+        valid.logical_and_(torch.isfinite(pixel_u))
+        valid.logical_and_(torch.isfinite(pixel_v))
+        valid.logical_and_(pixel_u.ge(0))
+        valid.logical_and_(pixel_u.lt(width))
+        valid.logical_and_(pixel_v.ge(0))
+        valid.logical_and_(pixel_v.lt(height))
+    else:
+        valid = (
+            valid
+            & torch.isfinite(pixel_u)
+            & torch.isfinite(pixel_v)
+            & pixel_u.ge(0)
+            & pixel_u.lt(width)
+            & pixel_v.ge(0)
+            & pixel_v.lt(height)
+        )
     # In-place division is exact only when it does not suppress PyTorch's
     # normal dtype promotion (for example FP32 pixels divided by FP64 image
     # extents).  Preserve the generic parent semantics for mixed dtypes while
