@@ -1961,6 +1961,15 @@ class _RawFingerprinter:
             self._tag(f"numpy.scalar:{value.dtype.str}")
             self.digest.update(value.tobytes())
             return
+        if isinstance(value, type):
+            # MMDetection keeps the 3D box constructor itself in sample
+            # metadata (for example, ``LiDARInstance3DBoxes``).  A class
+            # reference has no portable raw bytes; its import identity is the
+            # stable semantic value that must survive cloning and replay.
+            self._tag("python.type")
+            self._tag(value.__module__)
+            self._tag(value.__qualname__)
+            return
         if isinstance(value, Mapping):
             self._tag(f"mapping:{type(value).__module__}.{type(value).__qualname__}")
             for key, item in value.items():

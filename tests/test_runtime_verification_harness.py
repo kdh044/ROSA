@@ -464,6 +464,16 @@ def test_raw_fingerprints_compare_tensor_and_array_bits():
         require_same_fingerprint("test", value, clone)
 
 
+def test_raw_fingerprint_uses_python_class_import_identity():
+    value = {"box_type_3d": dict}
+
+    assert raw_fingerprint(value) == raw_fingerprint(copy.deepcopy(value))
+    assert raw_fingerprint(value) != raw_fingerprint({"box_type_3d": list})
+    assert raw_fingerprint(value) != raw_fingerprint(
+        {"box_type_3d": "builtins.dict"}
+    )
+
+
 def test_batch_manifest_locks_real_sample_identity_and_cpu_metadata():
     batch = {
         "inputs": {
