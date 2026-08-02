@@ -23,7 +23,7 @@
     "invalid_cases": ["NaN", "Inf", "camera origin", "absolute coordinate at least 1e4"],
     "invalid_sentinel_raw_bit_equal": true,
     "mixed_dtype_matrix_cases": 512,
-    "mixed_dtype_fallback_cases": 326,
+    "mixed_dtype_fallback_cases": 384,
     "mixed_dtype_output_dtype_shape_stride_and_raw_bit_equal": true,
     "empty_shape_cases": 16,
     "ordinary_tensor_autograd_scope": "reverse-mode no_grad or inference_mode; forward AD is unsupported on the homogeneous-dtype reuse path",
@@ -47,16 +47,16 @@
     "physical_round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
     "measured_per_arm_per_round": 300,
     "rounds": [
-      {"round": 1, "order": "PC", "parent_median_ms": 2.3241965, "candidate_median_ms": 2.033078, "median_ratio": 0.8747444546964941, "parent_p95_ms": 2.4137281, "candidate_p95_ms": 2.09241555, "p95_ratio": 0.8668812158254279},
-      {"round": 2, "order": "CP", "parent_median_ms": 2.3273615, "candidate_median_ms": 2.0360975, "median_ratio": 0.8748522737013567, "parent_p95_ms": 2.46458525, "candidate_p95_ms": 2.09323255, "p95_ratio": 0.8493244654450479},
-      {"round": 3, "order": "PC", "parent_median_ms": 2.325844, "candidate_median_ms": 2.033183, "median_ratio": 0.8741699787260022, "parent_p95_ms": 3.57471895, "candidate_p95_ms": 3.08761805, "p95_ratio": 0.8637372876544601},
-      {"round": 4, "order": "CP", "parent_median_ms": 2.315038, "candidate_median_ms": 2.026318, "median_ratio": 0.8752849845229322, "parent_p95_ms": 2.4018236, "candidate_p95_ms": 2.0766681, "p95_ratio": 0.8646214068343737},
-      {"round": 5, "order": "PC", "parent_median_ms": 2.314232, "candidate_median_ms": 2.0261925, "median_ratio": 0.8755355988509363, "parent_p95_ms": 2.37322655, "candidate_p95_ms": 2.0676965, "p95_ratio": 0.8712596359584803},
-      {"round": 6, "order": "CP", "parent_median_ms": 2.3155785, "candidate_median_ms": 2.026348, "median_ratio": 0.8750936321096434, "parent_p95_ms": 2.51576385, "candidate_p95_ms": 2.15582895, "p95_ratio": 0.8569281850520271}
+      {"round": 1, "order": "PC", "parent_median_ms": 2.235594, "candidate_median_ms": 1.945166, "median_ratio": 0.8700891127816589, "parent_p95_ms": 2.278988, "candidate_p95_ms": 1.978245, "p95_ratio": 0.8680366022111569},
+      {"round": 2, "order": "CP", "parent_median_ms": 2.2478225, "candidate_median_ms": 1.943384, "median_ratio": 0.8645629270104735, "parent_p95_ms": 2.693269, "candidate_p95_ms": 1.982341, "p95_ratio": 0.7360352790605023},
+      {"round": 3, "order": "PC", "parent_median_ms": 2.2408065, "candidate_median_ms": 1.9480955, "median_ratio": 0.8693724781680167, "parent_p95_ms": 2.290855, "candidate_p95_ms": 1.982081, "p95_ratio": 0.865214515977659},
+      {"round": 4, "order": "CP", "parent_median_ms": 2.243837, "candidate_median_ms": 1.941571, "median_ratio": 0.8652905714630786, "parent_p95_ms": 2.655803, "candidate_p95_ms": 1.978976, "p95_ratio": 0.7451516546972798},
+      {"round": 5, "order": "PC", "parent_median_ms": 2.2391545, "candidate_median_ms": 1.9398285, "median_ratio": 0.8663218638999676, "parent_p95_ms": 2.292899, "candidate_p95_ms": 1.970974, "p95_ratio": 0.8595991362899108},
+      {"round": 6, "order": "CP", "parent_median_ms": 2.239795, "candidate_median_ms": 1.9425575, "median_ratio": 0.8672925423978534, "parent_p95_ms": 2.565831, "candidate_p95_ms": 1.975231, "p95_ratio": 0.7698211612534106}
     ],
-    "median_of_round_median_ratios": 0.8749729529055,
-    "median_of_round_p95_ratios": 0.8641793472444169,
-    "worst_round_p95_ratio": 0.8712596359584803
+    "median_of_round_median_ratios": 0.8668072031489105,
+    "median_of_round_p95_ratios": 0.8147101487716607,
+    "worst_round_p95_ratio": 0.8680366022111569
   },
   "cpu_storage_inventory": {
     "method": "TorchDispatchMode retaining every operator output and counting unique non-input storages",

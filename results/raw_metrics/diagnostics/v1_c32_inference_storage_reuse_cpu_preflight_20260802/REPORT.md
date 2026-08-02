@@ -21,7 +21,7 @@ FP64, and BF16; shared and camera-conditioned point layouts; one, two, five,
 and ten Horner coefficients; NaN, Inf, camera-origin, and boundedness-rejected
 rays.  Output strides and all caller inputs are unchanged.  The strict default
 path continues to pass its original contracts.  An independent 512-case
-points/intrinsic/polynomial/image-extent dtype cross-product, including 326
+points/intrinsic/polynomial/image-extent dtype cross-product, including 384
 promotion fallbacks, preserved output dtype, shape, stride, and raw bits; 16
 empty-shape cases were also exact.  The optimized path is scoped to ordinary
 tensors under reverse-mode `no_grad`/`inference_mode`.  Forward-mode AD is not
@@ -38,8 +38,8 @@ suite passed 279 tests with five optional-host skips while CUDA was hidden.
 
 For `B=4,C=4,N=300,P=13`, one Torch thread, 60 warmups per arm, and six
 alternating rounds with 300 paired measurements per arm, the median
-candidate/parent projection-time ratio was `0.87497`.  The median round p95
-ratio was `0.86418`, and the worst round p95 ratio was `0.87126`.
+candidate/parent projection-time ratio was `0.86681`.  The median round p95
+ratio was `0.81471`, and the worst round p95 ratio was `0.86804`.
 
 A Torch-dispatch storage inventory retained every operator output to prevent
 allocator address reuse.  Unique non-input output storage fell from
