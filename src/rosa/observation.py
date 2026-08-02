@@ -7,7 +7,6 @@ from collections.abc import Sequence
 import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
-from torch.utils import _python_dispatch
 
 from . import geometry as _geometry
 from .geometry import (
@@ -39,6 +38,7 @@ _RELEASED_OCAM_PROJECT_WITH_XYZ = _ocam_project_points_with_raw_camera_xyz
 _RELEASED_GEOMETRY_CAMERA_XYZ = _geometry._camera_xyz
 _RELEASED_OCAM_PROJECT_IMPL = _geometry._ocam_project_points_impl
 _RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
+_RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
 # CUDA raw-bit parity must be established before this candidate becomes the
 # production default.  CPU tests exercise the complete guarded implementation.
@@ -260,27 +260,23 @@ def _can_use_prepared_multiscale(
     uv: Tensor,
     sampler: nn.Module,
 ) -> bool:
-    """Fail closed unless the private released no-grad sampler is unobserved."""
+    """Select the private sampler only inside an unobserved outer Dynamo graph."""
 
     if (
-        type(fpn) not in (list, tuple)
+        not torch._dynamo.is_compiling()
+        or type(fpn) not in (list, tuple)
         or len(fpn) != 4
         or type(sampler) is not FusedBilinearSampler
         or sampler.training
         or torch.is_grad_enabled()
-        or torch.overrides._is_torch_function_mode_enabled()
-        or getattr(
-            _python_dispatch,
-            "_is_in_non_infra_torch_dispatch_mode",
-            True,
-        )
+        or getattr(sampler, "_compiled_call_impl", None) is not None
         or "forward" in sampler.__dict__
         or type(sampler).forward is not _RELEASED_FUSED_SAMPLER_FORWARD
+        or "_prepare_grid" in sampler.__dict__
+        or type(sampler)._prepare_grid is not _RELEASED_PREPARE_GRID
         or "_sample_multiscale_prepared" in sampler.__dict__
         or type(sampler)._sample_multiscale_prepared
         is not _RELEASED_PREPARED_MULTISCALE
-        or torch.jit.is_scripting()
-        or torch.jit.is_tracing()
         or type(uv) is not torch.Tensor
         or uv.ndim != 5
         or uv.shape[-1] != 2
@@ -311,9 +307,7 @@ def _can_use_prepared_multiscale(
         )
     ):
         return False
-    if torch._dynamo.is_compiling():
-        return True
-    return bool(all(all(name is None for name in tensor.names) for tensor in tensors))
+    return True
 
 
 def sample_multiscale_features(

@@ -72,6 +72,26 @@ class FusedBilinearSampler(nn.Module):
         super().__init__()
         self.fallback = DeterministicBilinearSampler()
 
+    @staticmethod
+    def _prepare_grid(
+        uv: Tensor,
+        batch: int,
+        cameras: int,
+    ) -> tuple[Tensor, tuple[int, int, int]]:
+        queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
+        grid = (
+            torch.nan_to_num(
+                uv.permute(0, 2, 1, 3, 4, 5),
+                nan=-2.0,
+                posinf=-2.0,
+                neginf=-2.0,
+            )
+            .reshape(batch * cameras, queries * samples * patch, 1, 2)
+            .mul(2.0)
+            .sub(1.0)
+        )
+        return grid, (queries, samples, patch)
+
     def forward(self, feature: Tensor, uv: Tensor) -> Tensor:
         if feature.ndim != 5:
             raise ValueError("feature must be [B,C,D,H,W]")
@@ -90,17 +110,10 @@ class FusedBilinearSampler(nn.Module):
         ):
             return self.fallback(feature, uv)
 
-        queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
-        grid = (
-            torch.nan_to_num(
-                uv.permute(0, 2, 1, 3, 4, 5),
-                nan=-2.0,
-                posinf=-2.0,
-                neginf=-2.0,
-            )
-            .reshape(batch * cameras, queries * samples * patch, 1, 2)
-            .mul(2.0)
-            .sub(1.0)
+        grid, (queries, samples, patch) = self._prepare_grid(
+            uv,
+            batch,
+            cameras,
         )
         sampled = F.grid_sample(
             feature.reshape(batch * cameras, channels, height, width),
@@ -127,17 +140,10 @@ class FusedBilinearSampler(nn.Module):
         """Reuse one grid for caller-validated homogeneous FPN inputs."""
 
         batch, cameras = features[0].shape[:2]
-        queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
-        grid = (
-            torch.nan_to_num(
-                uv.permute(0, 2, 1, 3, 4, 5),
-                nan=-2.0,
-                posinf=-2.0,
-                neginf=-2.0,
-            )
-            .reshape(batch * cameras, queries * samples * patch, 1, 2)
-            .mul(2.0)
-            .sub(1.0)
+        grid, (queries, samples, patch) = self._prepare_grid(
+            uv,
+            batch,
+            cameras,
         )
         prepared = []
         for feature in features:
