@@ -38,6 +38,10 @@ _RELEASED_OCAM_PROJECT_POINTS = ocam_project_points
 _RELEASED_OCAM_PROJECT_WITH_XYZ = _ocam_project_points_with_raw_camera_xyz
 _RELEASED_GEOMETRY_CAMERA_XYZ = _geometry._camera_xyz
 _RELEASED_OCAM_PROJECT_IMPL = _geometry._ocam_project_points_impl
+_RELEASED_SANITIZE_CAMERA_XYZ = _geometry._sanitize_camera_xyz
+_RELEASED_SANITIZE_CAMERA_XYZ_REUSE = (
+    _geometry._sanitize_camera_xyz_inference_storage_reuse
+)
 _RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
 _RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
@@ -98,6 +102,9 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
         is not _RELEASED_OCAM_PROJECT_WITH_XYZ
         or _geometry._camera_xyz is not _RELEASED_GEOMETRY_CAMERA_XYZ
         or _geometry._ocam_project_points_impl is not _RELEASED_OCAM_PROJECT_IMPL
+        or _geometry._sanitize_camera_xyz is not _RELEASED_SANITIZE_CAMERA_XYZ
+        or _geometry._sanitize_camera_xyz_inference_storage_reuse
+        is not _RELEASED_SANITIZE_CAMERA_XYZ_REUSE
         or torch.jit.is_scripting()
         or torch.jit.is_tracing()
     ):

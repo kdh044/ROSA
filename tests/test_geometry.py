@@ -73,6 +73,63 @@ def test_single_transform_candidate_is_enabled_on_benchmark_branch():
     assert observation_module._ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE is True
 
 
+def test_single_transform_candidate_is_raw_exact_under_cpu_bfloat16_autocast(
+    monkeypatch,
+):
+    generator = torch.Generator().manual_seed(3407)
+    batch, cameras, queries, points = 2, 3, 5, 7
+    lidar2cam = torch.eye(4).repeat(batch, cameras, 1, 1)
+    lidar2cam[..., :3, :3].add_(
+        torch.randn(batch, cameras, 3, 3, generator=generator) * 0.05
+    )
+    lidar2cam[..., :3, 3] = torch.randn(batch, cameras, 3, generator=generator) * 0.2
+    intrinsic = torch.eye(3).repeat(batch, cameras, 1, 1)
+    intrinsic[..., 0, 2] = 400.0
+    intrinsic[..., 1, 2] = 400.0
+    polynomial = torch.zeros(batch, cameras, 5)
+    polynomial[..., 1] = -150.0
+    metas = {
+        "lidar2cam": lidar2cam,
+        "ocam_intrinsic": intrinsic,
+        "ocam_pol": polynomial,
+        "image_wh": torch.full((batch, cameras, 2), 800.0),
+        "ocam_lens_fov_deg": 220.0,
+    }
+    keypoints = torch.randn(batch, queries, points, 3, generator=generator)
+    keypoints[..., 2].sub_(3.0)
+    anchor = torch.zeros(batch, queries, 11)
+    anchor[..., :3] = keypoints.mean(dim=2)
+    anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+    anchor[..., 7] = 1.0
+
+    outputs = []
+    for enabled in (False, True):
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            enabled,
+        )
+        with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+            assert (
+                observation_module._can_reuse_camera_transform(
+                    keypoints,
+                    metas,
+                )
+                is enabled
+            )
+            outputs.append(
+                project_and_describe(
+                    keypoints,
+                    anchor,
+                    metas,
+                    "full_fov",
+                    compact_relation=True,
+                )
+            )
+
+    _assert_observation_raw_equal(outputs[1], outputs[0])
+
+
 @pytest.mark.parametrize(
     "dtype",
     (torch.float16, torch.bfloat16, torch.float32, torch.float64),
@@ -307,6 +364,32 @@ def test_single_transform_candidate_fails_closed_for_extension_surfaces(
         )
 
 
+@pytest.mark.parametrize(
+    "helper_name",
+    (
+        "_sanitize_camera_xyz",
+        "_sanitize_camera_xyz_inference_storage_reuse",
+    ),
+)
+def test_single_transform_candidate_fails_closed_for_sanitizer_override(
+    helper_name,
+    monkeypatch,
+):
+    metas = _metas()
+    keypoints = torch.zeros(1, 1, 1, 3)
+    original = getattr(observation_module._geometry, helper_name)
+
+    with torch.no_grad():
+        assert observation_module._can_reuse_camera_transform(keypoints, metas)
+
+    def hooked(*args, **kwargs):
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(observation_module._geometry, helper_name, hooked)
+    with torch.no_grad():
+        assert not observation_module._can_reuse_camera_transform(keypoints, metas)
+
+
 def test_single_transform_candidate_preserves_callable_hooks(monkeypatch):
     metas = _metas()
     keypoints = torch.tensor(
@@ -320,6 +403,11 @@ def test_single_transform_candidate_preserves_callable_hooks(monkeypatch):
         (observation_module, "_ocam_project_points_with_raw_camera_xyz", 0),
         (observation_module._geometry, "_camera_xyz", 1),
         (observation_module._geometry, "_ocam_project_points_impl", 1),
+        (
+            observation_module._geometry,
+            "_sanitize_camera_xyz_inference_storage_reuse",
+            1,
+        ),
     )
 
     for owner, name, calls_per_fallback in surfaces:

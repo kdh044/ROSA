@@ -5,6 +5,7 @@ import types
 import pytest
 import torch
 
+import rosa.observation as observation_module
 import rosa.refiner as refiner_module
 import rosa.rfl as rfl_module
 from rosa.refiner import (
@@ -214,6 +215,93 @@ def test_compact_lean_refiner_reuses_pointwise_storage_for_base_and_candidates()
     ]
 
 
+def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
+    monkeypatch,
+):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    parameter_generator = torch.Generator().manual_seed(4103)
+    with torch.no_grad():
+        for parameter in stage.parameters():
+            parameter.uniform_(-0.1, 0.1, generator=parameter_generator)
+
+    path_codes = {
+        "direct_level_buffer": type(
+            stage.sampler
+        )._sample_multiscale_prepared_stacked.__code__,
+        "owned_rfl_delta": rfl_module._mask_cast_and_add_owned_delta.__code__,
+        "single_ocam_transform": (
+            observation_module._ocam_project_points_with_raw_camera_xyz.__code__
+        ),
+    }
+
+    def invoke(*, force_parent_fallback):
+        calls = Counter()
+
+        def profile(frame, event, _arg):
+            if event == "call":
+                for name, code in path_codes.items():
+                    if frame.f_code is code:
+                        calls[name] += 1
+            return profile
+
+        with monkeypatch.context() as patch:
+            if force_parent_fallback:
+                patch.setattr(
+                    observation_module,
+                    "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+                    False,
+                )
+                patch.setattr(
+                    observation_module,
+                    "_override_mode_is_active_or_unknown",
+                    lambda: True,
+                )
+                patch.setattr(
+                    rfl_module,
+                    "_plain_eager_no_grad_execution",
+                    lambda: False,
+                )
+            previous_profile = sys.getprofile()
+            sys.setprofile(profile)
+            try:
+                with torch.no_grad():
+                    output = stage(
+                        anchor,
+                        query,
+                        fpn,
+                        metas,
+                        generator,
+                        materialize_diagnostics=False,
+                        return_final_anchor_only=True,
+                    )
+            finally:
+                sys.setprofile(previous_profile)
+        return output, calls
+
+    candidate, candidate_calls = invoke(force_parent_fallback=False)
+    parent, parent_calls = invoke(force_parent_fallback=True)
+
+    assert candidate_calls == Counter(
+        {
+            "direct_level_buffer": 2,
+            "owned_rfl_delta": 2,
+            "single_ocam_transform": 2,
+        }
+    )
+    assert parent_calls == Counter()
+    assert torch.isfinite(candidate).all()
+    assert torch.count_nonzero(candidate != anchor) > 0
+    assert _raw_equal(candidate, parent)
+
+
 def test_closed_loop_is_exact_native_identity_at_initialization():
     stage, anchor, query, fpn, metas, generator = _fixture()
     output = stage(anchor, query, fpn, metas, generator)
@@ -338,6 +426,91 @@ def test_class_pointwise_forward_override_keeps_the_legacy_tensor_abi(
 
     assert observed
     assert torch.equal(output.final_anchor, anchor)
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ("_forward_impl", "_can_reuse_owned_rfl_delta"),
+)
+def test_instance_pointwise_private_override_disables_compact_relation(
+    surface,
+    monkeypatch,
+):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    compact_relation_arguments = []
+    released_project_and_describe = refiner_module.project_and_describe
+
+    def captured_project_and_describe(*args, **kwargs):
+        compact_relation_arguments.append(kwargs["compact_relation"])
+        return released_project_and_describe(*args, **kwargs)
+
+    monkeypatch.setattr(
+        refiner_module,
+        "project_and_describe",
+        captured_project_and_describe,
+    )
+    private_calls = []
+    if surface == "_forward_impl":
+        released = stage.rosa._forward_impl
+
+        def overridden(
+            _self,
+            features,
+            geometry,
+            relation,
+            valid,
+            sidecar_query,
+                *,
+                observation_usage,
+                reuse_owned_rfl_delta,
+                reuse_owned_pointwise_storage,
+            ):
+            assert torch.is_tensor(relation)
+            assert relation.shape[-1] == 19
+            private_calls.append(None)
+            return released(
+                features,
+                geometry,
+                relation,
+                valid,
+                sidecar_query,
+                    observation_usage=observation_usage,
+                    reuse_owned_rfl_delta=reuse_owned_rfl_delta,
+                    reuse_owned_pointwise_storage=reuse_owned_pointwise_storage,
+                )
+
+    else:
+
+        def overridden(*_args, **_kwargs):
+            private_calls.append(None)
+            raise AssertionError("the overridden private guard must not be called")
+
+    setattr(stage.rosa, surface, types.MethodType(overridden, stage.rosa))
+    with torch.no_grad():
+        output = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+    assert compact_relation_arguments == [False, False]
+    if surface == "_forward_impl":
+        assert len(private_calls) == 2
+    else:
+        assert private_calls == []
+    assert torch.equal(output, anchor)
 
 
 def test_iterative_distribution_is_identity_and_distance_adaptive():

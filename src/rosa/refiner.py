@@ -37,6 +37,8 @@ _COMPACT_SIGMA_POINTS = (-2.0, 0.0, 2.0)
 KeypointGenerator = Callable[[Tensor, Tensor], Tensor]
 _RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
 _RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
+_RELEASED_POINTWISE_ROSA_IMPL = PointwiseROSA._forward_impl
+_RELEASED_POINTWISE_ROSA_REUSE_GUARD = PointwiseROSA._can_reuse_owned_rfl_delta
 _RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
 _RELEASED_RFL_OWNED_DELTA_FORWARD = (
     SphericalRayFeatureLifting._forward_lifted_owned_delta_inference
@@ -407,6 +409,11 @@ class ROSARefiner(nn.Module):
             and "_forward_compact_lean_inference" not in self.rosa.__dict__
             and type(self.rosa)._forward_compact_lean_inference
             is _RELEASED_POINTWISE_ROSA_LEAN_FORWARD
+            and "_forward_impl" not in self.rosa.__dict__
+            and type(self.rosa)._forward_impl is _RELEASED_POINTWISE_ROSA_IMPL
+            and "_can_reuse_owned_rfl_delta" not in self.rosa.__dict__
+            and type(self.rosa)._can_reuse_owned_rfl_delta
+            is _RELEASED_POINTWISE_ROSA_REUSE_GUARD
             and type(rfl) is SphericalRayFeatureLifting
             and "forward" not in rfl.__dict__
             and type(rfl).forward is _RELEASED_RFL_FORWARD
