@@ -157,6 +157,7 @@ class ROSAFullFOVDeformableFeatureAggregation(DeformableFeatureAggregation):
     """Use the declared OCam lens cone in every native decoder block."""
 
     camera_transform = "homogeneous_4x4"
+    inference_storage_reuse = False
 
     def __init__(self, *args, projection_type: str = "ocam_fisheye", **kwargs):
         if projection_type != "ocam_fisheye":
@@ -185,6 +186,7 @@ class ROSAFullFOVDeformableFeatureAggregation(DeformableFeatureAggregation):
             image_wh,
             contract="full_fov",
             camera_transform=self.camera_transform,
+            inference_storage_reuse=self.inference_storage_reuse,
         )
 
 
@@ -214,6 +216,15 @@ class ROSAMetricGatedAffine3x3FullFOVDeformableFeatureAggregation(
             image_wh=image_wh,
             metas=metas,
         )
+
+
+@MODELS.register_module()
+class ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation(
+    ROSAMetricGatedAffine3x3FullFOVDeformableFeatureAggregation
+):
+    """Reuse projection storage in the no-grad affine evaluation arm."""
+
+    inference_storage_reuse = True
 
 
 @MODELS.register_module()
@@ -908,6 +919,7 @@ __all__ = [
     "ROSAEvaluatorAlignedSparseBox3DLoss",
     "ROSAFullFOVDeformableFeatureAggregation",
     "ROSAMetricGatedAffine3x3FullFOVDeformableFeatureAggregation",
+    "ROSAMetricGatedInferenceReuseAffine3x3FullFOVDeformableFeatureAggregation",
     "ROSANativeBaselineHead",
     "ROSAOfficialResidualNativeBaselineHead",
     "ROSANormalizedKeyPointsGenerator",

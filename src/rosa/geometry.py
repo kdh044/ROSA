@@ -24,6 +24,27 @@ def _horner(coefficients: Tensor, value: Tensor) -> Tensor:
     return output
 
 
+def _horner_inference_storage_reuse(
+    coefficients: Tensor,
+    value: Tensor,
+) -> Tensor:
+    """Evaluate Horner terms in one owned buffer during no-grad inference."""
+
+    if torch.is_grad_enabled():
+        raise RuntimeError(
+            "OCam inference storage reuse requires torch.no_grad() or "
+            "torch.inference_mode()"
+        )
+    terms = coefficients.unbind(dim=-1)
+    if len(terms) == 1:
+        return terms[0].expand_as(value).clone()
+    output = terms[-1] * value
+    output.add_(terms[-2].expand_as(value))
+    for coefficient in reversed(terms[:-2]):
+        output.mul_(value).add_(coefficient.expand_as(value))
+    return output
+
+
 def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
     if lidar2cam.ndim != 4 or lidar2cam.shape[-2:] != (4, 4):
         raise ValueError("lidar2cam must be [B,C,4,4]")
@@ -132,6 +153,7 @@ def ocam_project_points(
     *,
     contract: str = "legacy_front_only",
     camera_transform: str = "homogeneous_4x4",
+    inference_storage_reuse: bool = False,
 ) -> Tensor:
     """Project lidar-frame points to normalized native-fisheye pixels.
 
@@ -144,6 +166,13 @@ def ocam_project_points(
 
     if contract not in PROJECTION_CONTRACTS:
         raise ValueError(f"unknown OCam projection contract: {contract}")
+    if not isinstance(inference_storage_reuse, bool):
+        raise TypeError("inference_storage_reuse must be a bool")
+    if inference_storage_reuse and torch.is_grad_enabled():
+        raise RuntimeError(
+            "OCam inference storage reuse requires torch.no_grad() or "
+            "torch.inference_mode()"
+        )
     for name in ("lidar2cam", "ocam_intrinsic", "ocam_pol"):
         if name not in metas:
             raise KeyError(f"missing OCam metadata: {name}")
@@ -164,12 +193,21 @@ def ocam_project_points(
     planar_norm = torch.sqrt(x.square() + y.square() + 1e-12)
     theta_ocam = torch.atan2(z, planar_norm)
     expanded_polynomial = polynomial[:, :, None, None]
-    rho = _horner(expanded_polynomial, theta_ocam)
-    scale = torch.where(
-        planar_norm > 1e-8,
-        rho / planar_norm.clamp_min(1e-8),
-        0.0,
-    )
+    if inference_storage_reuse:
+        rho = _horner_inference_storage_reuse(
+            expanded_polynomial,
+            theta_ocam,
+        )
+        rho.div_(planar_norm.clamp_min(1e-8))
+        rho.masked_fill_(~(planar_norm > 1e-8), 0.0)
+        scale = rho
+    else:
+        rho = _horner(expanded_polynomial, theta_ocam)
+        scale = torch.where(
+            planar_norm > 1e-8,
+            rho / planar_norm.clamp_min(1e-8),
+            0.0,
+        )
     image_x, image_y = x * scale, y * scale
 
     a11 = intrinsic[..., 1, 0][:, :, None, None]
@@ -178,8 +216,14 @@ def ocam_project_points(
     a21 = intrinsic[..., 0, 0][:, :, None, None]
     a22 = intrinsic[..., 0, 1][:, :, None, None]
     a23 = intrinsic[..., 1, 2][:, :, None, None]
-    pixel_u = a11 * image_x + a12 * image_y + a13
-    pixel_v = a21 * image_x + a22 * image_y + a23
+    if inference_storage_reuse:
+        pixel_u = a11 * image_x
+        pixel_u.add_(a12 * image_y).add_(a13)
+        pixel_v = a21 * image_x
+        pixel_v.add_(a22 * image_y).add_(a23)
+    else:
+        pixel_u = a11 * image_x + a12 * image_y + a13
+        pixel_v = a21 * image_x + a22 * image_y + a23
 
     half_fov = _half_fov_radians(
         metas.get("ocam_lens_fov_deg", 220.0),
@@ -203,6 +247,24 @@ def ocam_project_points(
         & pixel_v.ge(0)
         & pixel_v.lt(height)
     )
+    if inference_storage_reuse:
+        normalized_u = pixel_u.div_(width.clamp_min(1))
+        normalized_v = pixel_v.div_(height.clamp_min(1))
+        projected = normalized_u.new_empty((*normalized_u.shape, 2))
+        sentinel = normalized_u.new_tensor(2.0)
+        torch.where(
+            valid,
+            normalized_u,
+            sentinel,
+            out=projected[..., 0],
+        )
+        torch.where(
+            valid,
+            normalized_v,
+            sentinel,
+            out=projected[..., 1],
+        )
+        return projected
     normalized_u = pixel_u / width.clamp_min(1)
     normalized_v = pixel_v / height.clamp_min(1)
     return torch.stack(
