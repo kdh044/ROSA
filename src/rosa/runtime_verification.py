@@ -24,8 +24,11 @@ PARENT_ARM = "parent"
 CANDIDATE_ARM = "candidate"
 CPU_METADATA_PROTOCOL = "cpu-metadata"
 REPRESENTATION_PROTOCOL = "lean-loader-uint8-pinned"
+C0_C32_NEAR_NATIVE_PROTOCOL = "c0-c32-near-native"
 MODEL_ONLY_SCOPE = "model-only-common-preprocessor-boundary"
 INPUT_PIPELINE_SCOPE = "end-to-end-loader-collate-transfer"
+C0_C32_FULL_DETECTOR_SCOPE = "full-detector-test-step"
+C0_C32_COMMON_MODEL_SCOPE = "common-boundary-raw-model-predict"
 PCCP = "PCCP"
 CPPC = "CPPC"
 PHYSICAL_ROUND_ORDER = (PCCP, CPPC, PCCP, CPPC, PCCP, CPPC)
@@ -47,6 +50,7 @@ NEAR_NATIVE_P95_RATIO_MAXIMUM = 1.10
 HOST_METADATA_KEYS = ("T_global", "T_global_inv", "timestamp")
 EXPECTED_MODEL_TYPE = "Fisheye3DODGravityCenterSparse4D"
 EXPECTED_HEAD_TYPE = "ROSAOfficialResidualNativeBaselineHead"
+EXPECTED_C0_HEAD_TYPE = "ROSANativeBaselineHead"
 EXPECTED_PARENT_PREPROCESSOR = "Sparse4DDataPreprocessor"
 EXPECTED_CANDIDATE_PREPROCESSOR = "Fisheye3DODSingleFrameDataPreprocessor"
 EXPECTED_REPRESENTATION_PREPROCESSOR = "Fisheye3DODSingleFrameDataPreprocessor"
@@ -58,6 +62,7 @@ REPRESENTATION_STREAM_POLICY = "torch-current-default-stream-only"
 MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM = 1.01
 MODEL_ONLY_P95_RATIO_MAXIMUM = 1.01
 NON_EXECUTABLE_CONFIG_KEYS = ("work_dir", "experiment_contract")
+C0_C32_PEAK_MEMORY_RATIO_MAXIMUM = 1.02
 
 # Representation-runtime v2 is deliberately a single immutable experiment.
 # These are equality constraints, not user-tunable defaults.  Keeping them in
@@ -744,6 +749,58 @@ def evaluate_c32_near_native_gate(
     }
 
 
+def evaluate_c0_c32_near_native_gate(
+    paired_bootstrap: Mapping[str, Any],
+    memory: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Gate a real C32/C0 full-detector comparison, including memory.
+
+    This differs from :func:`evaluate_c32_near_native_gate`, which predates a
+    true C0 arm and therefore cannot authorize a near-native claim on its own.
+    Peak allocated and reserved memory are both allowed at most two percent
+    regression, as frozen by this protocol before any CUDA measurement.
+    """
+
+    latency_gate = evaluate_c32_near_native_gate(paired_bootstrap)
+    parent_memory = _nested(memory, PARENT_ARM)
+    candidate_memory = _nested(memory, CANDIDATE_ARM)
+    memory_checks: dict[str, Any] = {}
+    for field in ("peak_allocated_bytes", "peak_reserved_bytes"):
+        parent_value = _exact_integer(
+            f"parent {field}", _nested(parent_memory, field), minimum=1
+        )
+        candidate_value = _exact_integer(
+            f"candidate {field}",
+            _nested(candidate_memory, field),
+            minimum=1,
+        )
+        ratio = candidate_value / parent_value
+        memory_checks[f"{field}_regression_at_most_2_percent"] = {
+            "parent_bytes": parent_value,
+            "candidate_bytes": candidate_value,
+            "candidate_over_parent": ratio,
+            "threshold_max_inclusive": C0_C32_PEAK_MEMORY_RATIO_MAXIMUM,
+            "passed": ratio <= C0_C32_PEAK_MEMORY_RATIO_MAXIMUM,
+        }
+    checks = {
+        **latency_gate["checks"],
+        **memory_checks,
+    }
+    passed = all(check["passed"] for check in checks.values())
+    return {
+        "gate": "c32_vs_c0_full_detector_near_native",
+        "benchmark_scope": C0_C32_FULL_DETECTOR_SCOPE,
+        "passed": passed,
+        "decision": (
+            "NEAR_NATIVE_SUPPORTED"
+            if passed
+            else "NEAR_NATIVE_NOT_SUPPORTED"
+        ),
+        "speed_claim_eligible": passed,
+        "checks": checks,
+    }
+
+
 def evaluate_model_only_non_regression_gate(
     paired_bootstrap: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -1365,6 +1422,152 @@ def validate_config_pair(
     }
 
 
+def validate_c0_c32_near_native_config_pair(
+    parent_config: Any,
+    candidate_config: Any,
+    *,
+    expected_batch_size: int,
+) -> dict[str, Any]:
+    """Prove that C0 and C32 differ only by the audited head class.
+
+    The parent is exact C0 ``ROSANativeBaselineHead`` and the candidate is
+    exact C32 ``ROSAOfficialResidualNativeBaselineHead``.  Both retain the
+    same R18 detector, Main126 test pipeline, preprocessor, operation order,
+    and temporal-free instance bank.  Non-executable experiment bookkeeping
+    is intentionally excluded from the equality proof.
+    """
+
+    expected_batch_size = _exact_integer(
+        "expected_batch_size", expected_batch_size, minimum=1
+    )
+    parent = _mapping(parent_config)
+    candidate = _mapping(candidate_config)
+    expected_heads = {
+        PARENT_ARM: EXPECTED_C0_HEAD_TYPE,
+        CANDIDATE_ARM: EXPECTED_HEAD_TYPE,
+    }
+    for label, config in ((PARENT_ARM, parent), (CANDIDATE_ARM, candidate)):
+        if _nested(config, "model", "type") != EXPECTED_MODEL_TYPE:
+            raise VerificationContractError(
+                f"{label} model must be {EXPECTED_MODEL_TYPE}"
+            )
+        observed_head = _nested(config, "model", "head", "type")
+        if observed_head != expected_heads[label]:
+            raise VerificationContractError(
+                f"{label} head must be {expected_heads[label]}"
+            )
+        backbone = _nested(config, "model", "img_backbone")
+        if (
+            _nested(backbone, "type") != "mmdet.ResNet"
+            or _nested(backbone, "depth") != 18
+        ):
+            raise VerificationContractError(
+                f"{label} must use the frozen mmdet.ResNet depth-18 backbone"
+            )
+        init_cfg = _nested(backbone, "init_cfg")
+        if (
+            _nested(init_cfg, "type") != "Pretrained"
+            or _nested(init_cfg, "checkpoint") != "torchvision://resnet18"
+        ):
+            raise VerificationContractError(
+                f"{label} must retain the ImageNet ResNet-18 initialization contract"
+            )
+        _require_zero_temporal_slots(config, label)
+        order = _nested(config, "model", "head", "operation_order")
+        if not isinstance(order, (list, tuple)):
+            raise VerificationContractError(
+                f"{label} operation_order must be an ordered sequence"
+            )
+        if "temp_gnn" in order or list(order).count("gnn") != 5:
+            raise VerificationContractError(
+                f"{label} must contain exactly five temporal-free GNN stages"
+            )
+        if any(
+            index + 1 >= len(order) or order[index + 1] != "norm"
+            for index, operation in enumerate(order)
+            if operation == "gnn"
+        ):
+            raise VerificationContractError(
+                f"{label} must retain post-GNN LayerNorm at every stage"
+            )
+        dataloader = _nested(config, "test_dataloader")
+        if _nested(dataloader, "batch_size") != expected_batch_size:
+            raise VerificationContractError(
+                f"{label} test batch size must equal {expected_batch_size}"
+            )
+        if _nested(dataloader, "sampler", "shuffle") is not False:
+            raise VerificationContractError(
+                f"{label} test sampler must set shuffle=False"
+            )
+        dataset = _nested(dataloader, "dataset")
+        if (
+            _nested(dataset, "type") != "Fisheye3DODSparse4DDataset"
+            or _nested(dataset, "test_mode") is not True
+        ):
+            raise VerificationContractError(
+                f"{label} must use the Main126 Fisheye3DOD test dataset"
+            )
+        if not str(_nested(dataset, "ann_file")).endswith(
+            "/ImageSets-main126/fisheye3dod_infos_val.pkl"
+        ):
+            raise VerificationContractError(
+                f"{label} must use the Main126 validation annotations"
+            )
+        pipeline = _nested(dataset, "pipeline")
+        if not isinstance(pipeline, list) or len(pipeline) != 2:
+            raise VerificationContractError(
+                f"{label} test pipeline must contain the frozen loader and packer"
+            )
+        if (
+            not isinstance(pipeline[0], Mapping)
+            or pipeline[0].get("type")
+            != "LoadOfficialFisheye3DODForSparse4D"
+            or pipeline[0].get("to_float32") is not True
+            or not isinstance(pipeline[1], Mapping)
+            or pipeline[1].get("type") != "PackSparse4DInputs"
+        ):
+            raise VerificationContractError(
+                f"{label} must retain the frozen FP32 Main126 input pipeline"
+            )
+        if _nested(config, "model", "data_preprocessor", "type") != (
+            EXPECTED_PARENT_PREPROCESSOR
+        ):
+            raise VerificationContractError(
+                f"{label} must use {EXPECTED_PARENT_PREPROCESSOR}"
+            )
+        for forbidden in ("tta_model", "tta_pipeline"):
+            if forbidden in config:
+                raise VerificationContractError(
+                    f"{label} config must not enable {forbidden}"
+                )
+
+    normalized_parent = copy.deepcopy(parent)
+    normalized_candidate = copy.deepcopy(candidate)
+    normalized_candidate["model"]["head"]["type"] = EXPECTED_C0_HEAD_TYPE
+    for config in (normalized_parent, normalized_candidate):
+        for key in NON_EXECUTABLE_CONFIG_KEYS:
+            config.pop(key, None)
+    if normalized_parent != normalized_candidate:
+        raise VerificationContractError(
+            "C0/C32 executable configs differ beyond the audited head type"
+        )
+    normalized_preprocessor = _nested(
+        normalized_parent, "model", "data_preprocessor"
+    )
+    return {
+        "protocol": C0_C32_NEAR_NATIVE_PROTOCOL,
+        "model_type": EXPECTED_MODEL_TYPE,
+        "parent_head_type": EXPECTED_C0_HEAD_TYPE,
+        "candidate_head_type": EXPECTED_HEAD_TYPE,
+        "backbone": "mmdet.ResNet-18",
+        "preprocessor_sha256": canonical_sha256(normalized_preprocessor),
+        "test_batch_size": expected_batch_size,
+        "gnn_stages": 5,
+        "normalized_config_sha256": canonical_sha256(normalized_parent),
+        "only_executable_delta": "model.head.type",
+    }
+
+
 _REPRESENTATION_PIPELINE_PATHS = (
     ("train_dataloader", "dataset", "dataset", "pipeline"),
     ("val_dataloader", "dataset", "pipeline"),
@@ -1748,6 +1951,135 @@ def require_same_fingerprint(
             f"raw-bit mismatch for {label}: parent={parent}, candidate={candidate}"
         )
     return parent
+
+
+def finite_output_schema(value: Any) -> dict[str, Any]:
+    """Validate an inference output and describe structure without its values.
+
+    C0 and C32 are expected to produce different predictions.  Raw-output
+    equality would therefore be the wrong correctness condition.  This helper
+    instead rejects non-finite numeric values and returns a deterministic
+    schema containing container types, keys, tensor shapes, dtypes, and
+    devices.  Two arms can then be required to share a well-formed output
+    contract individually while retaining their scientifically meaningful
+    value and detection-count deltas.
+    """
+
+    def visit(item: Any, *, path: str, depth: int) -> dict[str, Any]:
+        if depth > 64:
+            raise VerificationContractError(
+                f"output schema nesting is too deep at {path}"
+            )
+        if item is None:
+            return {"type": "none"}
+        if isinstance(item, torch.Tensor):
+            if item.layout != torch.strided or item.is_quantized:
+                raise VerificationContractError(
+                    f"output tensor at {path} must be dense and non-quantized"
+                )
+            if (item.is_floating_point() or item.is_complex()) and not bool(
+                torch.isfinite(item).all()
+            ):
+                raise VerificationContractError(
+                    f"output tensor at {path} contains NaN or Inf"
+                )
+            return {
+                "type": "torch.Tensor",
+                "dtype": str(item.dtype),
+                "shape": list(item.shape),
+                "device_type": item.device.type,
+                "layout": str(item.layout),
+            }
+        if isinstance(item, np.ndarray):
+            if np.issubdtype(item.dtype, np.inexact) and not bool(
+                np.isfinite(item).all()
+            ):
+                raise VerificationContractError(
+                    f"output array at {path} contains NaN or Inf"
+                )
+            return {
+                "type": "numpy.ndarray",
+                "dtype": item.dtype.str,
+                "shape": list(item.shape),
+            }
+        if isinstance(item, np.generic):
+            if np.issubdtype(item.dtype, np.inexact) and not bool(
+                np.isfinite(item)
+            ):
+                raise VerificationContractError(
+                    f"output scalar at {path} contains NaN or Inf"
+                )
+            return {"type": f"numpy.scalar:{item.dtype.str}"}
+        if isinstance(item, Mapping):
+            return {
+                "type": f"mapping:{type(item).__module__}.{type(item).__qualname__}",
+                "items": [
+                    {
+                        "key": str(key),
+                        "schema": visit(
+                            child,
+                            path=f"{path}.{key}",
+                            depth=depth + 1,
+                        ),
+                    }
+                    for key, child in item.items()
+                ],
+            }
+        if isinstance(item, (list, tuple)):
+            return {
+                "type": f"sequence:{type(item).__name__}",
+                "length": len(item),
+                "items": [
+                    visit(
+                        child,
+                        path=f"{path}[{index}]",
+                        depth=depth + 1,
+                    )
+                    for index, child in enumerate(item)
+                ],
+            }
+        if isinstance(item, float):
+            if not math.isfinite(item):
+                raise VerificationContractError(
+                    f"output scalar at {path} contains NaN or Inf"
+                )
+            return {"type": "float"}
+        if isinstance(item, (str, bytes, bool, int)):
+            return {"type": type(item).__name__}
+        if hasattr(item, "tensor") and isinstance(item.tensor, torch.Tensor):
+            return {
+                "type": (
+                    f"tensor-wrapper:{type(item).__module__}."
+                    f"{type(item).__qualname__}"
+                ),
+                "tensor": visit(
+                    item.tensor,
+                    path=f"{path}.tensor",
+                    depth=depth + 1,
+                ),
+            }
+        if hasattr(item, "to_dict") and callable(item.to_dict):
+            return {
+                "type": (
+                    f"data-element:{type(item).__module__}."
+                    f"{type(item).__qualname__}"
+                ),
+                "value": visit(
+                    item.to_dict(),
+                    path=f"{path}.to_dict",
+                    depth=depth + 1,
+                ),
+            }
+        raise VerificationContractError(
+            f"unsupported inference output at {path}: "
+            f"{type(item).__module__}.{type(item).__qualname__}"
+        )
+
+    schema = visit(value, path="output", depth=0)
+    return {
+        "schema": schema,
+        "sha256": canonical_sha256(schema),
+    }
 
 
 def _sample_identity(sample: Any, index: int) -> dict[str, Any]:
