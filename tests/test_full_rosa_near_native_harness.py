@@ -219,6 +219,55 @@ def test_execution_gate_fails_before_any_armed_import(
         tool.validate_execution_gate(args)
 
 
+@pytest.mark.parametrize(
+    "value",
+    (
+        "GPU-E79E0304-D240-431B-F05F-7F3A67933B97",
+        "gpu-e79e0304-d240-431b-f05f-7f3a67933b97",
+        b"GPU-e79e0304-d240-431b-f05f-7f3a67933b97",
+    ),
+)
+def test_gpu_uuid_normalization_matches_nvidia_smi_selector_case(value) -> None:
+    assert tool._normalize_gpu_uuid(value) == (
+        "GPU-e79e0304-d240-431b-f05f-7f3a67933b97"
+    )
+
+
+def test_gpu_selection_requires_canonical_lower_uuid(monkeypatch) -> None:
+    args = SimpleNamespace(execute=True, device="cuda:0")
+    canonical = "GPU-e79e0304-d240-431b-f05f-7f3a67933b97"
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", canonical)
+    assert tool._gpu_selection_contract(args)["physical_uuid"] == canonical
+
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", canonical.upper())
+    with pytest.raises(tool.ProtocolError, match="lower-case UUID suffix"):
+        tool._gpu_selection_contract(args)
+
+
+def test_nvidia_smi_snapshot_uses_canonical_lower_selector(monkeypatch) -> None:
+    canonical = "GPU-e79e0304-d240-431b-f05f-7f3a67933b97"
+    commands = []
+
+    def run(command, **kwargs):
+        del kwargs
+        commands.append(command)
+        if any(value.startswith("--query-gpu=") for value in command):
+            row = (
+                "2026/08/02 20:09:39.000, 0, " + canonical
+                + ", NVIDIA GPU, 580.65.06, P0, 40.0, 450.0, 210, 405"
+            )
+        else:
+            row = ""
+        return SimpleNamespace(stdout=row)
+
+    monkeypatch.setattr(tool.subprocess, "run", run)
+    snapshot = tool._nvidia_smi_snapshot(canonical.upper())
+
+    assert snapshot["selected_gpu_uuid"] == canonical
+    assert len(commands) == 2
+    assert all(command[1] == f"--id={canonical}" for command in commands)
+
+
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:
     class FakeCuda:
         @staticmethod
@@ -243,7 +292,8 @@ def test_armed_execution_rejects_preimported_accelerator_module(monkeypatch) -> 
 
 def test_lock_write_failure_closes_and_removes_owned_sentinel(monkeypatch) -> None:
     gpu_uuid = f"GPU-UNITTEST-WRITE-{id(object())}"
-    lock = Path("/tmp") / f".full_rosa_near_native_{gpu_uuid}.lock"
+    canonical = tool._normalize_gpu_uuid(gpu_uuid)
+    lock = Path("/tmp") / f".full_rosa_near_native_{canonical}.lock"
 
     def fail_write(descriptor, payload):
         del descriptor, payload

@@ -390,10 +390,16 @@ def _gpu_selection_contract(args: argparse.Namespace) -> dict[str, Any]:
         raise ProtocolError(
             "CUDA_VISIBLE_DEVICES must be one exact GPU-... UUID during execution"
         )
+    physical_uuid = _normalize_gpu_uuid(tokens[0])
+    if tokens[0] != physical_uuid:
+        raise ProtocolError(
+            "CUDA_VISIBLE_DEVICES must use the canonical GPU- prefix and "
+            "lower-case UUID suffix"
+        )
     return {
         "execution_requires_one_physical_uuid": True,
         "observed_cuda_visible_devices": visible,
-        "physical_uuid": _normalize_gpu_uuid(tokens[0]),
+        "physical_uuid": physical_uuid,
         "logical_device": "cuda:0",
         "all_visible_gpu_rng_calls_confined_to_locked_device": True,
     }
@@ -785,7 +791,10 @@ def _normalize_gpu_uuid(value: Any) -> str:
     normalized = value.strip()
     if normalized.upper().startswith("GPU-"):
         normalized = normalized[4:]
-    return "GPU-" + normalized.upper()
+    # ``nvidia-smi --id`` treats the hexadecimal UUID suffix as
+    # case-sensitive on the deployed driver.  Its own query output uses a
+    # lower-case suffix, so keep one comparison/selector representation here.
+    return "GPU-" + normalized.lower()
 
 
 def _logical_device_identity(torch, device) -> dict[str, Any]:
@@ -873,6 +882,7 @@ def _nvidia_smi_snapshot(gpu_uuid: str) -> dict[str, Any]:
 
 
 def _acquire_physical_gpu_lock(gpu_uuid: str) -> tuple[int, Path]:
+    gpu_uuid = _normalize_gpu_uuid(gpu_uuid)
     safe_uuid = re.sub(r"[^A-Za-z0-9_.-]", "_", gpu_uuid)
     # A fixed system-wide location prevents two runs with different output
     # parents from benchmarking the same physical GPU concurrently.
