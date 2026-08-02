@@ -69,8 +69,8 @@ def _assert_observation_raw_equal(actual, expected):
             assert torch.equal(candidate, parent)
 
 
-def test_single_transform_candidate_stays_disabled_by_default():
-    assert observation_module._ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE is False
+def test_single_transform_candidate_is_enabled_on_benchmark_branch():
+    assert observation_module._ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE is True
 
 
 @pytest.mark.parametrize(
@@ -113,14 +113,12 @@ def test_single_transform_candidate_preserves_projection_and_raw_xyz(
             contract="full_fov",
             inference_storage_reuse=True,
         )
-        actual_projection, raw_camera_xyz = (
-            _ocam_project_points_with_raw_camera_xyz(
-                points,
-                metas,
-                metas["image_wh"],
-                contract="full_fov",
-                inference_storage_reuse=True,
-            )
+        actual_projection, raw_camera_xyz = _ocam_project_points_with_raw_camera_xyz(
+            points,
+            metas,
+            metas["image_wh"],
+            contract="full_fov",
+            inference_storage_reuse=True,
         )
         expected_camera_xyz = _camera_xyz(points, metas["lidar2cam"])
 
@@ -156,8 +154,16 @@ def test_single_transform_candidate_is_raw_exact_end_to_end(
         for name, value in _metas().items()
     }
     keypoints = torch.tensor(
-        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0],
-           [float("nan"), 0.0, -1.0], [10000.0, 0.0, -1.0]]]],
+        [
+            [
+                [
+                    [0.0, -0.0, -1.0],
+                    [0.5, 0.0, -2.0],
+                    [float("nan"), 0.0, -1.0],
+                    [10000.0, 0.0, -1.0],
+                ]
+            ]
+        ],
         dtype=dtype,
     )
     anchor = torch.zeros(1, 1, 11, dtype=dtype)
@@ -266,9 +272,7 @@ def test_single_transform_candidate_fails_closed_for_extension_surfaces(
             keypoints,
             custom_mapping,
         )
-        released_geometry_camera_xyz = (
-            observation_module._geometry._camera_xyz
-        )
+        released_geometry_camera_xyz = observation_module._geometry._camera_xyz
         monkeypatch.setattr(
             observation_module._geometry,
             "_camera_xyz",
@@ -434,6 +438,52 @@ def test_dispatch_mode_guard_fails_closed_without_infra_api(monkeypatch):
     monkeypatch.delattr(
         observation_module._python_dispatch,
         "_is_in_non_infra_torch_dispatch_mode",
+        raising=False,
+    )
+    with torch.no_grad():
+        assert not observation_module._can_reuse_camera_transform(
+            keypoints,
+            metas,
+        )
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+    _assert_observation_raw_equal(actual, expected)
+
+
+def test_function_mode_guard_fails_closed_without_private_api(monkeypatch):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        False,
+    )
+    with torch.no_grad():
+        expected = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        True,
+    )
+    monkeypatch.delattr(
+        observation_module.torch.overrides,
+        "_is_torch_function_mode_enabled",
         raising=False,
     )
     with torch.no_grad():
@@ -633,9 +683,12 @@ def test_single_transform_candidate_does_not_expand_conditioned_input_api(
         True,
     )
 
-    with torch.no_grad(), pytest.raises(
-        ValueError,
-        match=r"points must be \[B,N,P,3\]",
+    with (
+        torch.no_grad(),
+        pytest.raises(
+            ValueError,
+            match=r"points must be \[B,N,P,3\]",
+        ),
     ):
         project_and_describe(
             conditioned,
@@ -1186,9 +1239,7 @@ def test_project_and_describe_eval_storage_reuse_is_raw_exact():
 
 def test_compact_rfl_relation_preserves_legacy_values_and_owns_storage():
     metas = _metas()
-    keypoints = torch.tensor(
-        [[[[0.0, 0.0, -1.0], [0.5, 0.0, -1.0], [0.0, 0.5, -1.0]]]]
-    )
+    keypoints = torch.tensor([[[[0.0, 0.0, -1.0], [0.5, 0.0, -1.0], [0.0, 0.5, -1.0]]]])
     anchor = torch.zeros(1, 1, 11)
     anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
     anchor[..., 7] = 1.0

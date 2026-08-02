@@ -42,10 +42,10 @@ _RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
 _RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
 _RELEASED_PREPARED_STACKED = FusedBilinearSampler._sample_multiscale_prepared_stacked
-# CUDA raw-bit parity must be established before this candidate becomes the
-# production default.  CPU eager and Dynamo backend=eager tests exercise the
-# guarded implementation; production-backend lowering remains unverified.
-_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE = False
+# This isolated candidate branch enables the eager optimization for sealed
+# CUDA A/B validation.  Promotion to the release branch still requires raw-bit
+# full-model parity plus the preregistered latency and memory gates.
+_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE = True
 
 
 def _override_mode_is_active_or_unknown() -> bool:
@@ -88,15 +88,7 @@ def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
     if (
         not _ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE
         or torch.is_grad_enabled()
-        or torch.overrides._is_torch_function_mode_enabled()
-        or getattr(
-            _python_dispatch,
-            "_is_in_non_infra_torch_dispatch_mode",
-            # PyTorch 2.1/2.2 do not expose the infra-aware mode flag.  Keep
-            # this private candidate disabled there rather than miss a user
-            # TorchDispatchMode and change its observed operator sequence.
-            True,
-        )
+        or _override_mode_is_active_or_unknown()
         or type(metadata) is not dict
         or type(keypoints) is not torch.Tensor
         or keypoints.ndim != 4
