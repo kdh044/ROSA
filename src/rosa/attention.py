@@ -8,6 +8,7 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from . import rfl as _rfl
 from .config import ROSAConfig
 from .rfl import SphericalRayFeatureLifting
 from .types import ObservationEncoding, RayFeatureRelation
@@ -41,6 +42,60 @@ def mean_pairwise_camera_cosine(values: Tensor, valid: Tensor) -> Tensor:
     pair_count = camera_count * (camera_count - 1.0) * 0.5
     summed = masked.sum(dim=3)
     pair_sum = (summed.square().sum(dim=-1) - masked.square().sum(dim=(-1, -2))) * 0.5
+    return torch.where(
+        pair_count > 0,
+        pair_sum / pair_count.clamp_min(1.0),
+        torch.zeros_like(pair_sum),
+    )
+
+
+def _is_owned_plain_fp32_tensor(
+    value: Tensor,
+    *,
+    shape: torch.Size | tuple[int, ...],
+    device: torch.device,
+    protected: tuple[Tensor, ...],
+) -> bool:
+    """Validate storage before a private eager in-place operation."""
+
+    alias_check = getattr(torch._C, "_is_alias_of", None)
+    if (
+        alias_check is not _RELEASED_ALIAS_CHECK
+        or type(value) is not torch.Tensor
+        or value.shape != shape
+        or value.dtype is not torch.float32
+        or value.device != device
+        or value.layout != torch.strided
+        or value.is_quantized
+        or value.requires_grad
+        or value._base is not None
+        or not value.is_contiguous()
+        or value.storage_offset() != 0
+        or any(name is not None for name in value.names)
+        or any(type(other) not in (torch.Tensor, nn.Parameter) for other in protected)
+    ):
+        return False
+    try:
+        return not any(alias_check(value, other) for other in protected)
+    except Exception:
+        return False
+
+
+def _mean_pairwise_camera_cosine_owned_inference(
+    normalized_values: Tensor,
+    valid: Tensor,
+) -> Tensor:
+    """Consume an owned normalized-value buffer with the released math order."""
+
+    masked = normalized_values.permute(0, 1, 3, 2, 4)
+    masked.mul_(valid.permute(0, 1, 3, 2)[..., None].to(normalized_values.dtype))
+    camera_count = valid.sum(dim=2).to(normalized_values.dtype)
+    pair_count = camera_count * (camera_count - 1.0) * 0.5
+    summed = masked.sum(dim=3)
+    summed.square_()
+    summed_square = summed.sum(dim=-1)
+    masked.square_()
+    pair_sum = (summed_square - masked.sum(dim=(-1, -2))) * 0.5
     return torch.where(
         pair_count > 0,
         pair_sum / pair_count.clamp_min(1.0),
@@ -124,6 +179,7 @@ class PointwiseROSA(nn.Module):
             query,
             observation_usage=observation_usage,
             reuse_owned_rfl_delta=False,
+            reuse_owned_pointwise_storage=False,
         )
 
     def _can_reuse_owned_rfl_delta(
@@ -175,6 +231,145 @@ class PointwiseROSA(nn.Module):
             and self.rfl._can_reuse_owned_delta(features, relation)
         )
 
+    def _can_reuse_owned_pointwise_storage(
+        self,
+        features: Tensor,
+        geometry: Tensor,
+        relation: Tensor | RayFeatureRelation,
+        valid: Tensor,
+        query: Tensor,
+        observation_usage: str,
+    ) -> bool:
+        """Seal Pointwise buffer reuse to the released FP32 lean eager edge."""
+
+        if (
+            "_can_reuse_owned_pointwise_storage" in self.__dict__
+            or type(self)._can_reuse_owned_pointwise_storage
+            is not _RELEASED_POINTWISE_ROSA_STORAGE_GUARD
+            or _is_owned_plain_fp32_tensor is not _RELEASED_OWNED_TENSOR_CHECK
+            or _mean_pairwise_camera_cosine_owned_inference
+            is not _RELEASED_OWNED_CONSISTENCY
+            or _rfl._plain_eager_no_grad_execution is not _RELEASED_PLAIN_EAGER_NO_GRAD
+            or not _rfl._plain_eager_no_grad_execution()
+            or not self._can_reuse_owned_rfl_delta(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage,
+            )
+        ):
+            return False
+
+        if (
+            type(self.feature_norm) is not nn.LayerNorm
+            or "forward" in self.feature_norm.__dict__
+            or type(self.feature_norm).forward is not _RELEASED_LAYER_NORM_FORWARD
+            or type(self.query_proj) is not nn.Linear
+            or "forward" in self.query_proj.__dict__
+            or type(self.query_proj).forward is not _RELEASED_LINEAR_FORWARD
+            or type(self.key_proj) is not nn.Linear
+            or "forward" in self.key_proj.__dict__
+            or type(self.key_proj).forward is not _RELEASED_LINEAR_FORWARD
+            or type(self.value_proj) is not nn.Identity
+            or "forward" in self.value_proj.__dict__
+            or type(self.value_proj).forward is not _RELEASED_IDENTITY_FORWARD
+            or type(self.geometry_bias) is not nn.Sequential
+            or "forward" in self.geometry_bias.__dict__
+            or type(self.geometry_bias).forward is not _RELEASED_SEQUENTIAL_FORWARD
+            or len(self.geometry_bias) != 3
+            or type(self.geometry_bias[0]) is not nn.Linear
+            or "forward" in self.geometry_bias[0].__dict__
+            or type(self.geometry_bias[0]).forward is not _RELEASED_LINEAR_FORWARD
+            or type(self.geometry_bias[1]) is not nn.SiLU
+            or "forward" in self.geometry_bias[1].__dict__
+            or type(self.geometry_bias[1]).forward is not _RELEASED_SILU_FORWARD
+            or self.geometry_bias[1].inplace
+            or type(self.geometry_bias[2]) is not nn.Linear
+            or "forward" in self.geometry_bias[2].__dict__
+            or type(self.geometry_bias[2]).forward is not _RELEASED_LINEAR_FORWARD
+            or type(self.point_embedding) is not nn.Embedding
+            or "forward" in self.point_embedding.__dict__
+            or type(self.point_embedding).forward is not _RELEASED_EMBEDDING_FORWARD
+            or self.point_query is not None
+            or self.point_key is not None
+            or self.point_output is not None
+        ):
+            return False
+
+        tensors = (features, geometry, valid, query, relation.ray, relation.valid)
+        if (
+            features.dtype is not torch.float32
+            or geometry.dtype is not torch.float32
+            or query.dtype is not torch.float32
+            or relation.ray.dtype is not torch.float32
+            or valid.dtype is not torch.bool
+            or relation.valid.dtype is not torch.bool
+            or any(tensor.device != features.device for tensor in tensors)
+            or any(
+                tensor.layout != torch.strided
+                or tensor.is_quantized
+                or tensor.requires_grad
+                or not tensor.is_contiguous()
+                or any(name is not None for name in tensor.names)
+                for tensor in tensors
+            )
+        ):
+            return False
+        alias_check = getattr(torch._C, "_is_alias_of", None)
+        try:
+            if (
+                alias_check is not _RELEASED_ALIAS_CHECK
+                or alias_check(relation.ray, geometry)
+                or alias_check(relation.valid, valid)
+            ):
+                return False
+        except Exception:
+            return False
+
+        dims = self.cfg.embed_dims
+        hidden = self.cfg.hidden_dims
+        parameters = tuple(self.parameters())
+        return bool(
+            self.cfg.architecture_profile == "compact"
+            and self.cfg.enable_rfl
+            and self.cfg.enable_rosa_geometry
+            and not self.cfg.uniform_camera_fusion
+            and not self.cfg.uniform_point_fusion
+            and all(
+                getattr(module, "_compiled_call_impl", None) is None
+                for module in self.modules()
+            )
+            and self.feature_norm.normalized_shape == (dims,)
+            and self.feature_norm.elementwise_affine
+            and self.query_proj.in_features == dims
+            and self.query_proj.out_features == hidden
+            and self.query_proj.bias is None
+            and self.key_proj.in_features == dims + self.geometry_dims
+            and self.key_proj.out_features == hidden
+            and self.key_proj.bias is None
+            and self.geometry_bias[0].in_features == self.geometry_dims
+            and self.geometry_bias[0].out_features == hidden
+            and self.geometry_bias[2].in_features == hidden
+            and self.geometry_bias[2].out_features == 1
+            and self.point_embedding.num_embeddings == self.cfg.num_keypoints
+            and self.point_embedding.embedding_dim == dims
+            and self.point_embedding.padding_idx is None
+            and self.point_embedding.max_norm is None
+            and not self.point_embedding.scale_grad_by_freq
+            and not self.point_embedding.sparse
+            and all(type(parameter) is nn.Parameter for parameter in parameters)
+            and all(parameter.dtype is torch.float32 for parameter in parameters)
+            and all(parameter.device == features.device for parameter in parameters)
+            and all(parameter.layout == torch.strided for parameter in parameters)
+            and all(not parameter.is_quantized for parameter in parameters)
+            and all(
+                all(name is None for name in parameter.names)
+                for parameter in parameters
+            )
+        )
+
     def _forward_compact_lean_inference(
         self,
         features: Tensor,
@@ -185,16 +380,38 @@ class PointwiseROSA(nn.Module):
         *,
         observation_usage: str,
     ) -> ObservationEncoding:
-        """Fuse a lean observation while reusing only RFL-owned storage."""
+        """Fuse a lean observation while reusing owned RFL/Pointwise storage."""
 
-        if not self._can_reuse_owned_rfl_delta(
-            features,
-            geometry,
-            relation,
-            valid,
-            query,
-            observation_usage,
-        ):
+        pointwise_storage_reuse = bool(
+            "_can_reuse_owned_pointwise_storage" not in self.__dict__
+            and type(self)._can_reuse_owned_pointwise_storage
+            is _RELEASED_POINTWISE_ROSA_STORAGE_GUARD
+            and self._can_reuse_owned_pointwise_storage(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage,
+            )
+        )
+        rfl_storage_reuse = bool(
+            pointwise_storage_reuse
+            or (
+                "_can_reuse_owned_rfl_delta" not in self.__dict__
+                and type(self)._can_reuse_owned_rfl_delta
+                is _RELEASED_POINTWISE_ROSA_REUSE_GUARD
+                and self._can_reuse_owned_rfl_delta(
+                    features,
+                    geometry,
+                    relation,
+                    valid,
+                    query,
+                    observation_usage,
+                )
+            )
+        )
+        if not rfl_storage_reuse:
             # Use Module.__call__ so every public hook and interception surface
             # remains observable whenever any private precondition is absent.
             return self(
@@ -213,6 +430,7 @@ class PointwiseROSA(nn.Module):
             query,
             observation_usage=observation_usage,
             reuse_owned_rfl_delta=True,
+            reuse_owned_pointwise_storage=pointwise_storage_reuse,
         )
 
     def _forward_impl(
@@ -225,6 +443,7 @@ class PointwiseROSA(nn.Module):
         *,
         observation_usage: str,
         reuse_owned_rfl_delta: bool,
+        reuse_owned_pointwise_storage: bool,
     ) -> ObservationEncoding:
         if observation_usage not in ("full", "base_support", "candidate"):
             raise ValueError(f"invalid observation usage: {observation_usage!r}")
@@ -246,13 +465,39 @@ class PointwiseROSA(nn.Module):
         else:
             rfl_scale = 1.0 if self.cfg.enable_rfl else 0.0
             lifted = features + rfl_scale * self.rfl(features, relation)
+        if reuse_owned_pointwise_storage:
+            protected = (
+                features,
+                geometry,
+                valid,
+                query,
+                relation.ray,
+                relation.valid,
+                *tuple(self.parameters()),
+            )
+            reuse_owned_pointwise_storage = _is_owned_plain_fp32_tensor(
+                lifted,
+                shape=features.shape,
+                device=features.device,
+                protected=protected,
+            )
         normalized = self.feature_norm(lifted)
         query_key = self.query_proj(query)[:, :, None, None, :]
         scoring_geometry = (
             geometry if self.cfg.enable_rosa_geometry else torch.zeros_like(geometry)
         )
         camera_key = self.key_proj(torch.cat((normalized, scoring_geometry), dim=-1))
-        logits = (query_key * camera_key).sum(dim=-1)
+        if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
+            camera_key,
+            shape=features.shape[:-1] + (self.cfg.hidden_dims,),
+            device=features.device,
+            protected=(lifted, normalized, scoring_geometry, query_key),
+        ):
+            torch.mul(query_key, camera_key, out=camera_key)
+            logits = camera_key.sum(dim=-1)
+        else:
+            reuse_owned_pointwise_storage = False
+            logits = (query_key * camera_key).sum(dim=-1)
         logits = logits / math.sqrt(self.cfg.hidden_dims)
         logits = logits + self.geometry_bias(scoring_geometry).squeeze(-1)
         if self.cfg.uniform_camera_fusion:
@@ -260,18 +505,55 @@ class PointwiseROSA(nn.Module):
 
         camera_weights = masked_softmax(logits, valid, dim=2)
         values = self.value_proj(lifted)
-        point_features = (camera_weights[..., None] * values).sum(dim=2)
+        if reuse_owned_pointwise_storage and values is not lifted:
+            reuse_owned_pointwise_storage = False
+        if reuse_owned_pointwise_storage and observation_usage == "base_support":
+            torch.mul(camera_weights[..., None], values, out=values)
+            point_features = values.sum(dim=2)
+        else:
+            point_features = (camera_weights[..., None] * values).sum(dim=2)
         point_valid = valid.any(dim=2)
         point_ids = torch.arange(
             self.cfg.num_keypoints,
             device=query.device,
         )
-        point_features = point_features + self.point_embedding(point_ids)[None, None]
+        point_embedding = self.point_embedding(point_ids)[None, None]
+        if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
+            point_features,
+            shape=features.shape[:2] + features.shape[3:5],
+            device=features.device,
+            protected=(values, camera_weights, point_embedding),
+        ):
+            point_features.add_(point_embedding)
+        else:
+            reuse_owned_pointwise_storage = False
+            point_features = point_features + point_embedding
         if self.cfg.architecture_profile == "compact":
-            point_logits = (
-                F.normalize(query, dim=-1, eps=1e-6)[:, :, None, :]
-                * F.normalize(point_features, dim=-1, eps=1e-6)
-            ).sum(dim=-1)
+            if reuse_owned_pointwise_storage:
+                normalized_query = F.normalize(query, dim=-1, eps=1e-6)
+                normalized_points = F.normalize(point_features, dim=-1, eps=1e-6)
+                if _is_owned_plain_fp32_tensor(
+                    normalized_points,
+                    shape=point_features.shape,
+                    device=features.device,
+                    protected=(query, normalized_query, point_features),
+                ):
+                    torch.mul(
+                        normalized_query[:, :, None, :],
+                        normalized_points,
+                        out=normalized_points,
+                    )
+                    point_logits = normalized_points.sum(dim=-1)
+                else:
+                    reuse_owned_pointwise_storage = False
+                    point_logits = (
+                        normalized_query[:, :, None, :] * normalized_points
+                    ).sum(dim=-1)
+            else:
+                point_logits = (
+                    F.normalize(query, dim=-1, eps=1e-6)[:, :, None, :]
+                    * F.normalize(point_features, dim=-1, eps=1e-6)
+                ).sum(dim=-1)
         else:
             point_logits = (
                 self.point_query(query)[:, :, None, :] * self.point_key(point_features)
@@ -280,7 +562,11 @@ class PointwiseROSA(nn.Module):
         if self.cfg.uniform_point_fusion:
             point_logits = point_logits * 0.0
         point_weights = masked_softmax(point_logits, point_valid, dim=2)
-        object_feature = (point_weights[..., None] * point_features).sum(dim=2)
+        if reuse_owned_pointwise_storage:
+            torch.mul(point_weights[..., None], point_features, out=point_features)
+            object_feature = point_features.sum(dim=2)
+        else:
+            object_feature = (point_weights[..., None] * point_features).sum(dim=2)
         if self.point_output is None:
             object_feature = F.layer_norm(
                 object_feature,
@@ -292,16 +578,31 @@ class PointwiseROSA(nn.Module):
         if not need_consistency:
             consistency = None
         else:
-            normalized_values = F.normalize(
-                torch.nan_to_num(values.float()),
-                dim=-1,
-                eps=1e-6,
-            )
-            if self.cfg.architecture_profile == "compact":
-                point_consistency = mean_pairwise_camera_cosine(
-                    normalized_values,
-                    valid,
+            if reuse_owned_pointwise_storage:
+                values.nan_to_num_()
+                normalized_values = F.normalize(values, dim=-1, eps=1e-6)
+            else:
+                normalized_values = F.normalize(
+                    torch.nan_to_num(values.float()),
+                    dim=-1,
+                    eps=1e-6,
                 )
+            if self.cfg.architecture_profile == "compact":
+                if reuse_owned_pointwise_storage and _is_owned_plain_fp32_tensor(
+                    normalized_values,
+                    shape=values.shape,
+                    device=features.device,
+                    protected=(values, valid),
+                ):
+                    point_consistency = _mean_pairwise_camera_cosine_owned_inference(
+                        normalized_values,
+                        valid,
+                    )
+                else:
+                    point_consistency = mean_pairwise_camera_cosine(
+                        normalized_values,
+                        valid,
+                    )
             else:
                 similarity = torch.einsum(
                     "bncpd,bnfpd->bnpcf",
@@ -382,9 +683,22 @@ class PointwiseROSA(nn.Module):
         )
 
 
+_RELEASED_ALIAS_CHECK = getattr(torch._C, "_is_alias_of", None)
+_RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
+_RELEASED_OWNED_TENSOR_CHECK = _is_owned_plain_fp32_tensor
+_RELEASED_OWNED_CONSISTENCY = _mean_pairwise_camera_cosine_owned_inference
+_RELEASED_LINEAR_FORWARD = nn.Linear.forward
+_RELEASED_LAYER_NORM_FORWARD = nn.LayerNorm.forward
+_RELEASED_IDENTITY_FORWARD = nn.Identity.forward
+_RELEASED_SEQUENTIAL_FORWARD = nn.Sequential.forward
+_RELEASED_SILU_FORWARD = nn.SiLU.forward
+_RELEASED_EMBEDDING_FORWARD = nn.Embedding.forward
 _RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
 _RELEASED_POINTWISE_ROSA_IMPL = PointwiseROSA._forward_impl
 _RELEASED_POINTWISE_ROSA_REUSE_GUARD = PointwiseROSA._can_reuse_owned_rfl_delta
+_RELEASED_POINTWISE_ROSA_STORAGE_GUARD = (
+    PointwiseROSA._can_reuse_owned_pointwise_storage
+)
 _RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
 
 

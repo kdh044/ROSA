@@ -168,6 +168,52 @@ def test_compact_lean_refiner_reuses_exactly_two_rfl_delta_buffers():
     assert observed_calls == Counter({"private_rfl": 2, "owned_finish": 2})
 
 
+def test_compact_lean_refiner_reuses_pointwise_storage_for_base_and_candidates():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    calls = []
+    implementation_code = type(stage.rosa)._forward_impl.__code__
+
+    def capture_private_flags(frame, event, _arg):
+        if event == "call" and frame.f_code is implementation_code:
+            calls.append(
+                (
+                    frame.f_locals["observation_usage"],
+                    frame.f_locals["reuse_owned_rfl_delta"],
+                    frame.f_locals["reuse_owned_pointwise_storage"],
+                )
+            )
+
+    with torch.no_grad():
+        stage.rosa.rfl.output_proj.weight.normal_()
+        previous_profile = sys.getprofile()
+        sys.setprofile(capture_private_flags)
+        try:
+            result = stage(
+                anchor,
+                query,
+                fpn,
+                metas,
+                generator,
+                materialize_diagnostics=False,
+                return_final_anchor_only=True,
+            )
+        finally:
+            sys.setprofile(previous_profile)
+    assert result.shape == anchor.shape
+    assert calls == [
+        ("base_support", True, True),
+        ("candidate", True, True),
+    ]
+
+
 def test_closed_loop_is_exact_native_identity_at_initialization():
     stage, anchor, query, fpn, metas, generator = _fixture()
     output = stage(anchor, query, fpn, metas, generator)
