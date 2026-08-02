@@ -1,0 +1,86 @@
+{
+  "schema": "rosa.c32_representation_aware_runtime_harness_cpu.v1",
+  "date_utc": "2026-08-02",
+  "status": "CPU_HARNESS_IMPLEMENTED_GPU_UNEXECUTED",
+  "optimization_stack_commit": "f7df58a5e02a6ceeb24c8d1d33e016bf95446166",
+  "harness_source_commits": [
+    "6e5dc64c236e7ce5d8d30697c0a08879a3477510",
+    "2844a67c45545a68fc1559457b14762a71fcb1be"
+  ],
+  "branch": "audit/c32-representation-aware-runtime-harness",
+  "protocol": "lean-loader-uint8-pinned",
+  "arm_contract": {
+    "parent": "lean loader, contiguous CPU FP32 image ingress, pin_memory=false, non_blocking=false",
+    "candidate": "lean loader, contiguous CPU uint8 image ingress, pin_memory=true, non_blocking=true",
+    "stream_policy": "torch-current-default-stream-only",
+    "checkpoint_and_model_graph": "identical"
+  },
+  "pairing_contract": {
+    "physical_rounds": [
+      "PCCP",
+      "CPPC",
+      "PCCP",
+      "CPPC",
+      "PCCP",
+      "CPPC"
+    ],
+    "warmup_iterations_per_arm": 60,
+    "measured_pairs_per_arm": 300,
+    "semantic_binding": "same ordered sample identities and canonical semantic SHA-256; the complete 360-pair live sequence is fingerprinted before timing and replay-checked",
+    "arm_binding": "distinct raw representation fingerprints",
+    "bootstrap": "deterministic six-round-stratified paired percentile bootstrap"
+  },
+  "benchmark_scopes": {
+    "model_only": "preprocessed common FP32 boundary through model._run_forward; excludes loader, collate, pinning, preprocessing, and H2D",
+    "input_pipeline_end_to_end": "dataset loader/transforms plus collate/pinning plus preprocessor/H2D; excludes model execution",
+    "combined_full_inference": "not measured and no speed gate or claim"
+  },
+  "fail_closed_checks": [
+    "sample identity or semantic digest mismatch",
+    "paired-batch swap or reuse in live measured pairs",
+    "captured representation mutation",
+    "unauthorized executable config drift",
+    "parent/candidate ingress dtype, shape, layout, pinning, or non_blocking drift",
+    "custom CUDA stream",
+    "common preprocessor-boundary raw-bit mismatch",
+    "execution without explicit ARMED state and the existing exact idle/reserved confirmation"
+  ],
+  "cpu_tests": {
+    "new_representation_negative_suite": {
+      "passed": 16,
+      "failed": 0
+    },
+    "full_relevant_guarded_suite": {
+      "passed": 68,
+      "failed": 0
+    },
+    "repository_wide_guarded_cpu_suite": {
+      "passed": 218,
+      "skipped": 5,
+      "failed": 0
+    },
+    "cuda_availability_calls": "monkeypatched before pytest collection; no real CUDA discovery",
+    "nvidia_smi": "not invoked except mocked unit-test subprocess responses"
+  },
+  "execution": {
+    "real_cuda_query": false,
+    "gpu_inference": false,
+    "gpu_timing": false,
+    "job_or_queue_signal": false,
+    "job_restart": false,
+    "speed_claim_authorized": false
+  },
+  "limitations": [
+    "The ARMED CUDA path has not been executed or numerically validated.",
+    "The two benchmark scopes are intentionally separate and must not be added into a synthetic full-inference claim.",
+    "The input-pipeline gate excludes model execution; the model-only gate is non-regression-only.",
+    "Full live-pair prevalidation warms filesystem/page caches; the input-pipeline result is explicitly a prevalidated warm-cache measurement.",
+    "Actual pinning, asynchronous transfer, CUDA stream, profiler, memory, latency, and environment evidence remain pending an authorized idle GPU run.",
+    "C32-versus-C0 near-native eligibility still requires a separately sealed true C0/C32 arm pair."
+  ],
+  "file_sha256": {
+    "src/rosa/runtime_verification.py": "00103d46f8370e87dd1f37e72a8fb5d3c8eeba29d1eadfd88dd1372d730430eb",
+    "tools/verify_c32_runtime.py": "3af1efcf18d6e372eb63a2e377f140361d8302fd0b3a53ed3fccec3f80a4b6b6",
+    "tests/test_representation_runtime_harness.py": "81d660257f05fa647e1a334b7c5a4d09cd6fcb8b0780df3c683747db707c5b64"
+  }
+}

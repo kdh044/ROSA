@@ -23,6 +23,10 @@ import torch
 
 PARENT_ARM = "parent"
 CANDIDATE_ARM = "candidate"
+CPU_METADATA_PROTOCOL = "cpu-metadata"
+REPRESENTATION_PROTOCOL = "lean-loader-uint8-pinned"
+MODEL_ONLY_SCOPE = "model-only-common-preprocessor-boundary"
+INPUT_PIPELINE_SCOPE = "end-to-end-loader-collate-transfer"
 PCCP = "PCCP"
 CPPC = "CPPC"
 PHYSICAL_ROUND_ORDER = (PCCP, CPPC, PCCP, CPPC, PCCP, CPPC)
@@ -48,6 +52,18 @@ EXPECTED_MODEL_TYPE = "Fisheye3DODGravityCenterSparse4D"
 EXPECTED_HEAD_TYPE = "ROSAOfficialResidualNativeBaselineHead"
 EXPECTED_PARENT_PREPROCESSOR = "Sparse4DDataPreprocessor"
 EXPECTED_CANDIDATE_PREPROCESSOR = "Fisheye3DODSingleFrameDataPreprocessor"
+EXPECTED_REPRESENTATION_PREPROCESSOR = (
+    "Fisheye3DODSingleFrameDataPreprocessor"
+)
+EXPECTED_LEAN_LOADER = "LoadOfficialFisheye3DODLeanForSparse4D"
+EXPECTED_PARENT_PACKER = "PackSparse4DInputs"
+EXPECTED_CANDIDATE_PACKER = "PackFisheye3DODUint8Inputs"
+EXPECTED_RUNTIME_TRANSFORM_IMPORT = (
+    "rosa.integrations.fisheye3dod.runtime_transforms"
+)
+REPRESENTATION_STREAM_POLICY = "torch-current-default-stream-only"
+MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM = 1.01
+MODEL_ONLY_P95_RATIO_MAXIMUM = 1.01
 NON_EXECUTABLE_CONFIG_KEYS = ("work_dir", "experiment_contract")
 
 
@@ -257,6 +273,7 @@ def _timing_pairs(
     records: Sequence[Mapping[str, Any]],
     *,
     expected_pairs: int,
+    required_pair_fields: Sequence[str] = (),
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     expected_pairs = _exact_integer(
         "expected_pairs", expected_pairs, minimum=1
@@ -288,6 +305,18 @@ def _timing_pairs(
     candidate_ns: list[int] = []
     sample_counts: list[int] = []
     round_pair_counts = [0] * PHYSICAL_ROUND_COUNT
+    if isinstance(required_pair_fields, (str, bytes)):
+        raise VerificationContractError(
+            "required_pair_fields must be a sequence of field names"
+        )
+    normalized_required_fields = tuple(required_pair_fields)
+    if any(
+        not isinstance(name, str) or not name
+        for name in normalized_required_fields
+    ):
+        raise VerificationContractError(
+            "required_pair_fields must contain nonempty strings"
+        )
     comparable_fields = (
         "phase",
         "round_index",
@@ -295,7 +324,7 @@ def _timing_pairs(
         "segment_iteration_index",
         "batch_index",
         "pair_index",
-    )
+    ) + normalized_required_fields
     for pair_index in range(expected_pairs):
         pair = grouped[pair_index]
         if set(pair) != {PARENT_ARM, CANDIDATE_ARM}:
@@ -304,6 +333,11 @@ def _timing_pairs(
             )
         parent = pair[PARENT_ARM]
         candidate = pair[CANDIDATE_ARM]
+        for name in normalized_required_fields:
+            if name not in parent or name not in candidate:
+                raise VerificationContractError(
+                    f"timing pair {pair_index} is missing required field {name}"
+                )
         if any(parent.get(name) != candidate.get(name) for name in comparable_fields):
             raise VerificationContractError(
                 f"timing pair {pair_index} does not share schedule metadata"
@@ -391,6 +425,7 @@ def paired_bootstrap_confidence_intervals(
     expected_pairs: int,
     bootstrap_samples: int = BOOTSTRAP_SAMPLES,
     seed: int = BOOTSTRAP_SEED,
+    required_pair_fields: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Compute deterministic percentile CIs by resampling paired P/C calls."""
 
@@ -401,6 +436,7 @@ def paired_bootstrap_confidence_intervals(
     parent_ns, candidate_ns, sample_counts = _timing_pairs(
         records,
         expected_pairs=expected_pairs,
+        required_pair_fields=required_pair_fields,
     )
     point_estimates = {
         "median_candidate_over_parent": (
@@ -505,6 +541,7 @@ def paired_bootstrap_confidence_intervals(
         "pairs": len(parent_ns),
         "pairs_per_round": pairs_per_round,
         "physical_round_order": list(PHYSICAL_ROUND_ORDER),
+        "required_pair_fields": list(required_pair_fields),
         "per_round_point_estimates": per_round,
         "metrics": metrics,
     }
@@ -629,6 +666,142 @@ def evaluate_c32_near_native_gate(
             if passed
             else "NEAR_NATIVE_NOT_SUPPORTED"
         ),
+        "checks": checks,
+    }
+
+
+def evaluate_model_only_non_regression_gate(
+    paired_bootstrap: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Gate only common-boundary model math; it is not a speed-adoption gate."""
+
+    metrics = _nested(paired_bootstrap, "metrics")
+    median_upper = float(
+        _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
+    )
+    p95_ratio = float(
+        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
+    )
+    if not all(math.isfinite(value) for value in (median_upper, p95_ratio)):
+        raise VerificationContractError("model-only decision metrics must be finite")
+    checks = {
+        "median_ratio_ci95_upper_at_most_1_01": {
+            "observed": median_upper,
+            "threshold_max_inclusive": (
+                MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
+            ),
+            "passed": (
+                median_upper <= MODEL_ONLY_MEDIAN_RATIO_CI95_UPPER_MAXIMUM
+            ),
+        },
+        "p95_ratio_at_most_1_01": {
+            "observed_candidate_over_parent": p95_ratio,
+            "threshold_max_inclusive": MODEL_ONLY_P95_RATIO_MAXIMUM,
+            "passed": p95_ratio <= MODEL_ONLY_P95_RATIO_MAXIMUM,
+        },
+    }
+    passed = all(check["passed"] for check in checks.values())
+    return {
+        "gate": "model_only_common_boundary_non_regression",
+        "benchmark_scope": MODEL_ONLY_SCOPE,
+        "passed": passed,
+        "decision": "MODEL_ONLY_NON_REGRESSION" if passed else "INCONCLUSIVE",
+        "speed_claim_eligible": False,
+        "checks": checks,
+    }
+
+
+def evaluate_input_pipeline_gate(
+    paired_bootstrap: Mapping[str, Any],
+    representation_pairs: Sequence[Mapping[str, Any]],
+    *,
+    common_boundary_parity: bool,
+) -> dict[str, Any]:
+    """Gate loader+collate+transfer separately from model execution."""
+
+    if common_boundary_parity is not True:
+        raise VerificationContractError(
+            "input-pipeline timing requires exact common-boundary parity"
+        )
+    if not isinstance(representation_pairs, Sequence) or not representation_pairs:
+        raise VerificationContractError(
+            "input-pipeline gate requires representation pair manifests"
+        )
+    metrics = _nested(paired_bootstrap, "metrics")
+    median_ratio = float(
+        _nested(metrics, "median_candidate_over_parent", "point_estimate")
+    )
+    median_upper = float(
+        _nested(metrics, "median_candidate_over_parent", "ci95", "upper")
+    )
+    p95_ratio = float(
+        _nested(metrics, "p95_candidate_over_parent", "point_estimate")
+    )
+    if not all(
+        math.isfinite(value)
+        for value in (median_ratio, median_upper, p95_ratio)
+    ):
+        raise VerificationContractError("input-pipeline metrics must be finite")
+    byte_records = []
+    for pair in representation_pairs:
+        if pair.get("schema") != "rosa.representation_pair.v1":
+            raise VerificationContractError(
+                "input-pipeline gate received an invalid pair manifest"
+            )
+        parent_bytes = _exact_integer(
+            "parent image bytes",
+            _nested(pair, "arms", PARENT_ARM, "ingress", "image_bytes"),
+            minimum=1,
+        )
+        candidate_bytes = _exact_integer(
+            "candidate image bytes",
+            _nested(pair, "arms", CANDIDATE_ARM, "ingress", "image_bytes"),
+            minimum=1,
+        )
+        byte_records.append(
+            {
+                "batch_index": pair.get("batch_index"),
+                "parent": parent_bytes,
+                "candidate": candidate_bytes,
+                "passed": candidate_bytes < parent_bytes,
+            }
+        )
+    checks = {
+        "common_preprocessor_boundary_raw_bit_parity": {
+            "passed": True,
+        },
+        "candidate_ingress_bytes_strictly_lower": {
+            "batches": byte_records,
+            "passed": all(record["passed"] for record in byte_records),
+        },
+        "median_reduction_at_least_2_percent": {
+            "observed_candidate_over_parent": median_ratio,
+            "threshold_max_inclusive": 1.0 - STRICT_MEDIAN_REDUCTION_MINIMUM,
+            "passed": median_ratio <= 1.0 - STRICT_MEDIAN_REDUCTION_MINIMUM,
+        },
+        "median_ratio_ci95_upper_below_1": {
+            "observed": median_upper,
+            "threshold_max_exclusive": STRICT_MEDIAN_RATIO_CI95_UPPER_EXCLUSIVE,
+            "passed": median_upper < STRICT_MEDIAN_RATIO_CI95_UPPER_EXCLUSIVE,
+        },
+        "p95_regression_at_most_1_percent": {
+            "observed_candidate_over_parent": p95_ratio,
+            "threshold_max_inclusive": STRICT_P95_RATIO_MAXIMUM,
+            "passed": p95_ratio <= STRICT_P95_RATIO_MAXIMUM,
+        },
+    }
+    passed = all(check["passed"] for check in checks.values())
+    return {
+        "gate": "end_to_end_input_pipeline_adoption",
+        "benchmark_scope": INPUT_PIPELINE_SCOPE,
+        "passed": passed,
+        "decision": (
+            "INPUT_PIPELINE_CANDIDATE_ELIGIBLE"
+            if passed
+            else "RETAIN_PARENT_AND_REPORT_INCONCLUSIVE"
+        ),
+        "speed_claim_eligible": passed,
+        "scope_excludes_model_execution": True,
         "checks": checks,
     }
 
@@ -874,6 +1047,237 @@ def validate_config_pair(
     }
 
 
+_REPRESENTATION_PIPELINE_PATHS = (
+    ("train_dataloader", "dataset", "dataset", "pipeline"),
+    ("val_dataloader", "dataset", "pipeline"),
+    ("test_dataloader", "dataset", "pipeline"),
+)
+
+
+def _pipeline_at(config: Mapping[str, Any], path: Sequence[str]) -> list[Any]:
+    pipeline = _nested(config, *path)
+    if not isinstance(pipeline, list) or len(pipeline) < 2:
+        raise VerificationContractError(
+            "config pipeline must be a list containing loader and packer"
+        )
+    return pipeline
+
+
+def _exact_bool_setting(
+    mapping: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool,
+    label: str,
+) -> bool:
+    value = mapping.get(key, default)
+    if type(value) is not bool:
+        raise VerificationContractError(f"{label} must be an exact boolean")
+    return value
+
+
+def validate_representation_config_pair(
+    parent_config: Any,
+    candidate_config: Any,
+    *,
+    expected_batch_size: int,
+) -> dict[str, Any]:
+    """Seal the lean FP32 versus pinned uint8 representation-only delta."""
+
+    expected_batch_size = _exact_integer(
+        "expected_batch_size", expected_batch_size, minimum=1
+    )
+    parent = _mapping(parent_config)
+    candidate = _mapping(candidate_config)
+    for label, config in ((PARENT_ARM, parent), (CANDIDATE_ARM, candidate)):
+        if _nested(config, "model", "type") != EXPECTED_MODEL_TYPE:
+            raise VerificationContractError(
+                f"{label} model must be {EXPECTED_MODEL_TYPE}"
+            )
+        if _nested(config, "model", "head", "type") != EXPECTED_HEAD_TYPE:
+            raise VerificationContractError(
+                f"{label} head must be {EXPECTED_HEAD_TYPE}"
+            )
+        _require_zero_temporal_slots(config, label)
+        order = _nested(config, "model", "head", "operation_order")
+        if not isinstance(order, (list, tuple)) or "temp_gnn" in order:
+            raise VerificationContractError(
+                f"{label} operation_order must be a temporal-free sequence"
+            )
+        if _nested(config, "test_dataloader", "batch_size") != expected_batch_size:
+            raise VerificationContractError(
+                f"{label} test batch size must equal {expected_batch_size}"
+            )
+        if _nested(config, "test_dataloader", "sampler", "shuffle") is not False:
+            raise VerificationContractError(
+                f"{label} test sampler must set shuffle=False"
+            )
+        preprocessor = _nested(config, "model", "data_preprocessor")
+        if _nested(preprocessor, "type") != EXPECTED_REPRESENTATION_PREPROCESSOR:
+            raise VerificationContractError(
+                f"{label} preprocessor must be "
+                f"{EXPECTED_REPRESENTATION_PREPROCESSOR}"
+            )
+        for forbidden in ("tta_model", "tta_pipeline"):
+            if forbidden in config:
+                raise VerificationContractError(
+                    f"{label} config must not enable {forbidden}"
+                )
+        for stream_key in ("stream", "cuda_stream", "transfer_stream"):
+            if stream_key in preprocessor:
+                raise VerificationContractError(
+                    f"{label} must not configure a custom CUDA stream"
+                )
+
+    normalized_parent = copy.deepcopy(parent)
+    normalized_candidate = copy.deepcopy(candidate)
+    for path in _REPRESENTATION_PIPELINE_PATHS:
+        parent_pipeline = _pipeline_at(normalized_parent, path)
+        candidate_pipeline = _pipeline_at(normalized_candidate, path)
+        parent_loader = parent_pipeline[0]
+        candidate_loader = candidate_pipeline[0]
+        parent_packer = parent_pipeline[-1]
+        candidate_packer = candidate_pipeline[-1]
+        if not all(
+            isinstance(value, Mapping)
+            for value in (
+                parent_loader,
+                candidate_loader,
+                parent_packer,
+                candidate_packer,
+            )
+        ):
+            raise VerificationContractError(
+                "representation pipelines require mapping loader/packer entries"
+            )
+        if (
+            parent_loader.get("type") != EXPECTED_LEAN_LOADER
+            or candidate_loader.get("type") != EXPECTED_LEAN_LOADER
+        ):
+            raise VerificationContractError(
+                f"both representation arms must use {EXPECTED_LEAN_LOADER}"
+            )
+        if parent_loader.get("to_float32") is not True:
+            raise VerificationContractError(
+                "parent lean loader must emit FP32 images"
+            )
+        if candidate_loader.get("to_float32") is not False:
+            raise VerificationContractError(
+                "candidate lean loader must retain uint8 images"
+            )
+        if parent_packer.get("type") != EXPECTED_PARENT_PACKER:
+            raise VerificationContractError(
+                f"parent packer must be {EXPECTED_PARENT_PACKER}"
+            )
+        if candidate_packer.get("type") != EXPECTED_CANDIDATE_PACKER:
+            raise VerificationContractError(
+                f"candidate packer must be {EXPECTED_CANDIDATE_PACKER}"
+            )
+        candidate_loader["to_float32"] = True
+        candidate_packer["type"] = EXPECTED_PARENT_PACKER
+
+    pin_memory = {}
+    for loader_name in (
+        "train_dataloader",
+        "val_dataloader",
+        "test_dataloader",
+    ):
+        parent_loader_config = _nested(parent, loader_name)
+        candidate_loader_config = _nested(candidate, loader_name)
+        parent_pin = _exact_bool_setting(
+            parent_loader_config,
+            "pin_memory",
+            default=False,
+            label=f"parent {loader_name}.pin_memory",
+        )
+        candidate_pin = _exact_bool_setting(
+            candidate_loader_config,
+            "pin_memory",
+            default=False,
+            label=f"candidate {loader_name}.pin_memory",
+        )
+        if parent_pin or not candidate_pin:
+            raise VerificationContractError(
+                "representation pair requires parent pin_memory=False and "
+                "candidate pin_memory=True"
+            )
+        pin_memory[loader_name] = {
+            PARENT_ARM: parent_pin,
+            CANDIDATE_ARM: candidate_pin,
+        }
+        normalized_candidate[loader_name].pop("pin_memory", None)
+        if "pin_memory" in normalized_parent[loader_name]:
+            normalized_candidate[loader_name]["pin_memory"] = (
+                normalized_parent[loader_name]["pin_memory"]
+            )
+
+    parent_preprocessor = _nested(parent, "model", "data_preprocessor")
+    candidate_preprocessor = _nested(candidate, "model", "data_preprocessor")
+    parent_non_blocking = _exact_bool_setting(
+        parent_preprocessor,
+        "non_blocking",
+        default=False,
+        label="parent data_preprocessor.non_blocking",
+    )
+    candidate_non_blocking = _exact_bool_setting(
+        candidate_preprocessor,
+        "non_blocking",
+        default=False,
+        label="candidate data_preprocessor.non_blocking",
+    )
+    if parent_non_blocking or not candidate_non_blocking:
+        raise VerificationContractError(
+            "representation pair requires parent non_blocking=False and "
+            "candidate non_blocking=True"
+        )
+    normalized_candidate["model"]["data_preprocessor"].pop(
+        "non_blocking", None
+    )
+    if "non_blocking" in normalized_parent["model"]["data_preprocessor"]:
+        normalized_candidate["model"]["data_preprocessor"]["non_blocking"] = (
+            normalized_parent["model"]["data_preprocessor"]["non_blocking"]
+        )
+
+    parent_imports = _nested(parent, "custom_imports", "imports")
+    candidate_imports = _nested(candidate, "custom_imports", "imports")
+    if not isinstance(parent_imports, list) or not isinstance(candidate_imports, list):
+        raise VerificationContractError("custom imports must be ordered lists")
+    if candidate_imports != parent_imports + [EXPECTED_RUNTIME_TRANSFORM_IMPORT]:
+        raise VerificationContractError(
+            "candidate custom imports must add only the uint8 runtime transform"
+        )
+    normalized_candidate["custom_imports"]["imports"] = copy.deepcopy(
+        normalized_parent["custom_imports"]["imports"]
+    )
+    for config in (normalized_parent, normalized_candidate):
+        for key in NON_EXECUTABLE_CONFIG_KEYS:
+            config.pop(key, None)
+    if normalized_parent != normalized_candidate:
+        raise VerificationContractError(
+            "representation configs differ beyond the audited lean FP32/uint8 "
+            "pinned-transfer surface"
+        )
+    return {
+        "protocol": REPRESENTATION_PROTOCOL,
+        "model_type": EXPECTED_MODEL_TYPE,
+        "head_type": EXPECTED_HEAD_TYPE,
+        "preprocessor": EXPECTED_REPRESENTATION_PREPROCESSOR,
+        "parent_ingress_dtype": "torch.float32",
+        "candidate_ingress_dtype": "torch.uint8",
+        "loader": EXPECTED_LEAN_LOADER,
+        "parent_packer": EXPECTED_PARENT_PACKER,
+        "candidate_packer": EXPECTED_CANDIDATE_PACKER,
+        "pin_memory": pin_memory,
+        "non_blocking": {
+            PARENT_ARM: parent_non_blocking,
+            CANDIDATE_ARM: candidate_non_blocking,
+        },
+        "stream_policy": REPRESENTATION_STREAM_POLICY,
+        "test_batch_size": expected_batch_size,
+        "normalized_config_sha256": canonical_sha256(normalized_parent),
+    }
+
+
 def _json_default(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -1087,6 +1491,347 @@ def build_batch_manifest(
     return manifest
 
 
+def semantic_sample_digest(
+    batch: Mapping[str, Any],
+    *,
+    expected_batch_size: int,
+) -> dict[str, Any]:
+    """Return the cheap semantic identity key used by live paired timing."""
+
+    expected_batch_size = _exact_integer(
+        "expected_batch_size", expected_batch_size, minimum=1
+    )
+    if not isinstance(batch, Mapping):
+        raise VerificationContractError("semantic batch must be a mapping")
+    samples = batch.get("data_samples")
+    if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
+        raise VerificationContractError(
+            "semantic batch data_samples must be a sequence"
+        )
+    if len(samples) != expected_batch_size:
+        raise VerificationContractError(
+            f"semantic batch has {len(samples)} samples, expected "
+            f"{expected_batch_size}"
+        )
+    identities = [
+        _sample_identity(sample, index) for index, sample in enumerate(samples)
+    ]
+    return {
+        "sample_identities": identities,
+        "sha256": canonical_sha256(identities),
+    }
+
+
+def build_representation_batch_manifest(
+    batch: Mapping[str, Any],
+    *,
+    arm: str,
+    batch_index: int,
+    expected_batch_size: int,
+    observed_pinned: bool | None = None,
+) -> dict[str, Any]:
+    """Validate and fingerprint one arm-specific CPU ingress representation."""
+
+    if arm not in (PARENT_ARM, CANDIDATE_ARM):
+        raise VerificationContractError("representation arm is invalid")
+    batch_index = _exact_integer("batch_index", batch_index, minimum=0)
+    expected_batch_size = _exact_integer(
+        "expected_batch_size", expected_batch_size, minimum=1
+    )
+    if not isinstance(batch, Mapping):
+        raise VerificationContractError("representation batch must be a mapping")
+    inputs = batch.get("inputs")
+    samples = batch.get("data_samples")
+    if not isinstance(inputs, Mapping):
+        raise VerificationContractError(
+            "representation batch inputs must be a mapping"
+        )
+    if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
+        raise VerificationContractError(
+            "representation batch data_samples must be a sequence"
+        )
+    if len(samples) != expected_batch_size:
+        raise VerificationContractError(
+            f"representation batch {batch_index} has {len(samples)} samples, "
+            f"expected {expected_batch_size}"
+        )
+    image = inputs.get("img")
+    if not isinstance(image, torch.Tensor):
+        raise VerificationContractError("representation img must be a tensor")
+    if image.layout != torch.strided or image.device.type != "cpu":
+        raise VerificationContractError(
+            "representation img must be a dense CPU tensor"
+        )
+    if not image.is_contiguous():
+        raise VerificationContractError("representation img must be contiguous")
+    expected_shape = (expected_batch_size, 4, 3, 800, 800)
+    if tuple(image.shape) != expected_shape:
+        raise VerificationContractError(
+            f"representation img shape {tuple(image.shape)} != {expected_shape}"
+        )
+    expected_dtype = (
+        torch.float32 if arm == PARENT_ARM else torch.uint8
+    )
+    if image.dtype != expected_dtype:
+        raise VerificationContractError(
+            f"{arm} representation img dtype {image.dtype} != {expected_dtype}"
+        )
+    if arm == PARENT_ARM:
+        if not bool(torch.isfinite(image).all()):
+            raise VerificationContractError("parent FP32 image must be finite")
+        if bool(((image < 0) | (image > 255)).any()) or not torch.equal(
+            image, image.trunc()
+        ):
+            raise VerificationContractError(
+                "parent FP32 image must be an exact expanded uint8 image"
+            )
+    if observed_pinned is None:
+        observed_pinned = bool(image.is_pinned())
+    if type(observed_pinned) is not bool:
+        raise VerificationContractError("observed_pinned must be an exact boolean")
+    expected_pinned = arm == CANDIDATE_ARM
+    if observed_pinned is not expected_pinned:
+        raise VerificationContractError(
+            f"{arm} representation pinned={observed_pinned}, expected "
+            f"{expected_pinned}"
+        )
+    for name in HOST_METADATA_KEYS:
+        value = inputs.get(name)
+        if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+            raise VerificationContractError(
+                f"representation {name} must be a CPU tensor"
+            )
+        if value.ndim == 0 or value.shape[0] != expected_batch_size:
+            raise VerificationContractError(
+                f"representation {name} must have the frozen batch dimension"
+            )
+        if not value.is_contiguous():
+            raise VerificationContractError(
+                f"representation {name} must be contiguous"
+            )
+    identities = [
+        _sample_identity(sample, index) for index, sample in enumerate(samples)
+    ]
+    canonical_image = image if image.dtype == torch.float32 else image.float()
+    common_input_fingerprints = {
+        name: raw_fingerprint(inputs[name])
+        for name in sorted(inputs)
+        if name != "img"
+    }
+    semantic_payload = {
+        "batch_index": batch_index,
+        "sample_identities": identities,
+        "data_samples": raw_fingerprint(samples),
+        "canonical_fp32_image": raw_fingerprint(canonical_image),
+        "common_inputs": common_input_fingerprints,
+    }
+    representation_fingerprint = raw_fingerprint(batch)
+    manifest = {
+        "arm": arm,
+        "batch_index": batch_index,
+        "batch_size": expected_batch_size,
+        "sample_identities": identities,
+        "semantic_sha256": canonical_sha256(semantic_payload),
+        "representation_fingerprint": representation_fingerprint,
+        "ingress": {
+            "image_dtype": str(image.dtype),
+            "image_shape": list(image.shape),
+            "image_stride": list(image.stride()),
+            "image_bytes": image.numel() * image.element_size(),
+            "device": str(image.device),
+            "contiguous": image.is_contiguous(),
+            "pinned": observed_pinned,
+            "non_blocking": arm == CANDIDATE_ARM,
+            "stream_policy": REPRESENTATION_STREAM_POLICY,
+        },
+    }
+    manifest["sha256"] = canonical_sha256(manifest)
+    return manifest
+
+
+def validate_representation_ingress(
+    batch: Mapping[str, Any],
+    *,
+    arm: str,
+    expected_batch_size: int,
+    observed_pinned: bool | None = None,
+) -> dict[str, Any]:
+    """Cheap structural ingress check suitable between timed components."""
+
+    if arm not in (PARENT_ARM, CANDIDATE_ARM):
+        raise VerificationContractError("representation arm is invalid")
+    expected_batch_size = _exact_integer(
+        "expected_batch_size", expected_batch_size, minimum=1
+    )
+    if not isinstance(batch, Mapping) or not isinstance(batch.get("inputs"), Mapping):
+        raise VerificationContractError(
+            "representation ingress must contain an inputs mapping"
+        )
+    image = batch["inputs"].get("img")
+    if not isinstance(image, torch.Tensor):
+        raise VerificationContractError("representation ingress img must be a tensor")
+    expected_dtype = torch.float32 if arm == PARENT_ARM else torch.uint8
+    expected_shape = (expected_batch_size, 4, 3, 800, 800)
+    if (
+        image.device.type != "cpu"
+        or image.layout != torch.strided
+        or image.dtype != expected_dtype
+        or tuple(image.shape) != expected_shape
+        or not image.is_contiguous()
+    ):
+        raise VerificationContractError(
+            f"{arm} ingress violates the frozen CPU/dtype/shape/layout contract"
+        )
+    if observed_pinned is None:
+        observed_pinned = bool(image.is_pinned())
+    if type(observed_pinned) is not bool:
+        raise VerificationContractError("observed_pinned must be an exact boolean")
+    expected_pinned = arm == CANDIDATE_ARM
+    if observed_pinned is not expected_pinned:
+        raise VerificationContractError(
+            f"{arm} ingress pinned={observed_pinned}, expected {expected_pinned}"
+        )
+    samples = batch.get("data_samples")
+    if not isinstance(samples, Sequence) or isinstance(samples, (str, bytes)):
+        raise VerificationContractError(
+            "representation ingress data_samples must be a sequence"
+        )
+    if len(samples) != expected_batch_size:
+        raise VerificationContractError(
+            "representation ingress data sample count changed"
+        )
+    return {
+        "arm": arm,
+        "image_dtype": str(image.dtype),
+        "image_shape": list(image.shape),
+        "image_stride": list(image.stride()),
+        "image_bytes": image.numel() * image.element_size(),
+        "pinned": observed_pinned,
+        "non_blocking": arm == CANDIDATE_ARM,
+        "stream_policy": REPRESENTATION_STREAM_POLICY,
+    }
+
+
+def build_representation_pair_manifest(
+    parent_batch: Mapping[str, Any],
+    candidate_batch: Mapping[str, Any],
+    *,
+    batch_index: int,
+    expected_batch_size: int,
+    observed_pinned: Mapping[str, bool] | None = None,
+) -> dict[str, Any]:
+    """Bind two distinct representations to one exact semantic batch."""
+
+    observed_pinned = observed_pinned or {}
+    if not isinstance(observed_pinned, Mapping):
+        raise VerificationContractError("observed_pinned must be a mapping")
+    parent = build_representation_batch_manifest(
+        parent_batch,
+        arm=PARENT_ARM,
+        batch_index=batch_index,
+        expected_batch_size=expected_batch_size,
+        observed_pinned=observed_pinned.get(PARENT_ARM),
+    )
+    candidate = build_representation_batch_manifest(
+        candidate_batch,
+        arm=CANDIDATE_ARM,
+        batch_index=batch_index,
+        expected_batch_size=expected_batch_size,
+        observed_pinned=observed_pinned.get(CANDIDATE_ARM),
+    )
+    if parent["sample_identities"] != candidate["sample_identities"]:
+        raise VerificationContractError(
+            "representation pair has swapped or different sample identities"
+        )
+    if parent["semantic_sha256"] != candidate["semantic_sha256"]:
+        raise VerificationContractError(
+            "representation pair does not share one semantic batch digest"
+        )
+    if (
+        parent["representation_fingerprint"]
+        == candidate["representation_fingerprint"]
+    ):
+        raise VerificationContractError(
+            "representation pair must preserve distinct FP32 and uint8 ingress"
+        )
+    pair = {
+        "schema": "rosa.representation_pair.v1",
+        "batch_index": batch_index,
+        "semantic_sha256": parent["semantic_sha256"],
+        "sample_identities": parent["sample_identities"],
+        "arms": {
+            PARENT_ARM: parent,
+            CANDIDATE_ARM: candidate,
+        },
+    }
+    pair["sha256"] = canonical_sha256(pair)
+    return pair
+
+
+def validate_representation_snapshot(
+    batch: Mapping[str, Any],
+    manifest: Mapping[str, Any],
+    *,
+    label: str,
+) -> dict[str, Any]:
+    """Reject mutation of a captured reusable arm representation."""
+
+    expected = _nested(manifest, "representation_fingerprint")
+    observed = raw_fingerprint(batch)
+    if observed != expected:
+        raise VerificationContractError(
+            f"captured representation mutated for {label}: "
+            f"expected={expected}, observed={observed}"
+        )
+    return observed
+
+
+def validate_common_preprocessor_boundary(
+    parent_processed: Mapping[str, Any],
+    candidate_processed: Mapping[str, Any],
+    *,
+    expected_device_type: str | None = None,
+) -> dict[str, Any]:
+    """Prove both ingress formats become the same FP32 model-boundary batch."""
+
+    if not isinstance(parent_processed, Mapping) or not isinstance(
+        candidate_processed, Mapping
+    ):
+        raise VerificationContractError(
+            "common preprocessor boundary values must be mappings"
+        )
+    for label, processed in (
+        (PARENT_ARM, parent_processed),
+        (CANDIDATE_ARM, candidate_processed),
+    ):
+        inputs = processed.get("inputs")
+        if not isinstance(inputs, Mapping):
+            raise VerificationContractError(
+                f"{label} common boundary inputs must be a mapping"
+            )
+        image = inputs.get("img")
+        if not isinstance(image, torch.Tensor) or image.dtype != torch.float32:
+            raise VerificationContractError(
+                f"{label} common boundary img must be torch.float32"
+            )
+        if expected_device_type is not None and image.device.type != expected_device_type:
+            raise VerificationContractError(
+                f"{label} common boundary img device {image.device.type} != "
+                f"{expected_device_type}"
+            )
+    fingerprint = require_same_fingerprint(
+        "common preprocessor boundary",
+        parent_processed,
+        candidate_processed,
+    )
+    return {
+        "parity": "raw-bit exact",
+        "fingerprint": fingerprint,
+        "image_dtype": "torch.float32",
+        "device_type": expected_device_type,
+    }
+
+
 def validate_expected_manifest(
     observed: Mapping[str, Any],
     expected: Mapping[str, Any],
@@ -1168,6 +1913,7 @@ __all__ = [
     "BOOTSTRAP_SAMPLES",
     "BOOTSTRAP_SEED",
     "CANDIDATE_ARM",
+    "CPU_METADATA_PROTOCOL",
     "CPPC",
     "DEFAULT_MEASURED_ITERATIONS_PER_ARM",
     "DEFAULT_WARMUP_ITERATIONS_PER_ARM",
@@ -1175,34 +1921,47 @@ __all__ = [
     "EXPECTED_HEAD_TYPE",
     "EXPECTED_MODEL_TYPE",
     "EXPECTED_PARENT_PREPROCESSOR",
+    "INPUT_PIPELINE_SCOPE",
     "HOST_METADATA_KEYS",
     "ITERATIONS_PER_ARM_GRANULARITY",
     "MINIMUM_MEASURED_ITERATIONS_PER_ARM",
     "MINIMUM_WARMUP_ITERATIONS_PER_ARM",
+    "MODEL_ONLY_SCOPE",
     "NEAR_NATIVE_MEDIAN_RATIO_CI95_UPPER_MAXIMUM",
     "NEAR_NATIVE_P95_RATIO_MAXIMUM",
     "PARENT_ARM",
     "PCCP",
     "PHYSICAL_ROUND_ORDER",
+    "REPRESENTATION_PROTOCOL",
+    "REPRESENTATION_STREAM_POLICY",
     "ScheduleEntry",
     "VerificationContractError",
     "build_alternating_schedule",
     "build_batch_manifest",
+    "build_representation_batch_manifest",
+    "build_representation_pair_manifest",
     "canonical_json",
     "canonical_sha256",
     "classify_transfer_event",
     "evaluate_c32_near_native_gate",
+    "evaluate_input_pipeline_gate",
+    "evaluate_model_only_non_regression_gate",
     "evaluate_strict_lightweight_gate",
     "file_sha256",
     "paired_bootstrap_confidence_intervals",
     "percentile",
     "raw_fingerprint",
     "require_same_fingerprint",
+    "semantic_sample_digest",
     "summarize_timings",
     "summarize_transfer_event_names",
     "validate_config_pair",
+    "validate_common_preprocessor_boundary",
     "validate_expected_manifest",
     "validate_preregistration_plan",
+    "validate_representation_config_pair",
+    "validate_representation_ingress",
+    "validate_representation_snapshot",
     "validate_runtime_parameters",
     "validate_transfer_reduction",
 ]
