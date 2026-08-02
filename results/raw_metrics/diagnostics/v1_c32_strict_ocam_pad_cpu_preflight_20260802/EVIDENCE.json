@@ -1,0 +1,57 @@
+{
+  "schema": "rosa.c32_strict_ocam_homogeneous_pad.cpu_preflight.v1",
+  "status": "CPU_PREPARED_NOT_ADOPTED",
+  "gpu_used": false,
+  "parent_commit": "f7df58a5e02a6ceeb24c8d1d33e016bf95446166",
+  "candidate_commit": "6ce2edd8e11fb33e60e57f3bc8db4b2f1879a83a",
+  "change": "replace ones_like plus cat with one constant F.pad while preserving the historical homogeneous tensor, broadcast 4x4 matmul shape, and output slice",
+  "model_math": "same input bytes and same 4x4 matmul shape on the tested CPU contract",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "cpu_raw_bit_contract": {
+    "dtypes": [
+      "torch.float32",
+      "torch.float64"
+    ],
+    "point_layouts": [
+      "B,N,P,3",
+      "B,C,N,P,3"
+    ],
+    "seeds": [
+      3407,
+      7101080,
+      918031
+    ],
+    "forward_equal": true,
+    "point_gradient_equal": true,
+    "extrinsic_gradient_equal": true,
+    "homogeneous_input_equal": true,
+    "homogeneous_stride_equal": true,
+    "matmul_operand_shapes_equal": true
+  },
+  "cpu_microbenchmark": {
+    "scope": "camera transform only",
+    "threads": 1,
+    "dtype": "float32",
+    "shape": "B4 C4 N300 P13",
+    "legacy_median_ms": 0.818258966319263,
+    "candidate_median_ms": 0.8051911485381426,
+    "candidate_over_legacy_ratio": 0.9840297285834791,
+    "interpretation": "isolated CPU observation only; not a CUDA or end-to-end speed claim"
+  },
+  "tests": {
+    "focused": "45 passed, 1 skipped",
+    "full_cpu_suite": "194 passed, 5 skipped, 68 warnings in 14.49s",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/geometry.py": "10245f7b433c8f6e3483513c64345e33a1e782576e34fdd5bf76a4ab78268cd9",
+    "tests/test_ocam_strict_homogeneous_pad.py": "b3c98b7a2421aba9be6c60a472110af7b2b2e3c0ae488e074dbabedfcf6eb606"
+  },
+  "pending_gates": [
+    "CUDA raw-bit camera XYZ, normalized UV, validity, D0-D5 outputs, and final predictions",
+    "paired CUDA model latency and peak-memory measurement while GPUs are idle",
+    "strict adoption gate; no default merge on an inconclusive result"
+  ]
+}
