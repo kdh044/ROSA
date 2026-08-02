@@ -184,6 +184,12 @@ def _observation_reliability_context(
 ) -> Tensor:
     """Summarize evidence that should control rather than define a correction."""
 
+    if (
+        observation.cross_camera_consistency is None
+        or observation.camera_geometry_summary is None
+    ):
+        raise RuntimeError("reliability context requires full observation details")
+
     camera_valid = observation.valid.any(dim=-1)
     valid_float = camera_valid.to(observation.camera_geometry_summary.dtype)
     valid_count = valid_float.sum(dim=-1).clamp_min(1.0)
@@ -396,6 +402,7 @@ class ROSARefiner(nn.Module):
         query: Tensor,
         fpn: Sequence[Tensor],
         metadata: dict,
+        observation_usage: str = "full",
     ) -> ObservationEncoding:
         rfl = getattr(self.rosa, "rfl", None)
         released_relation_surface = bool(
@@ -406,9 +413,7 @@ class ROSARefiner(nn.Module):
             and "forward" not in rfl.__dict__
             and type(rfl).forward is _RELEASED_RFL_FORWARD
         )
-        relation_modules = tuple(
-            module for module in (self.rosa, rfl) if isinstance(module, nn.Module)
-        )
+        relation_modules = tuple(self.rosa.modules())
         relation_hooks_active = bool(
             any(
                 module._forward_pre_hooks
@@ -442,13 +447,16 @@ class ROSARefiner(nn.Module):
             self.sampler,
             self.level_head,
         )
-        return self.rosa(
-            features,
-            geometry,
-            relation,
-            valid,
-            query,
-        )
+        if released_relation_surface and not relation_hooks_active:
+            return self.rosa(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage=observation_usage,
+            )
+        return self.rosa(features, geometry, relation, valid, query)
 
     def _observe(
         self,
@@ -457,6 +465,7 @@ class ROSARefiner(nn.Module):
         fpn: Sequence[Tensor],
         metadata: dict,
         keypoint_generator: KeypointGenerator,
+        observation_usage: str = "full",
     ) -> ObservationEncoding:
         observation_anchor = (
             anchor
@@ -471,6 +480,7 @@ class ROSARefiner(nn.Module):
             query,
             fpn,
             metadata,
+            observation_usage,
         )
 
     def _candidate_offsets(
@@ -559,6 +569,7 @@ class ROSARefiner(nn.Module):
         fpn: Sequence[Tensor],
         metadata: dict,
         keypoint_generator: KeypointGenerator,
+        observation_usage: str,
     ) -> _CandidateEvidence:
         candidate_count = int(offsets.shape[-1])
         if self.cfg.architecture_profile == "legacy":
@@ -581,6 +592,7 @@ class ROSARefiner(nn.Module):
                     fpn,
                     metadata,
                     keypoint_generator,
+                    observation_usage,
                 )
                 candidate_features.append(observation.object_feature)
                 candidate_consistency.append(
@@ -626,6 +638,7 @@ class ROSARefiner(nn.Module):
                 fpn,
                 metadata,
                 keypoint_generator,
+                observation_usage,
             )
             candidates = observation.object_feature.reshape(
                 batch,
@@ -633,6 +646,8 @@ class ROSARefiner(nn.Module):
                 candidate_count,
                 -1,
             )
+            if observation.cross_camera_consistency is None:
+                raise RuntimeError("candidate observation omitted consistency")
             consistency = observation.cross_camera_consistency.reshape(
                 batch,
                 queries,
@@ -734,6 +749,7 @@ class ROSARefiner(nn.Module):
         keypoint_generator: KeypointGenerator,
         step: int,
         sigma_points: Tensor,
+        materialize_diagnostics: bool,
     ) -> _RefinementStep:
         config = self.cfg
         geometry_base = current.detach()
@@ -742,12 +758,19 @@ class ROSARefiner(nn.Module):
             if config.architecture_profile == "legacy"
             else geometry_base
         )
+        lean_observation = bool(
+            not materialize_diagnostics
+            and not self.training
+            and not torch.is_grad_enabled()
+            and config.yaw_gate_mode != "anisotropy_gap"
+        )
         observation = self._observe(
             geometry_base,
             query,
             fpn,
             metadata,
             keypoint_generator,
+            "base_support" if lean_observation else "full",
         )
         feature = observation.object_feature
         shared = feature + self.refinement_trunk(feature)
@@ -860,6 +883,7 @@ class ROSARefiner(nn.Module):
                 fpn,
                 metadata,
                 keypoint_generator,
+                "candidate" if lean_observation else "full",
             )
         else:
             candidates = self._direct_second_pass(
@@ -897,7 +921,10 @@ class ROSARefiner(nn.Module):
             ),
             dim=-1,
         )
-        reliability_context = _observation_reliability_context(observation)
+        if lean_observation:
+            reliability_context = feature.new_zeros(feature.shape[:2] + (6,))
+        else:
+            reliability_context = _observation_reliability_context(observation)
         radial_supported = observation.supported & candidates.supported.any(dim=2)
         if config.center_update_mode == "legacy_candidate_gate":
             radial_proposal = candidates.radial_delta
@@ -1044,6 +1071,7 @@ class ROSARefiner(nn.Module):
                 keypoint_generator,
                 step_index,
                 sigma_points,
+                materialize_diagnostics,
             )
             steps.append(step)
             current = step.anchor

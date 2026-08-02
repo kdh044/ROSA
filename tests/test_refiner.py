@@ -466,17 +466,21 @@ def test_fast_profile_uses_one_vectorized_refinement_pass():
     assert output.iteration_anchors.shape == (1, 2, 1, 11)
 
 
-def test_lean_inference_skips_only_diagnostic_materialization():
+@pytest.mark.parametrize("profile", ("fast", "published"))
+def test_lean_inference_skips_only_diagnostic_materialization(profile):
     cfg = ROSAConfig.from_mapping(
         {
-            "profile": "fast",
+            "profile": profile,
             "embed_dims": 16,
             "hidden_dims": 8,
         }
     )
     stage, anchor, query, fpn, metas, generator = _fixture(cfg)
     stage.eval()
+    parameter_generator = torch.Generator().manual_seed(7101080)
     with torch.no_grad():
+        for parameter in stage.parameters():
+            parameter.uniform_(-0.05, 0.05, generator=parameter_generator)
         full = stage(
             anchor,
             query,
@@ -503,6 +507,40 @@ def test_lean_inference_skips_only_diagnostic_materialization():
             assert torch.equal(actual, expected), name
         else:
             assert actual == expected
+
+
+def test_lean_inference_hook_keeps_full_observation_abi():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    observed_relations = []
+
+    def inspect_relation(_module, args):
+        observed_relations.append(args[1])
+
+    handle = stage.rosa.rfl.register_forward_pre_hook(inspect_relation)
+    try:
+        with torch.no_grad():
+            stage(
+                anchor,
+                query,
+                fpn,
+                metas,
+                generator,
+                materialize_diagnostics=False,
+            )
+    finally:
+        handle.remove()
+
+    assert observed_relations
+    assert all(torch.is_tensor(relation) for relation in observed_relations)
+    assert all(relation.shape[-1] == 19 for relation in observed_relations)
 
 
 def test_compact_refiner_parameter_contract():

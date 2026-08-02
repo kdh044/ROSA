@@ -3,7 +3,8 @@ import copy
 import torch
 import torch.nn.functional as F
 
-from rosa.attention import mean_pairwise_camera_cosine
+from rosa.attention import PointwiseROSA, mean_pairwise_camera_cosine
+from rosa.config import ROSAConfig
 from rosa.rfl import SphericalRayFeatureLifting
 from rosa.types import RayFeatureRelation
 
@@ -65,3 +66,60 @@ def test_compact_rfl_relation_is_raw_exact_to_legacy_carrier():
         parent.parameters(),
     ):
         assert torch.equal(candidate_parameter.grad, parent_parameter.grad)
+
+
+def test_compact_observation_usages_keep_required_outputs_raw_exact():
+    generator = torch.Generator().manual_seed(7101080)
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    module = PointwiseROSA(config).eval()
+    features = torch.randn(2, 3, 4, 13, 16, generator=generator)
+    geometry = torch.randn(2, 3, 4, 13, 14, generator=generator)
+    ray = F.normalize(
+        torch.randn(2, 3, 4, 13, 3, generator=generator),
+        dim=-1,
+    )
+    valid = torch.rand(2, 3, 4, 13, generator=generator) > 0.2
+    query = torch.randn(2, 3, 16, generator=generator)
+    relation = RayFeatureRelation(ray=ray, valid=valid)
+
+    with torch.no_grad():
+        for parameter in module.parameters():
+            parameter.uniform_(-0.1, 0.1, generator=generator)
+        full = module(features, geometry, relation, valid, query)
+        candidate = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="candidate",
+        )
+        base = module(
+            features,
+            geometry,
+            relation,
+            valid,
+            query,
+            observation_usage="base_support",
+        )
+
+    assert torch.equal(candidate.object_feature, full.object_feature)
+    assert torch.equal(candidate.supported, full.supported)
+    assert torch.equal(
+        candidate.cross_camera_consistency,
+        full.cross_camera_consistency,
+    )
+    assert torch.equal(base.object_feature, full.object_feature)
+    assert torch.equal(base.supported, full.supported)
+    assert base.cross_camera_consistency is None
+    for observation in (candidate, base):
+        assert observation.point_features is None
+        assert observation.camera_weights is None
+        assert observation.camera_weight_mean is None
+        assert observation.camera_geometry_summary is None

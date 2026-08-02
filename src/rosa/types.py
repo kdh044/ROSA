@@ -12,13 +12,13 @@ class ObservationEncoding:
     """Camera- and point-aggregated evidence for each object query."""
 
     object_feature: Tensor
-    point_features: Tensor
-    camera_weights: Tensor
+    point_features: Tensor | None
+    camera_weights: Tensor | None
     valid: Tensor
     supported: Tensor
-    cross_camera_consistency: Tensor
-    camera_weight_mean: Tensor
-    camera_geometry_summary: Tensor
+    cross_camera_consistency: Tensor | None
+    camera_weight_mean: Tensor | None
+    camera_geometry_summary: Tensor | None
 
 
 @dataclass(frozen=True)
