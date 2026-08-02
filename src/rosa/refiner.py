@@ -1049,9 +1049,23 @@ class ROSARefiner(nn.Module):
         keypoint_generator: KeypointGenerator,
         *,
         materialize_diagnostics: bool = True,
-    ) -> ROSAOutput:
+        return_final_anchor_only: bool = False,
+    ) -> ROSAOutput | Tensor:
         if not isinstance(materialize_diagnostics, bool):
             raise TypeError("materialize_diagnostics must be a bool")
+        if not isinstance(return_final_anchor_only, bool):
+            raise TypeError("return_final_anchor_only must be a bool")
+        if return_final_anchor_only and materialize_diagnostics:
+            raise ValueError(
+                "final-anchor-only inference cannot materialize diagnostics"
+            )
+        if return_final_anchor_only and (
+            self.training or torch.is_grad_enabled() or self.cfg.enable_quality_score
+        ):
+            raise RuntimeError(
+                "final-anchor-only output requires no-grad eval with quality "
+                "refinement disabled"
+            )
         base = baseline_anchor.detach()
         query_sidecar = query.detach()
         sigma_points = base.new_tensor(
@@ -1075,6 +1089,15 @@ class ROSARefiner(nn.Module):
             )
             steps.append(step)
             current = step.anchor
+
+        # The compact production path ranks detections with the untouched
+        # native score and consumes only the refined anchor.  Return before
+        # rebuilding analysis-only total deltas, zero quality tensors, and
+        # the large ROSAOutput carrier.  Training and public analysis calls
+        # retain the complete historical return contract above this explicit
+        # opt-in boundary.
+        if return_final_anchor_only:
+            return current
 
         first = steps[0]
         final = steps[-1]

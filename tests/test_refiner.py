@@ -3,6 +3,7 @@ import types
 import pytest
 import torch
 
+import rosa.refiner as refiner_module
 from rosa.refiner import (
     _CandidateEvidence,
     _candidate_confidence,
@@ -507,6 +508,127 @@ def test_lean_inference_skips_only_diagnostic_materialization(profile):
             assert torch.equal(actual, expected), name
         else:
             assert actual == expected
+
+
+def test_fast_final_anchor_only_is_raw_exact_and_skips_return_postprocessing(
+    monkeypatch,
+):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    parameter_generator = torch.Generator().manual_seed(314159)
+    with torch.no_grad():
+        for parameter in stage.parameters():
+            parameter.uniform_(-0.05, 0.05, generator=parameter_generator)
+
+    calls = []
+    released = refiner_module._radial_basis
+
+    def counted_radial_basis(center_xy):
+        calls.append(tuple(center_xy.shape))
+        return released(center_xy)
+
+    monkeypatch.setattr(refiner_module, "_radial_basis", counted_radial_basis)
+    with torch.no_grad():
+        full = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+        )
+        full_call_count = len(calls)
+        rng_before = torch.get_rng_state().clone()
+        final_anchor = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+        minimal_call_count = len(calls) - full_call_count
+
+    assert torch.is_tensor(final_anchor)
+    assert torch.equal(final_anchor, full.final_anchor)
+    assert torch.equal(torch.get_rng_state(), rng_before)
+    assert minimal_call_count + 1 == full_call_count
+
+
+def test_final_anchor_only_rejects_training_or_full_diagnostics():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    with torch.no_grad(), pytest.raises(ValueError, match="cannot materialize"):
+        stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            return_final_anchor_only=True,
+        )
+
+    stage.train()
+    with torch.no_grad(), pytest.raises(RuntimeError, match="no-grad eval"):
+        stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+
+def test_fast_final_anchor_only_is_one_full_compiled_graph():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    compiled = torch.compile(stage, backend="eager", fullgraph=True)
+
+    with torch.no_grad():
+        expected = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+        actual = compiled(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+    assert torch.equal(actual, expected)
 
 
 def test_lean_inference_hook_keeps_full_observation_abi():

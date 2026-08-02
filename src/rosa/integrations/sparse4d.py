@@ -682,15 +682,24 @@ class ROSARefinementHead(Sparse4DHead):
             rosa_metadata,
             deformable.kps_generator,
             materialize_diagnostics=not lean_inference,
+            return_final_anchor_only=native_identity_rank,
         )
+        if native_identity_rank:
+            if not torch.is_tensor(result):
+                raise RuntimeError("lean ROSA refiner did not return its final anchor")
+            refined_anchor = result
+        else:
+            if torch.is_tensor(result):
+                raise RuntimeError("full ROSA refiner omitted its output record")
+            refined_anchor = result.final_anchor
         if selected_indices is None:
-            final_anchor = result.final_anchor
+            final_anchor = refined_anchor
             if not native_identity_rank:
                 quality_delta = result.quality_delta
                 supported = result.candidate_supported.any(dim=2)
         else:
             final_anchor = baseline_anchor.detach().scatter(
-                1, anchor_index, result.final_anchor
+                1, anchor_index, refined_anchor
             )
             if not native_identity_rank:
                 scalar_index = selected_indices[..., None]
