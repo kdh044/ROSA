@@ -6,6 +6,7 @@ import math
 
 import torch
 from torch import Tensor
+from torch.nn import functional as F
 
 PROJECTION_CONTRACTS = ("legacy_front_only", "full_fov")
 
@@ -29,17 +30,17 @@ def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
                 "camera-conditioned points must be [B,C,N,P,3] with the "
                 "same camera count as lidar2cam"
             )
-        homogeneous = torch.cat(
-            (points, torch.ones_like(points[..., :1])),
-            dim=-1,
-        )
+        # Preserve the historical 4x4 matmul shape and arithmetic exactly,
+        # while constructing the constant homogeneous coordinate in one
+        # allocation instead of allocating ``ones_like`` and then ``cat``.
+        homogeneous = F.pad(points, (0, 1), mode="constant", value=1.0)
         return torch.matmul(
             lidar2cam[:, :, None, None],
             homogeneous[..., None],
         ).squeeze(-1)[..., :3]
     if points.ndim != 4:
         raise ValueError("points must be [B,N,P,3] or [B,C,N,P,3]")
-    homogeneous = torch.cat((points, torch.ones_like(points[..., :1])), -1)
+    homogeneous = F.pad(points, (0, 1), mode="constant", value=1.0)
     return torch.matmul(
         lidar2cam[:, :, None, None],
         homogeneous[:, None, ..., None],
