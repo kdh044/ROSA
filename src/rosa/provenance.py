@@ -247,6 +247,12 @@ def _source_revision(source: Path) -> dict[str, Any]:
     return last_revision
 
 
+def read_source_revision(source_root: str | os.PathLike[str]) -> dict[str, Any]:
+    """Return the stable, read-only source identity used by resume contracts."""
+
+    return _source_revision(Path(source_root).resolve())
+
+
 def _decode_paths(output: bytes, *, sort_paths: bool = True) -> list[str]:
     paths = [os.fsdecode(item) for item in output.split(b"\0") if item]
     return sorted(paths, key=os.fsencode) if sort_paths else paths
@@ -713,4 +719,4 @@ def capture_external_provenance(
     return result
 
 
-__all__ = ["capture_external_provenance"]
+__all__ = ["capture_external_provenance", "read_source_revision"]

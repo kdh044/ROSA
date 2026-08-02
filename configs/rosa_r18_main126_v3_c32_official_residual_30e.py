@@ -27,8 +27,23 @@ param_scheduler = [
     ),
 ]
 train_cfg = dict(max_epochs=30)
-default_hooks = dict(checkpoint=dict(max_keep_ckpts=5))
+default_hooks = dict(
+    checkpoint=dict(
+        max_keep_ckpts=5,
+        save_best=["fisheye_bev/mAP", "fisheye_bev/NDS"],
+        rule=["greater", "greater"],
+    )
+)
+custom_hooks = [
+    dict(type="SyncBuffersHook", priority="NORMAL"),
+    dict(type="ROSASparseMilestoneCheckpointHook", milestones=(8,)),
+]
 work_dir = "work_dirs/rosa_r18_main126_v3_c32_official_residual_30e"
+
+sealed_resume_contract = dict(
+    contract="rosa.c32-fast-cp16.30e-pair.v1",
+    role="control",
+)
 
 experiment_contract = dict(
     _delete_=True,
@@ -46,7 +61,7 @@ experiment_contract = dict(
     arm="C32-official-Sparse4D-GNN-residual-30e-control",
     paired_candidate="C32+ROSA-fast-CP16-v3",
     changed_from_historical_c32=(
-        "training horizon 20->30 and checkpoint retention 20->5 only"
+        "training horizon 20->30; retain latest five, e8, and mAP/NDS best"
     ),
     learned_parameters_added=0,
     buffers_added=0,

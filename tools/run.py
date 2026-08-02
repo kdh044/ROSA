@@ -10,11 +10,13 @@ from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict
 import hashlib
+import importlib.metadata
 import json
 import os
 from pathlib import Path
 import stat
 import statistics
+import sys
 import tempfile
 import time
 import warnings
@@ -30,6 +32,13 @@ Runner = None
 _FAST_PROFILES = frozenset({"fast"})
 _KNOWN_RELEASE_ARCHITECTURE = "ROSA R18 Main126"
 _ROSA_CONTRACT_VERSION = 3
+_SEALED_TRAINING_CONTRACT_VERSION = 1
+_SEALED_PAIR_CONTRACT = "rosa.c32-fast-cp16.30e-pair.v1"
+_SEALED_PAIR_HEADS = {
+    "control": "ROSAOfficialResidualNativeBaselineHead",
+    "candidate": "ROSAOfficialResidualRefinementHead",
+}
+_SEALED_CONFIG_EXCLUDED_FIELDS = frozenset({"load_from", "resume", "work_dir"})
 _ROSA_TOPOLOGY_FIELDS = (
     "architecture_profile",
     "rfl_topology_contract",
@@ -124,6 +133,14 @@ def _CheckpointContractHook(metadata: Mapping):
     from rosa.mmengine_hooks import CheckpointContractHook
 
     return CheckpointContractHook(metadata)
+
+
+def _ResumeContractValidationHook(payload_contract: Mapping):
+    """Build the pre-load validator lazily with MMEngine's Hook base class."""
+
+    from rosa.mmengine_hooks import ResumeContractValidationHook
+
+    return ResumeContractValidationHook(payload_contract)
 
 
 def _runner_class():
@@ -229,17 +246,195 @@ def _effective_rosa_config(config: Config):
     return ROSAConfig.from_mapping(rosa_mapping)
 
 
+def _json_sha256(value) -> str:
+    payload = json.dumps(
+        value,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        allow_nan=False,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _config_sha256(config: Config) -> str:
+    """Hash the resolved experiment while excluding load-location controls."""
+
+    payload = {
+        key: value
+        for key, value in config.to_dict().items()
+        if key not in _SEALED_CONFIG_EXCLUDED_FIELDS
+    }
+    return _json_sha256(payload)
+
+
+def _runtime_identity() -> dict:
+    packages = {}
+    for distribution in ("mmcv", "mmengine", "mmdet", "mmdet3d", "numpy"):
+        try:
+            packages[distribution] = importlib.metadata.version(distribution)
+        except importlib.metadata.PackageNotFoundError:
+            packages[distribution] = None
+    return {
+        "python_implementation": sys.implementation.name,
+        "python_version": ".".join(str(value) for value in sys.version_info[:3]),
+        "torch_version": str(torch.__version__),
+        "torch_cuda_version": (
+            None if torch.version.cuda is None else str(torch.version.cuda)
+        ),
+        "packages": packages,
+    }
+
+
+def _revision_identity(path: Path) -> dict:
+    from rosa.provenance import read_source_revision
+
+    revision = read_source_revision(path)
+    return {
+        "head": revision.get("head"),
+        "tracked_dirty": revision.get("tracked_dirty"),
+        "tracked_diff_sha256": revision.get("tracked_diff_sha256"),
+        "stable_capture": revision.get("stable_capture"),
+        "error": revision.get("error"),
+    }
+
+
+def _current_source_identity() -> dict:
+    source_root = Path(__file__).resolve().parents[1]
+    detector_root = Path(
+        os.environ.get(
+            "ROSA_DETECTOR_HOST_ROOT",
+            os.environ.get(
+                "SPARSE4D_ROOT",
+                source_root / "external" / "detector_host",
+            ),
+        )
+    ).resolve()
+    fisheye_root = Path(
+        os.environ.get(
+            "FISHEYE3DOD_OFFICIAL_ROOT",
+            source_root / "external" / "fisheye3dod",
+        )
+    ).resolve()
+    return {
+        "rosa": _revision_identity(source_root),
+        "detector_host": _revision_identity(detector_root),
+        "fisheye3dod": _revision_identity(fisheye_root),
+    }
+
+
+def _sealed_resume_spec(config: Config) -> Mapping | None:
+    spec = config.get("sealed_resume_contract")
+    if spec is None:
+        return None
+    if not isinstance(spec, Mapping):
+        raise TypeError("sealed_resume_contract must be a mapping")
+    if spec.get("contract") != _SEALED_PAIR_CONTRACT:
+        raise ValueError("unknown sealed_resume_contract")
+    role = spec.get("role")
+    if role not in _SEALED_PAIR_HEADS:
+        raise ValueError("sealed_resume_contract role must be control or candidate")
+    head_type = config.model.get("head", {}).get("type")
+    expected_head = _SEALED_PAIR_HEADS[role]
+    if head_type != expected_head:
+        raise ValueError(f"sealed {role} arm requires exact head {expected_head!r}")
+    return spec
+
+
+def _sealed_training_contract(config: Config) -> dict | None:
+    spec = _sealed_resume_spec(config)
+    if spec is None:
+        return None
+
+    max_epochs = config.train_cfg.get("max_epochs")
+    if isinstance(max_epochs, bool) or max_epochs != 30:
+        raise ValueError("sealed C32/ROSA pair requires exactly 30 epochs")
+    schedulers = config.get("param_scheduler")
+    if not isinstance(schedulers, (list, tuple)) or len(schedulers) != 2:
+        raise ValueError("sealed C32/ROSA pair requires exactly two schedulers")
+    cosine = schedulers[1]
+    if (
+        not isinstance(cosine, Mapping)
+        or cosine.get("type") != "CosineAnnealingLR"
+        or cosine.get("begin") != 0
+        or cosine.get("end") != 30
+        or cosine.get("T_max") != 30
+        or cosine.get("by_epoch") is not True
+        or cosine.get("convert_to_iter_based") is not True
+    ):
+        raise ValueError("sealed C32/ROSA pair requires the exact 30e cosine horizon")
+
+    checkpoint_policy = config.default_hooks.get("checkpoint", {})
+    if (
+        checkpoint_policy.get("type") != "CheckpointHook"
+        or checkpoint_policy.get("interval") != 1
+        or checkpoint_policy.get("max_keep_ckpts") != 5
+        or checkpoint_policy.get("save_best") != ["fisheye_bev/mAP", "fisheye_bev/NDS"]
+        or checkpoint_policy.get("rule") != ["greater", "greater"]
+    ):
+        raise ValueError(
+            "sealed C32/ROSA pair requires per-epoch checkpoints, last-five, "
+            "and mAP/NDS best"
+        )
+    custom_hooks = config.get("custom_hooks")
+    if not isinstance(custom_hooks, (list, tuple)):
+        raise ValueError("sealed C32/ROSA pair requires custom_hooks")
+    milestone_hooks = [
+        hook
+        for hook in custom_hooks
+        if hook.get("type") == "ROSASparseMilestoneCheckpointHook"
+    ]
+    if len(milestone_hooks) != 1 or tuple(milestone_hooks[0].get("milestones", ())) != (
+        8,
+    ):
+        raise ValueError("sealed C32/ROSA pair requires the protected e8 milestone")
+
+    source_identity = _current_source_identity()
+    for name, revision in source_identity.items():
+        if (
+            revision.get("stable_capture") is not True
+            or not isinstance(revision.get("head"), str)
+            or not isinstance(revision.get("tracked_dirty"), bool)
+            or not isinstance(revision.get("tracked_diff_sha256"), str)
+        ):
+            raise ValueError(f"sealed source identity is unavailable for {name}")
+
+    filename = getattr(config, "filename", None)
+    return {
+        "version": _SEALED_TRAINING_CONTRACT_VERSION,
+        "contract": _SEALED_PAIR_CONTRACT,
+        "role": spec["role"],
+        "head_type": config.model.head.type,
+        "config_name": None if filename is None else Path(filename).name,
+        "config_sha256": _config_sha256(config),
+        "max_epochs": max_epochs,
+        "optimizer_config_sha256": _json_sha256(config.optim_wrapper.to_dict()),
+        "scheduler_config_sha256": _json_sha256(
+            [scheduler.to_dict() for scheduler in schedulers]
+        ),
+        "checkpoint_policy_sha256": _json_sha256(checkpoint_policy.to_dict()),
+        "runtime_identity": _runtime_identity(),
+        "source_identity": source_identity,
+    }
+
+
 def _checkpoint_contract_metadata(config: Config) -> dict | None:
     effective = _effective_rosa_config(config)
-    if effective is None:
-        return None
-    return {
-        "rosa_contract_version": _ROSA_CONTRACT_VERSION,
-        "rfl_topology_contract": effective.rfl_topology_contract,
-        "projection_contract": effective.projection_contract,
-        "refinement_profile": _rosa_profile(config),
-        "rosa_config": asdict(effective),
-    }
+    metadata = {}
+    if effective is not None:
+        metadata.update(
+            {
+                "rosa_contract_version": _ROSA_CONTRACT_VERSION,
+                "rfl_topology_contract": effective.rfl_topology_contract,
+                "projection_contract": effective.projection_contract,
+                "refinement_profile": _rosa_profile(config),
+                "rosa_config": asdict(effective),
+            }
+        )
+    sealed = _sealed_training_contract(config)
+    if sealed is not None:
+        metadata["sealed_training_contract"] = sealed
+    return metadata or None
 
 
 def _checkpoint_state_dict(checkpoint: Mapping) -> Mapping | None:
@@ -979,12 +1174,101 @@ def _c73_deploy_payload_mismatches(checkpoint: Mapping, config: Config) -> list[
     return mismatches
 
 
+def _attach_runner_model_contract(metadata: dict, runner) -> None:
+    sealed = metadata.get("sealed_training_contract")
+    if not isinstance(sealed, dict):
+        return
+    from mmengine.model import is_model_wrapper
+    from rosa.checkpoint_contract import model_state_contract
+
+    model = runner.model.module if is_model_wrapper(runner.model) else runner.model
+    sealed["model_state_contract"] = model_state_contract(model.state_dict())
+
+
+def _sealed_checkpoint_mismatches(
+    checkpoint: Mapping,
+    metadata: Mapping,
+    config: Config,
+    *,
+    require_resume_state: bool,
+) -> tuple[dict | None, list[str]]:
+    """Validate exact training, model, optimizer, and scheduler identities."""
+
+    expected = _sealed_training_contract(config)
+    if expected is None:
+        return None, []
+    observed = metadata.get("sealed_training_contract")
+    if not isinstance(observed, Mapping):
+        return None, ["checkpoint lacks sealed_training_contract metadata"]
+
+    mismatches = []
+    for field, expected_value in expected.items():
+        if observed.get(field) != expected_value:
+            label = field.replace("_", " ")
+            mismatches.append(f"sealed {label} differs from current config/runtime")
+
+    expected_model = observed.get("model_state_contract")
+    if not isinstance(expected_model, Mapping):
+        mismatches.append("sealed checkpoint lacks the full model state contract")
+
+    stored_payload = metadata.get("sealed_payload_contract")
+    if not isinstance(stored_payload, Mapping):
+        mismatches.append("checkpoint lacks sealed_payload_contract metadata")
+        return None, mismatches
+
+    from rosa.checkpoint_contract import checkpoint_payload_contract
+
+    try:
+        payload = checkpoint_payload_contract(checkpoint)
+    except (TypeError, ValueError) as error:
+        mismatches.append(f"sealed checkpoint payload is invalid ({error})")
+        return None, mismatches
+    if payload != stored_payload:
+        mismatches.append("sealed checkpoint payload schema differs from metadata")
+    if isinstance(expected_model, Mapping) and payload["model_state"] != expected_model:
+        mismatches.append(
+            "sealed checkpoint omits or changes native/sidecar model state"
+        )
+
+    if require_resume_state:
+        if payload["optimizer_state"] is None:
+            mismatches.append("resume checkpoint is missing optimizer state")
+        if payload["scheduler_state"] is None:
+            mismatches.append("resume checkpoint is missing param_scheduler state")
+        epoch = metadata.get("epoch")
+        iteration = metadata.get("iter")
+        if (
+            not isinstance(epoch, int)
+            or isinstance(epoch, bool)
+            or not 0 <= epoch <= expected["max_epochs"]
+        ):
+            mismatches.append("resume checkpoint epoch is outside the sealed horizon")
+        if (
+            not isinstance(iteration, int)
+            or isinstance(iteration, bool)
+            or iteration < 0
+        ):
+            mismatches.append("resume checkpoint iter must be a non-negative integer")
+        optimizer_state = payload["optimizer_state"]
+        if (
+            isinstance(epoch, int)
+            and not isinstance(epoch, bool)
+            and epoch > 0
+            and isinstance(optimizer_state, Mapping)
+            and optimizer_state.get("state_parameter_count")
+            != optimizer_state.get("parameter_count")
+        ):
+            mismatches.append("resume checkpoint optimizer state is incomplete")
+    return payload, mismatches
+
+
 def _validate_checkpoint_contract(
     checkpoint_path: Path,
     config: Config,
     *,
     allow_mismatch: bool,
-) -> None:
+    require_resume_state: bool = False,
+) -> dict | None:
     """Reject silent evaluation under a different projection/topology."""
 
     checkpoint = _load_checkpoint_without_executing_code(checkpoint_path)
@@ -1002,6 +1286,13 @@ def _validate_checkpoint_contract(
     )
     mismatches: list[str] = []
     integrity_mismatches: list[str] = []
+    sealed_payload, sealed_mismatches = _sealed_checkpoint_mismatches(
+        checkpoint,
+        metadata,
+        config,
+        require_resume_state=require_resume_state,
+    )
+    integrity_mismatches.extend(sealed_mismatches)
 
     deploy_contract = metadata.get("deploy_contract")
     deploy_behavior = metadata.get("native_deploy_behavior")
@@ -1097,11 +1388,12 @@ def _validate_checkpoint_contract(
         )
         raise ValueError(message)
     if not mismatches:
-        return
+        return sealed_payload
     message = "checkpoint/config contract mismatch: " + "; ".join(mismatches)
     if not allow_mismatch:
         raise ValueError(message)
     warnings.warn(message, stacklevel=2)
+    return sealed_payload
 
 
 def _compile_fast_inference(runner, config: Config) -> bool:
@@ -1139,7 +1431,12 @@ def _resolve_train_resume_checkpoint(
     return None if discovered is None else Path(discovered).expanduser().resolve()
 
 
-def _run_training(args: argparse.Namespace, config: Config) -> None:
+def _run_training(
+    args: argparse.Namespace,
+    config: Config,
+    *,
+    resume_payload_contract: Mapping | None = None,
+) -> None:
     """Build and run MMEngine after any resume checkpoint has been sealed."""
 
     if args.amp:
@@ -1157,9 +1454,15 @@ def _run_training(args: argparse.Namespace, config: Config) -> None:
             runner.work_dir,
         )
     metadata = _checkpoint_contract_metadata(config) or {}
+    _attach_runner_model_contract(metadata, runner)
     if provenance is not None:
         metadata["external_provenance"] = provenance
         metadata["source_revision"] = provenance["source_revision"]
+    if resume_payload_contract is not None:
+        runner.register_hook(
+            _ResumeContractValidationHook(resume_payload_contract),
+            priority="HIGHEST",
+        )
     if metadata:
         runner.register_hook(
             _CheckpointContractHook(metadata),
@@ -1187,14 +1490,19 @@ def train(args: argparse.Namespace, config: Config) -> None:
     # internal load_or_resume call. Replacing or overwriting the original path
     # after validation therefore cannot change the bytes MMEngine consumes.
     with _private_checkpoint_snapshot(resume_checkpoint) as snapshot:
-        _validate_checkpoint_contract(
+        resume_payload_contract = _validate_checkpoint_contract(
             snapshot.path,
             config,
             allow_mismatch=False,
+            require_resume_state=True,
         )
         config.resume = True
         config.load_from = str(snapshot.path)
-        _run_training(args, config)
+        _run_training(
+            args,
+            config,
+            resume_payload_contract=resume_payload_contract,
+        )
 
 
 def evaluate(args: argparse.Namespace, config: Config) -> None:

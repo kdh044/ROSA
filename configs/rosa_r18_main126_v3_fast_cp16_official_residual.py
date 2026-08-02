@@ -31,8 +31,23 @@ param_scheduler = [
     ),
 ]
 train_cfg = dict(max_epochs=30)
-default_hooks = dict(checkpoint=dict(max_keep_ckpts=5))
+default_hooks = dict(
+    checkpoint=dict(
+        max_keep_ckpts=5,
+        save_best=["fisheye_bev/mAP", "fisheye_bev/NDS"],
+        rule=["greater", "greater"],
+    )
+)
+custom_hooks = [
+    dict(type="SyncBuffersHook", priority="NORMAL"),
+    dict(type="ROSASparseMilestoneCheckpointHook", milestones=(8,)),
+]
 work_dir = "work_dirs/rosa_r18_main126_v3_fast_cp16_official_residual"
+
+sealed_resume_contract = dict(
+    contract="rosa.c32-fast-cp16.30e-pair.v1",
+    role="candidate",
+)
 
 experiment_contract = dict(
     _delete_=True,

@@ -177,6 +177,15 @@ private exact-byte snapshot rather than reopening the source pathname. Under
 torchrun, every DDP process owns, validates, and cleans up its own descriptor;
 descriptor paths are process-local and are never shared between ranks.
 
+The paired 30-epoch C32 control and fast-CP16 candidate add a stricter resume
+contract. It binds the exact head, resolved config, source revisions, package
+runtime, complete native-plus-sidecar state schema, optimizer groups, and the
+converted 30-epoch scheduler before MMEngine's permissive loader runs. Their
+checkpoint policy is identical: retain the latest five resumable epochs,
+hard-link epoch 8 as a protected resume milestone, and retain separate best
+`fisheye_bev/mAP` and best `fisheye_bev/NDS` weights. Best-only weights do not
+contain optimizer/scheduler state and are therefore rejected for resume.
+
 ## Checkpoint and results
 
 Only the best Full checkpoint is retained locally:

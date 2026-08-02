@@ -6,6 +6,11 @@ import torch
 from mmengine.optim import AmpOptimWrapper, OptimWrapper
 from mmengine.registry import OPTIM_WRAPPERS
 
+# Importing the optimizer integration is already part of every released
+# config's custom_imports, so register the sparse checkpoint milestone beside
+# the paired optimizer without adding another user-facing import setting.
+from rosa.mmengine_hooks import ROSASparseMilestoneCheckpointHook  # noqa: F401
+
 _SIDECAR_GROUP_KEY = "rosa_sidecar"
 
 

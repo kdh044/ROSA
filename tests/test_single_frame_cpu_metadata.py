@@ -23,6 +23,7 @@ from rosa.integrations.fisheye3dod.model import (
 from rosa.integrations.sparse4d import (
     ROSANativeBaselineHead,
     ROSAOfficialResidualNativeBaselineHead,
+    ROSAOfficialResidualRefinementHead,
     ROSARefinementHead,
 )
 
@@ -210,14 +211,13 @@ def test_only_exact_audited_non_temporal_heads_are_accepted():
     for head_type in (
         ROSANativeBaselineHead,
         ROSAOfficialResidualNativeBaselineHead,
+        ROSAOfficialResidualRefinementHead,
         ROSARefinementHead,
     ):
         _require_temporal_free_metadata_path(_audited_head(head_type=head_type))
     for extended_type in (ExtendedC0Head, ExtendedROSAHead):
         with pytest.raises(TypeError, match="exact audited temporal-free"):
-            _require_temporal_free_metadata_path(
-                _audited_head(head_type=extended_type)
-            )
+            _require_temporal_free_metadata_path(_audited_head(head_type=extended_type))
 
     with pytest.raises(ValueError, match="num_temp_instances=0"):
         _require_temporal_free_metadata_path(_audited_head(count=1))

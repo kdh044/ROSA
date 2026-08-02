@@ -749,8 +749,19 @@ def test_train_resume_loads_verified_snapshot_after_source_path_attack(
             observed["snapshot"] = snapshot
             yield snapshot
 
-    def validate_then_attack(snapshot_path, config, *, allow_mismatch):
-        validate(snapshot_path, config, allow_mismatch=allow_mismatch)
+    def validate_then_attack(
+        snapshot_path,
+        config,
+        *,
+        allow_mismatch,
+        require_resume_state=False,
+    ):
+        validate(
+            snapshot_path,
+            config,
+            allow_mismatch=allow_mismatch,
+            require_resume_state=require_resume_state,
+        )
         if attack == "rename_replace":
             replacement = tmp_path / "replacement.pth"
             _save_checkpoint(replacement, has_rosa=False)
