@@ -1,0 +1,92 @@
+{
+  "schema": "rosa.c32_inference_sanitize_xy_reuse.cpu_preflight.v2",
+  "status": "CPU_SOURCE_AND_MEMORY_PREPARED_NOT_ADOPTED",
+  "semantic_parent_commit": "e0d539d1e63ed07578729d4c45b03aeb893fe725",
+  "candidate_code_commit": "05f541d05f76d6b887041a7d2bf61cd2ee5b0d53",
+  "change": "reuse only the owned camera-transform XYZ buffer during sanitization and same-dtype x/y projection products",
+  "training": "fail closed through the inherited inference-reuse class",
+  "grad_enabled_evaluation": "fail closed through the inherited inference-reuse class",
+  "parameters_added": 0,
+  "buffers_added": 0,
+  "checkpoint_keys_added": 0,
+  "user_numeric_hyperparameters_added": 0,
+  "gpu_execution": false,
+  "official_metric_execution": false,
+  "exactness": {
+    "transforms": ["affine_3x3", "homogeneous_4x4"],
+    "mixed_dtype_layout_invalid_cases": 1024,
+    "noncontiguous_cases": 16,
+    "empty_shape_cases": 32,
+    "cpu_autocast_cases": 4,
+    "output_dtype_shape_stride_and_raw_bit_equal": true,
+    "caller_bytes_version_counters_and_storage_aliases_unchanged": true,
+    "mixed_dtype_fallback_preserves_parent_promotion": true,
+    "forward_ad": "outside the ordinary reverse-no-grad deployment scope"
+  },
+  "model_identity": {
+    "state_keys": 595,
+    "parameter_tensors": 535,
+    "parameters": 29667109,
+    "buffer_tensors": 99,
+    "buffer_elements": 10097,
+    "all_state_tensor_bytes_equal": true,
+    "python_numpy_torch_rng_equal": true,
+    "strict_load_equal": true
+  },
+  "cpu_storage_inventory": {
+    "method": "TorchDispatchMode retaining every operator output and counting unique non-input storages",
+    "parent_output_storage_bytes": 12106448,
+    "candidate_output_storage_bytes": 10047240,
+    "reduction_bytes": 2059208,
+    "reduction_fraction": 0.1700918386631653,
+    "parent_storage_count": 64,
+    "candidate_storage_count": 57,
+    "cumulative_reduction_vs_unreused_affine_bytes": 8798416,
+    "cumulative_reduction_vs_unreused_affine_fraction": 0.46686705944330087,
+    "measurement_kind": "retained-output allocation inventory, not process or CUDA peak"
+  },
+  "author_cpu_component_observation": {
+    "scope": "one affine CPU OCam projection only; no loader, H2D, CUDA, detector, or end-to-end claim",
+    "shape": [4, 4, 300, 13],
+    "torch_threads": 1,
+    "warmup_per_arm": 60,
+    "measurements_per_arm_per_round": 300,
+    "round_order": ["PC", "CP", "PC", "CP", "PC", "CP"],
+    "rounds": [
+      {"round": 1, "order": "PC", "parent_median_ms": 1.4648295, "candidate_median_ms": 1.44152, "median_ratio": 0.984087226533873, "parent_p95_ms": 1.474294, "candidate_p95_ms": 1.452511, "p95_ratio": 0.9852247923412835},
+      {"round": 2, "order": "CP", "parent_median_ms": 1.467579, "candidate_median_ms": 1.4426265, "median_ratio": 0.9829975081409588, "parent_p95_ms": 1.47824, "candidate_p95_ms": 1.449938, "p95_ratio": 0.9808542591189522},
+      {"round": 3, "order": "PC", "parent_median_ms": 1.465891, "candidate_median_ms": 1.444349, "median_ratio": 0.985304500812134, "parent_p95_ms": 1.475746, "candidate_p95_ms": 1.453402, "p95_ratio": 0.9848591830843519},
+      {"round": 4, "order": "CP", "parent_median_ms": 1.4696315, "candidate_median_ms": 1.4484105, "median_ratio": 0.985560325836783, "parent_p95_ms": 1.483367, "candidate_p95_ms": 1.460913, "p95_ratio": 0.9848628154731768},
+      {"round": 5, "order": "PC", "parent_median_ms": 1.466803, "candidate_median_ms": 1.4436535, "median_ratio": 0.9842177170349391, "parent_p95_ms": 1.474314, "candidate_p95_ms": 1.455936, "p95_ratio": 0.9875345414884482},
+      {"round": 6, "order": "CP", "parent_median_ms": 1.4674685, "candidate_median_ms": 1.445401, "median_ratio": 0.9849621985071569, "parent_p95_ms": 1.475475, "candidate_p95_ms": 1.456136, "p95_ratio": 0.9868930344465342}
+    ],
+    "median_of_round_median_ratios": 0.984589957771048,
+    "median_of_round_p95_ratios": 0.9850438039072301,
+    "worst_round_p95_ratio": 0.9875345414884482
+  },
+  "independent_cpu_timing_boundary": {
+    "median_improvement_reproduced": true,
+    "median_p95_improvement_reproduced": true,
+    "independent_run_median_ratios": [0.9848023, 0.9858168],
+    "independent_run_median_p95_ratios": [0.9884072, 0.9861892],
+    "independent_run_worst_p95_ratios": [1.0665129, 1.5729838],
+    "worst_tail_nonregression_approved": false,
+    "interpretation": "shared-host component observation only; tail and whole-detector claims are withheld"
+  },
+  "tests": {
+    "focused_geometry": "106 passed",
+    "full_cpu_suite": "294 passed, 5 optional-host skipped",
+    "cuda_visible_devices": ""
+  },
+  "source_sha256": {
+    "src/rosa/geometry.py": "7d05b4233d6884d7346118bfc0584d1e0e42f02b418247e9a6f94d2119082c7d",
+    "tests/test_ocam_inference_storage_reuse.py": "74f9820ba9913b27871cb6d57e8988c0cad9b62924b18bbca3f281dea7fe49a9"
+  },
+  "pending_gates": [
+    "fresh strict immediate-parent and candidate official Main126 primary/replay metric closure",
+    "CUDA FP32/BF16 raw-bit and valid-mask equality",
+    "real D0-D5 mask and decoded-prediction equality",
+    "paired CUDA projection and full-test-step latency plus allocated/reserved peak-memory non-regression",
+    "isolated tail-latency rerun"
+  ]
+}
