@@ -9,9 +9,9 @@ directory; or acquire a runtime lock.
 The separately armed path is intentionally difficult to invoke accidentally.
 It requires two explicit attestations, revalidates every source/checkpoint/DAF
 input, rejects a non-default current stream and concurrent GPU processes, then
-measures the exact same captured batches in one isolated C0/fast or C0/balanced
-paired alternating protocol.  Fast and balanced are deliberately separate
-process invocations with separate output directories.
+measures the exact same captured batches in one isolated C0/compiled-fast,
+C0/eager-fast, or C0/balanced paired alternating protocol.  Candidate variants
+are deliberately separate process invocations with separate output directories.
 """
 
 from __future__ import annotations
@@ -38,15 +38,22 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 VERIFY_C0_C32_TOOL = ROOT / "tools/verify_c0_c32_near_native.py"
 
-PROTOCOL = "full-rosa-c0-fast-balanced-near-native-v1"
-PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v1"
-EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v1"
+PROTOCOL = "full-rosa-c0-fast-variants-balanced-near-native-v2"
+PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v2"
+EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v2"
+COMPLETION_SCHEMA = "rosa.full_rosa_near_native_completion.v2"
+FAILURE_SCHEMA = "rosa.full_rosa_near_native_failure.v2"
 IDLE_RESERVED_TOKEN = "I_HAVE_VERIFIED_THE_GPU_IS_IDLE_AND_RESERVED"
 CURRENT_STREAM_TOKEN = "I_HAVE_VERIFIED_THE_CURRENT_STREAM_IS_DEFAULT"
 
 NATIVE_ARM = "c0_native"
 FAST_ARM = "rosa_fast"
+FAST_EAGER_ARM = "rosa_fast_eager"
 BALANCED_ARM = "rosa_balanced"
+FAST_MODEL_ARMS = frozenset((FAST_ARM, FAST_EAGER_ARM))
+COMPILED_ARMS = frozenset((FAST_ARM,))
+EAGER_ARMS = frozenset((FAST_EAGER_ARM, BALANCED_ARM))
+CANDIDATE_ARMS = frozenset((*FAST_MODEL_ARMS, BALANCED_ARM))
 WARMUP_ITERATIONS_PER_ARM = 60
 MEASURED_ITERATIONS_PER_ARM = 300
 CAPTURE_BATCHES = 2
@@ -159,9 +166,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--candidate-profile",
-        choices=("fast", "balanced"),
+        choices=("fast", "fast_eager", "balanced"),
         default="fast",
-        help="Run exactly one isolated C0-vs-ROSA profile protocol.",
+        help=(
+            "Run exactly one isolated C0-vs-ROSA candidate protocol; "
+            "fast_eager uses the exact fast model without torch.compile."
+        ),
     )
     parser.add_argument("--execute", action="store_true")
     parser.add_argument(
@@ -290,9 +300,49 @@ def _is_within(path: Path, root: Path) -> bool:
 def selected_candidate(profile: str) -> str:
     if profile == "fast":
         return FAST_ARM
+    if profile == "fast_eager":
+        return FAST_EAGER_ARM
     if profile == "balanced":
         return BALANCED_ARM
-    raise ProtocolError("candidate profile must be fast or balanced")
+    raise ProtocolError("candidate profile must be fast, fast_eager, or balanced")
+
+
+def candidate_model_profile(candidate_arm: str) -> str:
+    if candidate_arm in FAST_MODEL_ARMS:
+        return "fast"
+    if candidate_arm == BALANCED_ARM:
+        return "balanced"
+    raise ProtocolError("unknown ROSA candidate arm")
+
+
+def candidate_execution_mode(candidate_arm: str) -> str:
+    if candidate_arm in COMPILED_ARMS:
+        return "compiled"
+    if candidate_arm in EAGER_ARMS:
+        return "eager"
+    raise ProtocolError("unknown ROSA candidate arm")
+
+
+def compiler_guard_contract(candidate_arm: str) -> dict[str, Any]:
+    if candidate_arm in COMPILED_ARMS:
+        return {
+            "applicable": True,
+            "requirement": (
+                "torch._dynamo counters must remain raw-exact across the entire "
+                "recorded warmup and measured timing window"
+            ),
+        }
+    if candidate_arm == FAST_EAGER_ARM:
+        return {
+            "applicable": False,
+            "reason": "fast_eager candidate is the uncompiled fast reference path",
+        }
+    if candidate_arm == BALANCED_ARM:
+        return {
+            "applicable": False,
+            "reason": "balanced candidate is eager-only",
+        }
+    raise ProtocolError("unknown ROSA candidate arm")
 
 
 def selected_arms(profile: str) -> tuple[str, str]:
@@ -314,8 +364,10 @@ def build_alternating_schedule(
         raise ProtocolError("batch_count must be a positive exact integer")
     if not isinstance(phase, str) or not phase:
         raise ProtocolError("phase must be a nonempty string")
-    if candidate_arm not in (FAST_ARM, BALANCED_ARM):
-        raise ProtocolError("candidate_arm must be fast or balanced")
+    if candidate_arm not in CANDIDATE_ARMS:
+        raise ProtocolError(
+            "candidate_arm must be compiled fast, eager fast, or balanced"
+        )
     if iterations_per_arm % 12:
         raise ProtocolError("iterations_per_arm must be divisible by twelve")
     iterations_per_segment = iterations_per_arm // 12
@@ -417,6 +469,8 @@ def _arms_plan(arms: Sequence[str]) -> dict[str, Any]:
     if FAST_ARM in arms:
         records[FAST_ARM] = {
             "profile": "fast",
+            "model_profile": "fast",
+            "execution_mode": "compiled",
             "head_type": "ROSARefinementHead",
             "config_derivation": {
                 "base": NATIVE_ARM,
@@ -433,9 +487,30 @@ def _arms_plan(arms: Sequence[str]) -> dict[str, Any]:
                 "compilation_excluded_from_timing": True,
             },
         }
+    if FAST_EAGER_ARM in arms:
+        records[FAST_EAGER_ARM] = {
+            "profile": "fast_eager",
+            "model_profile": "fast",
+            "execution_mode": "eager",
+            "head_type": "ROSARefinementHead",
+            "config_derivation": {
+                "base": NATIVE_ARM,
+                "only_changes": {
+                    "model.head.type": "ROSARefinementHead",
+                    "model.head.rosa_cfg": {"profile": "fast"},
+                },
+            },
+            "compile": False,
+            "compile_forbidden": True,
+            "compile_state_attestation": (
+                "head.rosa_refiner._compiled_call_impl must remain None"
+            ),
+        }
     if BALANCED_ARM in arms:
         records[BALANCED_ARM] = {
             "profile": "balanced",
+            "model_profile": "balanced",
+            "execution_mode": "eager",
             "head_type": "ROSARefinementHead",
             "config_derivation": {
                 "base": NATIVE_ARM,
@@ -610,6 +685,8 @@ def prepare_plan(
         "gpu_selection": gpu_selection,
         "output_dir": str(output_dir),
         "candidate_profile": args.candidate_profile,
+        "candidate_model_profile": candidate_model_profile(candidate_arm),
+        "candidate_execution_mode": candidate_execution_mode(candidate_arm),
         "arms": _arms_plan(arms),
         "comparisons": comparisons,
         "parameters": {
@@ -661,10 +738,7 @@ def prepare_plan(
                 "maximum allocated/reserved and their increments; documented "
                 "cuBLAS workspaces cleared only between isolated arm builds"
             ),
-            "compiler_guard": (
-                "torch._dynamo counters must remain raw-exact across the entire "
-                "recorded warmup and measured timing window"
-            ),
+            "compiler_guard": compiler_guard_contract(candidate_arm),
         },
         "near_native_gate": {
             "source": "existing C0/C32 full-detector gate",
@@ -682,6 +756,8 @@ def prepare_plan(
             "labels_integral_and_in_six_class_range": True,
             "values_may_differ_between_profiles": True,
             "compiled_fast_must_be_raw_exact_with_eager_fast": True,
+            "fast_eager_is_the_uncompiled_fast_reference_path": True,
+            "candidate_execution_mode": candidate_execution_mode(candidate_arm),
             "preflight_only_not_in_timed_interval": True,
         },
         "guards": {
@@ -964,9 +1040,10 @@ def _derive_configs(verifier, native_config_path: Path, arms: Sequence[str]):
     native = verifier.Config.fromfile(native_config_path, import_custom_modules=False)
     native_dict = native.to_dict()
     configs = {NATIVE_ARM: native}
-    for arm, profile in ((FAST_ARM, "fast"), (BALANCED_ARM, "balanced")):
-        if arm not in arms:
+    for arm in arms:
+        if arm == NATIVE_ARM:
             continue
+        profile = candidate_model_profile(arm)
         candidate = copy.deepcopy(native)
         candidate.model.head.type = "ROSARefinementHead"
         candidate.model.head.rosa_cfg = {"profile": profile}
@@ -1167,8 +1244,8 @@ def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
         for name in source_config
         if source_config[name] != target_config[name]
     }
-    expected_deltas = FAST_CHECKPOINT_ALLOWED_DELTAS if arm == FAST_ARM else {}
-    if arm not in (FAST_ARM, BALANCED_ARM) or observed_deltas != expected_deltas:
+    expected_deltas = FAST_CHECKPOINT_ALLOWED_DELTAS if arm in FAST_MODEL_ARMS else {}
+    if arm not in CANDIDATE_ARMS or observed_deltas != expected_deltas:
         raise ProtocolError(
             f"{arm} checkpoint/runtime ROSA config delta is not allowed: "
             f"{observed_deltas}"
@@ -1184,6 +1261,8 @@ def _validate_checkpoint_semantics(run_tool, checkpoint, config, arm: str):
         "compared_effective_fields": sorted(source_config),
         "allowed_runtime_delta": expected_deltas,
         "observed_runtime_delta": observed_deltas,
+        "runtime_model_profile": candidate_model_profile(arm),
+        "runtime_execution_mode": candidate_execution_mode(arm),
         "all_other_effective_fields_exact": True,
         "validator": "full effective ROSA config comparison",
     }
@@ -1228,9 +1307,9 @@ def _build_models(verifier, configs, state_dict, arms, device):
             if type(model.head) is not ROSARefinementHead:
                 raise ProtocolError(f"{arm} did not build ROSARefinementHead")
             result = model.load_state_dict(_checkpoint_copy(state_dict), strict=True)
-            profile = "fast" if arm == FAST_ARM else "balanced"
-            expected_topk = 50 if arm == FAST_ARM else 100
-            expected_steps = 1 if arm == FAST_ARM else 2
+            profile = candidate_model_profile(arm)
+            expected_topk = 50 if arm in FAST_MODEL_ARMS else 100
+            expected_steps = 1 if arm in FAST_MODEL_ARMS else 2
             if (
                 model.head.rosa_cfg.refine_topk != expected_topk
                 or model.head.rosa_cfg.num_refinement_steps != expected_steps
@@ -1353,6 +1432,50 @@ def _reset_compiler_cache(torch) -> None:
     reset()
 
 
+def _attest_candidate_compile_state(
+    model,
+    candidate_arm: str,
+    *,
+    expected_compiled: bool,
+    phase: str,
+) -> dict[str, Any]:
+    if type(expected_compiled) is not bool:
+        raise TypeError("expected_compiled must be bool")
+    if not isinstance(phase, str) or not phase:
+        raise TypeError("phase must be a nonempty string")
+    model_profile = candidate_model_profile(candidate_arm)
+    execution_mode = candidate_execution_mode(candidate_arm)
+    if candidate_arm in EAGER_ARMS and expected_compiled:
+        raise ProtocolError(f"{candidate_arm} forbids compiled execution")
+    head = getattr(model, "head", None)
+    refiner = getattr(head, "rosa_refiner", None)
+    if refiner is None:
+        raise ProtocolError(f"{candidate_arm} is missing its ROSA refiner")
+    missing = object()
+    compiled_call = getattr(refiner, "_compiled_call_impl", missing)
+    if compiled_call is missing:
+        raise ProtocolError(
+            f"{candidate_arm} refiner does not expose its compile-state attribute"
+        )
+    observed_compiled = compiled_call is not None
+    if observed_compiled is not expected_compiled:
+        expected = "compiled" if expected_compiled else "uncompiled"
+        observed = "compiled" if observed_compiled else "uncompiled"
+        raise ProtocolError(
+            f"{candidate_arm} must be {expected} during {phase}, observed {observed}"
+        )
+    return {
+        "arm": candidate_arm,
+        "model_profile": model_profile,
+        "execution_mode": execution_mode,
+        "phase": phase,
+        "attribute": "head.rosa_refiner._compiled_call_impl",
+        "expected_compiled": expected_compiled,
+        "observed_compiled": observed_compiled,
+        "passed": True,
+    }
+
+
 def _measure_single_model_memory(
     verifier, torch, model, source_batch, device, arm: str
 ) -> dict[str, Any]:
@@ -1441,6 +1564,7 @@ def _measure_isolated_memory(
         )
         models: dict[str, Any] = {}
         compiler_cache_created = False
+        compile_state_attestations: list[dict[str, Any]] = []
         try:
             models, built_contracts, built_load_contracts = _build_models(
                 verifier, configs, state_dict, (arm,), device
@@ -1448,6 +1572,15 @@ def _measure_isolated_memory(
             contracts[arm] = built_contracts[arm]
             load_contracts[arm] = built_load_contracts[arm]
             compiled = False
+            if arm in CANDIDATE_ARMS:
+                compile_state_attestations.append(
+                    _attest_candidate_compile_state(
+                        models[arm],
+                        arm,
+                        expected_compiled=False,
+                        phase="after isolated memory model build",
+                    )
+                )
             if arm == FAST_ARM:
                 compiled = bool(
                     run_tool._compile_fast_inference(
@@ -1459,19 +1592,52 @@ def _measure_isolated_memory(
                     raise ProtocolError(
                         "isolated fast memory model did not compile its ROSA refiner"
                     )
+            if arm in CANDIDATE_ARMS:
+                compile_state_attestations.append(
+                    _attest_candidate_compile_state(
+                        models[arm],
+                        arm,
+                        expected_compiled=arm in COMPILED_ARMS,
+                        phase="before isolated memory output preflight",
+                    )
+                )
             preflight = {
                 str(batch_index): _preflight_outputs(
                     verifier, torch, {arm: models[arm]}, source, device
                 )[arm]
                 for batch_index, source in enumerate(sources)
             }
+            if arm in CANDIDATE_ARMS:
+                compile_state_attestations.append(
+                    _attest_candidate_compile_state(
+                        models[arm],
+                        arm,
+                        expected_compiled=arm in COMPILED_ARMS,
+                        phase="after isolated memory output preflight",
+                    )
+                )
             record = _measure_single_model_memory(
                 verifier, torch, models[arm], sources[0], device, arm
             )
+            if arm in CANDIDATE_ARMS:
+                compile_state_attestations.append(
+                    _attest_candidate_compile_state(
+                        models[arm],
+                        arm,
+                        expected_compiled=arm in COMPILED_ARMS,
+                        phase="after isolated memory probes",
+                    )
+                )
             record.update(
                 {
                     "allocator_before_build": before_build,
                     "compiled": compiled,
+                    "execution_mode": (
+                        candidate_execution_mode(arm)
+                        if arm in CANDIDATE_ARMS
+                        else "native"
+                    ),
+                    "compile_state_attestations": compile_state_attestations,
                     "preflight_by_batch": preflight,
                 }
             )
@@ -1592,22 +1758,22 @@ def _run_pair_protocol(
         manifests=manifests,
         device=device,
     )
+    compiler_contract = compiler_guard_contract(candidate_arm)
     if compiler_before is None:
-        result["compiler_guard"] = {
-            "applicable": False,
-            "reason": "balanced candidate is eager-only",
-        }
+        result["compiler_guard"] = compiler_contract
     else:
         compiler_after = _compiler_counter_snapshot(torch)
         result["compiler_guard"] = _require_compiler_counters_unchanged(
             compiler_before, compiler_after
         )
-        result["compiler_guard"]["applicable"] = True
+        result["compiler_guard"].update(compiler_contract)
     result["stream_after"] = _require_current_default_stream(torch, device)
     result["arm_aliases"] = {
         verifier.PARENT_ARM: NATIVE_ARM,
         verifier.CANDIDATE_ARM: candidate_arm,
     }
+    result["candidate_model_profile"] = candidate_model_profile(candidate_arm)
+    result["candidate_execution_mode"] = candidate_execution_mode(candidate_arm)
     return result
 
 
@@ -1839,6 +2005,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
         )
         model_contracts[candidate_arm] = pair_model_contracts
         load_contracts[candidate_arm] = pair_load_contracts
+        timing_compile_state_attestations = [
+            _attest_candidate_compile_state(
+                models[candidate_arm],
+                candidate_arm,
+                expected_compiled=False,
+                phase="after paired timing model build",
+            )
+        ]
 
         eager_candidate_preflight = None
         eager_candidate_rng = None
@@ -1868,6 +2042,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 != eager_candidate_state
             ):
                 raise ProtocolError("eager fast preflight mutated model state")
+            timing_compile_state_attestations.append(
+                _attest_candidate_compile_state(
+                    models[candidate_arm],
+                    candidate_arm,
+                    expected_compiled=False,
+                    phase="after eager reference preflight",
+                )
+            )
             verifier._restore_rng(eager_candidate_rng)
             compiled[candidate_arm] = bool(
                 run_tool._compile_fast_inference(
@@ -1877,12 +2059,26 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             )
             if not compiled[candidate_arm]:
                 raise ProtocolError("fast arm did not compile its ROSA refiner")
+            timing_compile_state_attestations.append(
+                _attest_candidate_compile_state(
+                    models[candidate_arm],
+                    candidate_arm,
+                    expected_compiled=True,
+                    phase="after fast compilation",
+                )
+            )
 
         _require_current_default_stream(torch, device)
         output_preflight = _preflight_outputs(
             verifier, torch, models, sources[0], device
         )
         compiled_parity = None
+        if candidate_arm == FAST_EAGER_ARM:
+            compiled_parity = {
+                "applicable": False,
+                "reason": "candidate is the uncompiled fast reference path",
+                "raw_eager_reference_path": True,
+            }
         if eager_candidate_preflight is not None:
             verifier.require_same_fingerprint(
                 "compiled fast preflight RNG",
@@ -1894,8 +2090,21 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 != eager_candidate_state
             ):
                 raise ProtocolError("compiled fast preflight mutated model state")
+        timing_compile_state_attestations.append(
+            _attest_candidate_compile_state(
+                models[candidate_arm],
+                candidate_arm,
+                expected_compiled=candidate_arm in COMPILED_ARMS,
+                phase="after paired output preflight",
+            )
+        )
 
         compiler_warmup_by_batch = None
+        if candidate_arm == FAST_EAGER_ARM:
+            compiler_warmup_by_batch = {
+                "applicable": False,
+                "reason": "torch.compile is forbidden for fast_eager",
+            }
         if candidate_arm == FAST_ARM:
             warmup_rng = verifier._capture_rng()
             warmup_state = verifier.raw_fingerprint(models[candidate_arm].state_dict())
@@ -1924,6 +2133,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 compiler_warmup_by_batch,
                 batch_count=len(sources),
             )
+        timing_compile_state_attestations.append(
+            _attest_candidate_compile_state(
+                models[candidate_arm],
+                candidate_arm,
+                expected_compiled=candidate_arm in COMPILED_ARMS,
+                phase="immediately before recorded timing",
+            )
+        )
 
         _atomic_json(pair_dir / "OUTPUT_PREFLIGHT.json", output_preflight)
         gpu_snapshots.append(_nvidia_smi_snapshot(identity["gpu_uuid"]))
@@ -1935,6 +2152,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             manifests,
             device,
             candidate_arm,
+        )
+        timing_compile_state_attestations.append(
+            _attest_candidate_compile_state(
+                models[candidate_arm],
+                candidate_arm,
+                expected_compiled=candidate_arm in COMPILED_ARMS,
+                phase="immediately after recorded timing",
+            )
         )
         warmup_records = timings.pop("warmup_records")
         measured_records = timings.pop("measured_records")
@@ -1953,6 +2178,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             "output_preflight": output_preflight,
             "compiled_eager_parity": compiled_parity,
             "compiler_warmup_by_batch": compiler_warmup_by_batch,
+            "compile_state_attestations": timing_compile_state_attestations,
             "memory": memory,
             "statistics": timings,
             "near_native_gate": near_native_gate,
@@ -2000,9 +2226,14 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             "memory_model_contracts": memory_model_contracts,
             "memory_checkpoint_load_contracts": memory_load_contracts,
             "compiled": compiled,
+            "candidate_model_profile": candidate_model_profile(candidate_arm),
+            "candidate_execution_mode": candidate_execution_mode(candidate_arm),
             "output_contract": {
                 "finite_and_well_formed": True,
                 "values_allowed_to_differ": True,
+                "fast_eager_is_the_uncompiled_fast_reference_path": (
+                    candidate_arm == FAST_EAGER_ARM
+                ),
             },
             "comparisons": comparison_results,
             "environment": environment,
@@ -2012,7 +2243,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
         _atomic_json(output_dir / "EVIDENCE.json", evidence)
         _seal_directory(output_dir)
         completion = {
-            "schema": "rosa.full_rosa_near_native_completion.v1",
+            "schema": COMPLETION_SCHEMA,
             "status": "COMPLETE",
             "evidence_sha256": file_sha256(output_dir / "EVIDENCE.json"),
             "seal_sha256": file_sha256(output_dir / "SHA256SUMS"),
@@ -2028,7 +2259,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             _atomic_json(
                 output_dir / "FAILURE.json",
                 {
-                    "schema": "rosa.full_rosa_near_native_failure.v1",
+                    "schema": FAILURE_SCHEMA,
                     "status": "FAILED",
                     "error_type": type(error).__name__,
                     "error": str(error),

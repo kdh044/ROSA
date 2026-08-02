@@ -107,6 +107,7 @@ with tempfile.TemporaryDirectory() as raw_temp:
 
     for profile, candidate in (
         ('fast', module.FAST_ARM),
+        ('fast_eager', module.FAST_EAGER_ARM),
         ('balanced', module.BALANCED_ARM),
     ):
         output = temp / ('not-created-' + profile)
@@ -128,6 +129,23 @@ with tempfile.TemporaryDirectory() as raw_temp:
         assert set(plan['arms']) == {module.NATIVE_ARM, candidate}
         assert set(plan['comparisons']) == {candidate}
         assert plan['candidate_profile'] == profile
+        assert plan['schema'].endswith('.v2')
+        assert plan['protocol'].endswith('-v2')
+        compiler_guard = plan['measurement']['compiler_guard']
+        if profile == 'fast':
+            assert compiler_guard['applicable'] is True
+            assert 'raw-exact' in compiler_guard['requirement']
+        else:
+            assert compiler_guard['applicable'] is False
+            assert 'reason' in compiler_guard
+        if profile == 'fast_eager':
+            assert plan['candidate_model_profile'] == 'fast'
+            assert plan['candidate_execution_mode'] == 'eager'
+            assert plan['arms'][candidate]['compile'] is False
+            assert plan['arms'][candidate]['compile_forbidden'] is True
+            assert plan['arms'][candidate]['config_derivation']['only_changes'][
+                'model.head.rosa_cfg'
+            ] == {'profile': 'fast'}
         assert module.main(argv) == 0
         assert not output.exists()
 
@@ -148,7 +166,11 @@ print('stdlib-only-ok')
 
 @pytest.mark.parametrize(
     ("candidate", "iterations"),
-    ((tool.FAST_ARM, 60), (tool.BALANCED_ARM, 300)),
+    (
+        (tool.FAST_ARM, 60),
+        (tool.FAST_EAGER_ARM, 300),
+        (tool.BALANCED_ARM, 300),
+    ),
 )
 def test_pair_schedule_is_balanced_pccp_cppc_and_replays_one_batch(
     candidate: str, iterations: int
@@ -182,15 +204,33 @@ def test_pair_schedule_is_balanced_pccp_cppc_and_replays_one_batch(
 
 
 @pytest.mark.parametrize(
-    ("profile", "candidate"),
-    (("fast", tool.FAST_ARM), ("balanced", tool.BALANCED_ARM)),
+    ("profile", "candidate", "model_profile", "execution_mode"),
+    (
+        ("fast", tool.FAST_ARM, "fast", "compiled"),
+        ("fast_eager", tool.FAST_EAGER_ARM, "fast", "eager"),
+        ("balanced", tool.BALANCED_ARM, "balanced", "eager"),
+    ),
 )
-def test_candidate_profile_selects_exactly_one_pair(profile, candidate) -> None:
+def test_candidate_profile_selects_exactly_one_pair(
+    profile, candidate, model_profile, execution_mode
+) -> None:
     arms = tool.selected_arms(profile)
 
     assert arms == (tool.NATIVE_ARM, candidate)
     assert tool.selected_candidate(profile) == candidate
+    assert tool.candidate_model_profile(candidate) == model_profile
+    assert tool.candidate_execution_mode(candidate) == execution_mode
     assert set(tool._arms_plan(arms)) == {tool.NATIVE_ARM, candidate}
+
+
+def test_schedule_rejects_an_unregistered_candidate_arm() -> None:
+    with pytest.raises(tool.ProtocolError, match="candidate_arm"):
+        tool.build_alternating_schedule(
+            iterations_per_arm=60,
+            phase="measured",
+            candidate_arm="rosa_unknown",
+            batch_count=2,
+        )
 
 
 @pytest.mark.parametrize(
@@ -253,7 +293,8 @@ def test_nvidia_smi_snapshot_uses_canonical_lower_selector(monkeypatch) -> None:
         commands.append(command)
         if any(value.startswith("--query-gpu=") for value in command):
             row = (
-                "2026/08/02 20:09:39.000, 0, " + canonical
+                "2026/08/02 20:09:39.000, 0, "
+                + canonical
                 + ", NVIDIA GPU, 580.65.06, P0, 40.0, 450.0, 210, 405"
             )
         else:
@@ -311,9 +352,7 @@ def test_logical_device_identity_rejects_arbitrary_stringable_uuid() -> None:
 
 
 def test_logical_device_identity_rejects_same_named_cuuid_impostor() -> None:
-    ExpectedTorchCUuuid = type(
-        "_CUuuid", (), {"__module__": "torch._C"}
-    )
+    ExpectedTorchCUuuid = type("_CUuuid", (), {"__module__": "torch._C"})
     ImpostorTorchCUuuid = type(
         "_CUuuid",
         (),
@@ -339,9 +378,7 @@ def test_logical_device_identity_rejects_same_named_cuuid_impostor() -> None:
 def test_shared_native_state_projection_preserves_ordered_mapping_type() -> None:
     from collections import OrderedDict
 
-    native = OrderedDict(
-        (("backbone.weight", object()), ("head.weight", object()))
-    )
+    native = OrderedDict((("backbone.weight", object()), ("head.weight", object())))
     candidate_values = {
         "head.weight": object(),
         "rosa.weight": object(),
@@ -387,9 +424,7 @@ def test_allocator_stabilization_clears_cublas_workspace_before_cache(
     fake_torch = SimpleNamespace(
         cuda=FakeCuda(),
         _C=SimpleNamespace(
-            _cuda_clearCublasWorkspaces=lambda: calls.append(
-                ("clear_cublas", None)
-            )
+            _cuda_clearCublasWorkspaces=lambda: calls.append(("clear_cublas", None))
         ),
     )
     monkeypatch.setattr(tool.gc, "collect", lambda: calls.append(("gc", None)))
@@ -430,6 +465,59 @@ def test_current_stream_guard_uses_ids_without_real_torch() -> None:
 
     with pytest.raises(tool.ProtocolError, match="not the default"):
         tool._require_current_default_stream(SimpleNamespace(cuda=FakeCuda()), "cuda:0")
+
+
+def test_fast_eager_compile_state_attestation_is_fail_closed() -> None:
+    refiner = SimpleNamespace(_compiled_call_impl=None)
+    model = SimpleNamespace(head=SimpleNamespace(rosa_refiner=refiner))
+
+    record = tool._attest_candidate_compile_state(
+        model,
+        tool.FAST_EAGER_ARM,
+        expected_compiled=False,
+        phase="before timing",
+    )
+    assert record["model_profile"] == "fast"
+    assert record["execution_mode"] == "eager"
+    assert record["observed_compiled"] is False
+
+    refiner._compiled_call_impl = object()
+    with pytest.raises(tool.ProtocolError, match="must be uncompiled"):
+        tool._attest_candidate_compile_state(
+            model,
+            tool.FAST_EAGER_ARM,
+            expected_compiled=False,
+            phase="after timing",
+        )
+    with pytest.raises(tool.ProtocolError, match="forbids compiled"):
+        tool._attest_candidate_compile_state(
+            model,
+            tool.FAST_EAGER_ARM,
+            expected_compiled=True,
+            phase="invalid contract",
+        )
+
+
+def test_compile_state_attestation_rejects_missing_or_wrong_fast_state() -> None:
+    missing = SimpleNamespace(head=SimpleNamespace(rosa_refiner=SimpleNamespace()))
+    with pytest.raises(tool.ProtocolError, match="does not expose"):
+        tool._attest_candidate_compile_state(
+            missing,
+            tool.FAST_EAGER_ARM,
+            expected_compiled=False,
+            phase="missing attribute",
+        )
+
+    uncompiled = SimpleNamespace(
+        head=SimpleNamespace(rosa_refiner=SimpleNamespace(_compiled_call_impl=None))
+    )
+    with pytest.raises(tool.ProtocolError, match="must be compiled"):
+        tool._attest_candidate_compile_state(
+            uncompiled,
+            tool.FAST_ARM,
+            expected_compiled=True,
+            phase="after compilation",
+        )
 
 
 def test_armed_execution_rejects_preimported_accelerator_module(monkeypatch) -> None:
@@ -486,7 +574,11 @@ def test_atomic_publication_removes_new_marker_when_directory_fsync_fails(
 
 @pytest.mark.parametrize(
     ("candidate", "expected_compiles"),
-    ((tool.FAST_ARM, 1), (tool.BALANCED_ARM, 0)),
+    (
+        (tool.FAST_ARM, 1),
+        (tool.FAST_EAGER_ARM, 0),
+        (tool.BALANCED_ARM, 0),
+    ),
 )
 def test_memory_measurement_builds_only_one_model_at_a_time(
     monkeypatch, candidate, expected_compiles
@@ -497,7 +589,10 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     lifecycle = []
 
     class Model:
-        pass
+        def __init__(self):
+            self.head = SimpleNamespace(
+                rosa_refiner=SimpleNamespace(_compiled_call_impl=None)
+            )
 
     def build_models(verifier, configs, state_dict, arms, device):
         del verifier, configs, state_dict, device
@@ -535,6 +630,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         @staticmethod
         def _compile_fast_inference(model, config):
             compile_calls.append((model, config))
+            model.model.head.rosa_refiner._compiled_call_impl = object()
             return True
 
     monkeypatch.setattr(tool, "_build_models", build_models)
@@ -545,6 +641,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
             arm: {"raw_fingerprint": arm} for arm in models
         },
     )
+
     def stabilize(torch, device):
         del torch, device
         lifecycle.append("stabilize")
@@ -612,6 +709,16 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         assert memory[arm]["resident_benchmark_models"] == [arm]
         assert memory[arm]["peer_model_resident"] is False
         assert len(memory[arm]["probe_records"]) == 3
+    assert memory[candidate]["execution_mode"] == tool.candidate_execution_mode(
+        candidate
+    )
+    assert all(
+        record["passed"] for record in memory[candidate]["compile_state_attestations"]
+    )
+    assert all(
+        record["observed_compiled"] is (candidate == tool.FAST_ARM)
+        for record in memory[candidate]["compile_state_attestations"][1:]
+    )
 
 
 def test_fast_timing_rejects_compiler_counter_changes() -> None:
@@ -661,7 +768,14 @@ def test_fast_timing_rejects_compiler_counter_changes() -> None:
         )
 
 
-def test_balanced_timing_does_not_require_compiler_counters() -> None:
+@pytest.mark.parametrize(
+    ("candidate", "reason"),
+    (
+        (tool.FAST_EAGER_ARM, "uncompiled fast reference"),
+        (tool.BALANCED_ARM, "balanced candidate"),
+    ),
+)
+def test_eager_timing_does_not_require_compiler_counters(candidate, reason) -> None:
     class Cuda:
         @staticmethod
         def current_stream(device):
@@ -682,13 +796,15 @@ def test_balanced_timing_does_not_require_compiler_counters() -> None:
     result = tool._run_pair_protocol(
         verifier,
         SimpleNamespace(cuda=Cuda()),
-        {tool.NATIVE_ARM: object(), tool.BALANCED_ARM: object()},
+        {tool.NATIVE_ARM: object(), candidate: object()},
         [],
         [],
         "cuda:0",
-        tool.BALANCED_ARM,
+        candidate,
     )
     assert result["compiler_guard"]["applicable"] is False
+    assert reason in result["compiler_guard"]["reason"]
+    assert result["candidate_execution_mode"] == "eager"
 
 
 @dataclass(frozen=True)
@@ -742,18 +858,23 @@ def _semantic_checkpoint(**source_overrides):
     }
 
 
-def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta() -> None:
+@pytest.mark.parametrize("arm", (tool.FAST_ARM, tool.FAST_EAGER_ARM))
+def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta(
+    arm,
+) -> None:
     record = tool._validate_checkpoint_semantics(
         _SemanticRunTool,
         _semantic_checkpoint(),
         object(),
-        tool.FAST_ARM,
+        arm,
     )
 
-    assert record["validated_against_arm"] == tool.FAST_ARM
+    assert record["validated_against_arm"] == arm
     assert record["source_refinement_profile"] == "balanced"
     assert record["allowed_runtime_delta"] == tool.FAST_CHECKPOINT_ALLOWED_DELTAS
     assert record["observed_runtime_delta"] == tool.FAST_CHECKPOINT_ALLOWED_DELTAS
+    assert record["runtime_model_profile"] == "fast"
+    assert record["runtime_execution_mode"] == tool.candidate_execution_mode(arm)
     assert record["all_other_effective_fields_exact"] is True
 
 
@@ -781,15 +902,14 @@ def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta() 
         ),
     ),
 )
+@pytest.mark.parametrize("arm", (tool.FAST_ARM, tool.FAST_EAGER_ARM))
 def test_checkpoint_semantics_fails_closed_on_missing_or_unrelated_metadata(
-    mutation, message
+    mutation, message, arm
 ) -> None:
     checkpoint = _semantic_checkpoint()
     mutation(checkpoint)
     with pytest.raises(tool.ProtocolError, match=message):
-        tool._validate_checkpoint_semantics(
-            _SemanticRunTool, checkpoint, object(), tool.FAST_ARM
-        )
+        tool._validate_checkpoint_semantics(_SemanticRunTool, checkpoint, object(), arm)
 
 
 def test_compiled_parity_requires_raw_exact_output_for_every_batch() -> None:
@@ -847,6 +967,66 @@ def test_candidate_config_changes_only_the_preregistered_head_fields(profile) ->
     }
 
 
+def test_fast_eager_derives_the_exact_fast_model_config_without_name_leak() -> None:
+    native = {
+        "model": {
+            "backbone": {"depth": 18},
+            "head": {"type": "ROSANativeBaselineHead", "rosa_cfg": None},
+        },
+        "seed": 3407,
+    }
+    arms = tool._arms_plan(tool.selected_arms("fast_eager"))
+    derivation = arms[tool.FAST_EAGER_ARM]["config_derivation"]["only_changes"]
+    expected = tool._expected_candidate_config(
+        native, tool.candidate_model_profile(tool.FAST_EAGER_ARM)
+    )
+
+    assert tool.candidate_model_profile(tool.FAST_EAGER_ARM) == "fast"
+    assert derivation["model.head.rosa_cfg"] == {"profile": "fast"}
+    assert "fast_eager" not in json.dumps(derivation, sort_keys=True)
+    assert expected["model"]["head"] == {
+        "type": "ROSARefinementHead",
+        "rosa_cfg": {"profile": "fast"},
+    }
+
+
+def test_derive_configs_materializes_fast_eager_as_fast() -> None:
+    class FakeConfig:
+        def __init__(self):
+            self.model = SimpleNamespace(
+                backbone=SimpleNamespace(depth=18),
+                head=SimpleNamespace(type="ROSANativeBaselineHead", rosa_cfg=None),
+            )
+            self.seed = 3407
+
+        def to_dict(self):
+            return {
+                "model": {
+                    "backbone": {"depth": self.model.backbone.depth},
+                    "head": {
+                        "type": self.model.head.type,
+                        "rosa_cfg": self.model.head.rosa_cfg,
+                    },
+                },
+                "seed": self.seed,
+            }
+
+    verifier = SimpleNamespace(
+        Config=SimpleNamespace(
+            fromfile=lambda path, import_custom_modules: FakeConfig()
+        )
+    )
+    configs = tool._derive_configs(
+        verifier,
+        Path("unused-native-config.py"),
+        tool.selected_arms("fast_eager"),
+    )
+
+    assert configs[tool.NATIVE_ARM].model.head.type == "ROSANativeBaselineHead"
+    assert configs[tool.FAST_EAGER_ARM].model.head.type == "ROSARefinementHead"
+    assert configs[tool.FAST_EAGER_ARM].model.head.rosa_cfg == {"profile": "fast"}
+
+
 def test_native_checkpoint_filter_accepts_only_rosa_sidecar_state() -> None:
     tool._validate_native_checkpoint_exclusions(
         ["head.rosa_refiner.confidence.weight", "head.rosa_refiner.yaw.bias"]
@@ -857,7 +1037,7 @@ def test_native_checkpoint_filter_accepts_only_rosa_sidecar_state() -> None:
         )
 
 
-@pytest.mark.parametrize("profile", ("fast", "balanced"))
+@pytest.mark.parametrize("profile", ("fast", "fast_eager", "balanced"))
 def test_effective_dataset_contract_pins_main126_annotation_and_batch_size(
     tmp_path, profile
 ) -> None:
@@ -937,7 +1117,9 @@ def test_near_native_gate_maps_physical_arms_and_freezes_thresholds() -> None:
 
 
 def test_plan_json_shape_is_serializable_without_accelerator_types() -> None:
-    arms = tool._arms_plan(tool.selected_arms("balanced"))
+    arms = tool._arms_plan(tool.selected_arms("fast_eager"))
     encoded = json.dumps(arms, sort_keys=True)
     assert "ROSARefinementHead" in encoded
-    assert set(arms) == {tool.NATIVE_ARM, tool.BALANCED_ARM}
+    assert '"model_profile": "fast"' in encoded
+    assert '"execution_mode": "eager"' in encoded
+    assert set(arms) == {tool.NATIVE_ARM, tool.FAST_EAGER_ARM}
