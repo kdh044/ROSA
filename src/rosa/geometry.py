@@ -13,7 +13,12 @@ PROJECTION_CONTRACTS = ("legacy_front_only", "full_fov")
 
 def _horner(coefficients: Tensor, value: Tensor) -> Tensor:
     terms = coefficients.unbind(dim=-1)
-    output = terms[-1].expand_as(value).clone()
+    if len(terms) == 1:
+        return terms[0].expand_as(value).clone()
+    # The first multiply already materializes a full value-shaped tensor.
+    # Keep the leading coefficient as a broadcast view until that operation
+    # instead of cloning a full temporary that is immediately discarded.
+    output = terms[-1]
     for coefficient in reversed(terms[:-1]):
         output = output * value + coefficient.expand_as(value)
     return output
@@ -56,16 +61,15 @@ def _sanitize_camera_xyz(camera_xyz: Tensor) -> tuple[Tensor, Tensor]:
     bounded = torch.where(
         finite_and_bounded[..., None],
         camera_xyz,
-        torch.zeros_like(camera_xyz),
+        0.0,
     )
     radius_squared = (bounded * bounded).sum(dim=-1)
     geometry_valid = finite_and_bounded & radius_squared.gt(1e-6)
     # OCam's forward axis is -Z. Invalid positions are evaluated at this
     # finite ray and masked after projection, preventing NaN gradients at the
     # camera origin without changing any valid projection.
-    fallback = torch.zeros_like(camera_xyz)
-    fallback[..., 2] = -1.0
-    safe = torch.where(geometry_valid[..., None], bounded, fallback)
+    safe = torch.where(geometry_valid[..., None], bounded, 0.0)
+    safe[..., 2].masked_fill_(~geometry_valid, -1.0)
     return safe, geometry_valid
 
 
@@ -123,7 +127,7 @@ def ocam_project_points(
     scale = torch.where(
         planar_norm > 1e-8,
         rho / planar_norm.clamp_min(1e-8),
-        torch.zeros_like(rho),
+        0.0,
     )
     image_x, image_y = x * scale, y * scale
 
@@ -160,11 +164,10 @@ def ocam_project_points(
     )
     normalized_u = pixel_u / width.clamp_min(1)
     normalized_v = pixel_v / height.clamp_min(1)
-    sentinel = torch.full_like(normalized_u, 2.0)
     return torch.stack(
         (
-            torch.where(valid, normalized_u, sentinel),
-            torch.where(valid, normalized_v, sentinel),
+            torch.where(valid, normalized_u, 2.0),
+            torch.where(valid, normalized_v, 2.0),
         ),
         dim=-1,
     )
