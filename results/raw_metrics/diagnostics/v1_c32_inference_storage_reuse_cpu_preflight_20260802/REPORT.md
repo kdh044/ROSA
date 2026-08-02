@@ -20,13 +20,19 @@ Parent and candidate projection outputs are raw-bit equal for FP16, FP32,
 FP64, and BF16; shared and camera-conditioned point layouts; one, two, five,
 and ten Horner coefficients; NaN, Inf, camera-origin, and boundedness-rejected
 rays.  Output strides and all caller inputs are unchanged.  The strict default
-path continues to pass its original contracts.
+path continues to pass its original contracts.  An independent 512-case
+points/intrinsic/polynomial/image-extent dtype cross-product, including 326
+promotion fallbacks, preserved output dtype, shape, stride, and raw bits; 16
+empty-shape cases were also exact.  The optimized path is scoped to ordinary
+tensors under reverse-mode `no_grad`/`inference_mode`.  Forward-mode AD is not
+supported on its homogeneous-dtype `out=` path and is outside deployment.
 
 Seeded full-model builds have identical 595 state keys, all state tensor
-bytes, 29,667,109 parameters, 10,097 buffers, and final RNG state.  The only
+bytes, 29,667,109 parameters, 10,097 buffer elements, and Python, NumPy, and
+Torch RNG states.  The only
 resolved-config change from the affine parent is the registered deformable
 aggregation type, applied to all six decoder stages.  The repository-wide CPU
-suite passed 278 tests with five optional-host skips while CUDA was hidden.
+suite passed 279 tests with five optional-host skips while CUDA was hidden.
 
 ## CPU component observation
 

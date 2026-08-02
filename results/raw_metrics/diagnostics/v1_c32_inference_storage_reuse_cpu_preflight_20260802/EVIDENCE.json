@@ -2,7 +2,7 @@
   "schema": "rosa.c32_affine_ocam_inference_storage_reuse.cpu_preflight.v1",
   "status": "CPU_PREPARED_NOT_ADOPTED",
   "parent_commit": "a0df4686573e033725d1216d73540eb883208b9b",
-  "candidate_commit": "8f208240cf75644d71db3b5adca498380b897602",
+  "candidate_commit": "e0d539d1e63ed07578729d4c45b03aeb893fe725",
   "change": "reuse owned Horner, pixel, normalization, and projected-output storage during no-grad affine OCam evaluation",
   "training": "fail closed",
   "grad_enabled_evaluation": "fail closed",
@@ -22,6 +22,11 @@
     "caller_inputs_unchanged": ["points", "lidar2cam", "ocam_intrinsic", "ocam_pol", "image_wh"],
     "invalid_cases": ["NaN", "Inf", "camera origin", "absolute coordinate at least 1e4"],
     "invalid_sentinel_raw_bit_equal": true,
+    "mixed_dtype_matrix_cases": 512,
+    "mixed_dtype_fallback_cases": 326,
+    "mixed_dtype_output_dtype_shape_stride_and_raw_bit_equal": true,
+    "empty_shape_cases": 16,
+    "ordinary_tensor_autograd_scope": "reverse-mode no_grad or inference_mode; forward AD is unsupported on the homogeneous-dtype reuse path",
     "strict_default_path_changed": false
   },
   "model_identity": {
@@ -64,15 +69,15 @@
     "measurement_kind": "retained-output allocation inventory, not process or CUDA peak"
   },
   "tests": {
-    "candidate_contracts": "28 passed, 68 warnings in 3.10s",
-    "focused_projection": "85 passed, 68 warnings in 3.37s",
-    "full_cpu_suite": "278 passed, 5 skipped, 68 warnings in 16.48s",
+    "candidate_contracts": "29 passed",
+    "focused_projection": "97 passed",
+    "full_cpu_suite": "279 passed, 5 optional-host skipped",
     "cuda_visible_devices": ""
   },
   "source_sha256": {
-    "src/rosa/geometry.py": "ca3bab08d578c06d22a3f007e09680f81834dede5822a2cae17b76c708fb54cc",
+    "src/rosa/geometry.py": "df2c499036771efefaaf4f0be28e47f76228620339724ad099984ef12ad38e1a",
     "src/rosa/integrations/sparse4d.py": "27153a767a4af1bda93a1c5756036aaaa0ff1f1e044b7b053e40539bc21c6f3b",
-    "tests/test_ocam_inference_storage_reuse.py": "6040c1d5ce9ca90b66dd3aefa7da75a3af6e50e9a580568df02d9a09b680c015",
+    "tests/test_ocam_inference_storage_reuse.py": "69a729f4cfc32772e438a18a67125029009eb89823b34f4ab48e3ee4690c61bb",
     "configs/rosa_r18_main126_v2_c32_cbgs_native_official_gnn_residual_cpu_metadata_lean_loader_rgb_uint8_transfer_pinned_inplace_affine3x3_inference_reuse_metric_gate.py": "9a7f3156de81484a4e0ef074fd2f870383844578eea7d92529164be196f25466"
   },
   "pending_gates": [
