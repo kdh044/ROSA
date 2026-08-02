@@ -1,9 +1,18 @@
 import torch
 
+from rosa.observation import sample_multiscale_features
 from rosa.sampling import (
     DeterministicBilinearSampler,
     FusedBilinearSampler,
 )
+
+
+def _released_multiscale(fpn, uv, query, sampler, level_head):
+    sample_uv = uv.unsqueeze(4)
+    sampled = [sampler(feature, sample_uv).squeeze(4) for feature in fpn]
+    levels = torch.stack(sampled, dim=2)
+    weights = torch.softmax(level_head(query).float(), dim=-1).to(levels.dtype)
+    return (levels * weights[:, :, :, None, None, None]).sum(dim=2)
 
 
 def test_fused_sampler_matches_the_release_four_gather_sampler():
@@ -44,3 +53,83 @@ def test_fused_sampler_uses_deterministic_path_when_inputs_need_gradients():
     expected = sampler.fallback(feature, uv)
     actual = sampler(feature, uv)
     assert torch.equal(actual, expected)
+
+
+def test_eval_multiscale_storage_reuse_is_raw_exact():
+    generator = torch.Generator().manual_seed(3407)
+    fpn = [
+        torch.randn(1, 2, 3, size, size, generator=generator)
+        for size in (8, 4, 2, 1)
+    ]
+    uv = torch.rand(1, 5, 2, 3, 2, generator=generator)
+    query = torch.randn(1, 5, 3, generator=generator)
+    level_head = torch.nn.Linear(3, 4)
+    sampler = DeterministicBilinearSampler()
+
+    with torch.no_grad():
+        expected = _released_multiscale(fpn, uv, query, sampler, level_head)
+        actual = sample_multiscale_features(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+
+    assert torch.equal(actual, expected)
+
+
+def test_training_multiscale_path_preserves_output_and_gradients():
+    generator = torch.Generator().manual_seed(7101080)
+    parent_fpn = [
+        torch.randn(
+            1,
+            2,
+            3,
+            size,
+            size,
+            generator=generator,
+            requires_grad=True,
+        )
+        for size in (8, 4, 2, 1)
+    ]
+    candidate_fpn = [
+        value.detach().clone().requires_grad_() for value in parent_fpn
+    ]
+    uv = torch.rand(1, 5, 2, 3, 2, generator=generator)
+    parent_query = torch.randn(
+        1,
+        5,
+        3,
+        generator=generator,
+        requires_grad=True,
+    )
+    candidate_query = parent_query.detach().clone().requires_grad_()
+    parent_head = torch.nn.Linear(3, 4)
+    candidate_head = torch.nn.Linear(3, 4)
+    candidate_head.load_state_dict(parent_head.state_dict())
+    sampler = DeterministicBilinearSampler()
+
+    expected = _released_multiscale(
+        parent_fpn,
+        uv,
+        parent_query,
+        sampler,
+        parent_head,
+    )
+    actual = sample_multiscale_features(
+        candidate_fpn,
+        uv,
+        candidate_query,
+        sampler,
+        candidate_head,
+    )
+    assert torch.equal(actual, expected)
+
+    expected.sum().backward()
+    actual.sum().backward()
+    for candidate, parent in zip(candidate_fpn, parent_fpn):
+        assert torch.equal(candidate.grad, parent.grad)
+    assert torch.equal(candidate_query.grad, parent_query.grad)
+    for candidate, parent in zip(candidate_head.parameters(), parent_head.parameters()):
+        assert torch.equal(candidate.grad, parent.grad)

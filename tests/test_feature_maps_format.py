@@ -6,7 +6,11 @@ import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
-from projects.mmdet3d_plugin.ops import feature_maps_format
+from projects.mmdet3d_plugin.ops import (
+    feature_map_layout_receipt,
+    feature_maps_format,
+    trusted_feature_map_layout,
+)
 
 
 def _historical_feature_maps_format(feature_maps):
@@ -160,6 +164,206 @@ def test_single_copy_layout_round_trips_through_inverse_format():
         assert torch.equal(actual, parent)
         assert torch.equal(actual, source)
         assert actual.stride() == parent.stride()
+        assert actual.untyped_storage().data_ptr() == (
+            reconstructed_groups[0][0].untyped_storage().data_ptr()
+        )
+
+
+def test_inverse_uses_trusted_cpu_layout_without_metadata_readback(monkeypatch):
+    formatted = feature_maps_format(_features())
+    layout = (
+        ((7, 5), (4, 3), (2, 2), (1, 1)),
+    ) * 4
+    receipt = feature_map_layout_receipt(formatted, layout)
+    assert type(formatted) is list
+    assert trusted_feature_map_layout(formatted, receipt) == layout
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("trusted inverse attempted a device metadata readback")
+
+    monkeypatch.setattr(torch, "all", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+    reconstructed = feature_maps_format(
+        formatted,
+        inverse=True,
+        layout=trusted_feature_map_layout(formatted, receipt),
+    )
+    assert len(reconstructed) == 1
+    assert [value.shape[-2:] for value in reconstructed[0]] == [
+        torch.Size((7, 5)),
+        torch.Size((4, 3)),
+        torch.Size((2, 2)),
+        torch.Size((1, 1)),
+    ]
+
+
+def test_inference_mode_keeps_layout_receipt_versioned_without_readback(
+    monkeypatch,
+):
+    layout = (
+        ((7, 5), (4, 3), (2, 2), (1, 1)),
+    ) * 4
+    with torch.inference_mode():
+        formatted = feature_maps_format(_features())
+        receipt = feature_map_layout_receipt(formatted, layout)
+
+    assert torch.is_inference(formatted[0])
+    assert not torch.is_inference(formatted[1])
+    assert not torch.is_inference(formatted[2])
+    assert trusted_feature_map_layout(formatted, receipt) == layout
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("trusted inverse attempted a device metadata readback")
+
+    monkeypatch.setattr(torch, "all", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+    reconstructed = feature_maps_format(
+        formatted,
+        inverse=True,
+        layout=trusted_feature_map_layout(formatted, receipt),
+    )
+    assert len(reconstructed) == 1
+    assert [value.shape[-2:] for value in reconstructed[0]] == [
+        torch.Size((7, 5)),
+        torch.Size((4, 3)),
+        torch.Size((2, 2)),
+        torch.Size((1, 1)),
+    ]
+
+
+def test_trusted_layout_preserves_heterogeneous_camera_groups():
+    generator = torch.Generator().manual_seed(17)
+    first = [
+        torch.randn(1, 2, 4, height, width, generator=generator)
+        for height, width in ((5, 4), (3, 2))
+    ]
+    second = [
+        torch.randn(1, 2, 4, height, width, generator=generator)
+        for height, width in ((4, 3), (2, 1))
+    ]
+    expected = feature_maps_format(
+        _historical_feature_maps_format([first, second]),
+        inverse=True,
+    )
+    formatted = feature_maps_format([first, second])
+    layout = (
+        (((5, 4), (3, 2)),) * 2
+        + (((4, 3), (2, 1)),) * 2
+    )
+    receipt = feature_map_layout_receipt(formatted, layout)
+    actual = feature_maps_format(
+        formatted,
+        inverse=True,
+        layout=trusted_feature_map_layout(formatted, receipt),
+    )
+
+    assert type(formatted) is list
+    assert len(actual) == len(expected) == 2
+    for actual_group, expected_group, source_group in zip(
+        actual,
+        expected,
+        (first, second),
+    ):
+        for value, parent, source in zip(
+            actual_group,
+            expected_group,
+            source_group,
+        ):
+            assert torch.equal(value, parent)
+            assert torch.equal(value, source)
+            assert value.shape == parent.shape
+            assert value.stride() == parent.stride()
+            assert value.untyped_storage().data_ptr() == formatted[0].untyped_storage().data_ptr()
+
+
+def test_inference_mode_versions_nested_group_metadata(monkeypatch):
+    generator = torch.Generator().manual_seed(29)
+    first = [
+        torch.randn(1, 2, 4, height, width, generator=generator)
+        for height, width in ((5, 4), (3, 2))
+    ]
+    second = [
+        torch.randn(1, 2, 4, height, width, generator=generator)
+        for height, width in ((4, 3), (2, 1))
+    ]
+    layout = (
+        (((5, 4), (3, 2)),) * 2
+        + (((4, 3), (2, 1)),) * 2
+    )
+    with torch.inference_mode():
+        formatted = feature_maps_format([first, second])
+        receipt = feature_map_layout_receipt(formatted, layout)
+
+    assert torch.is_inference(formatted[0])
+    assert not torch.is_inference(formatted[1])
+    assert not torch.is_inference(formatted[2])
+    assert trusted_feature_map_layout(formatted, receipt) == layout
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("trusted inverse attempted a device metadata readback")
+
+    monkeypatch.setattr(torch, "all", forbidden)
+    monkeypatch.setattr(torch.Tensor, "cpu", forbidden)
+    actual = feature_maps_format(
+        formatted,
+        inverse=True,
+        layout=trusted_feature_map_layout(formatted, receipt),
+    )
+    assert len(actual) == 2
+    assert [[value.shape[-2:] for value in group] for group in actual] == [
+        [torch.Size((5, 4)), torch.Size((3, 2))],
+        [torch.Size((4, 3)), torch.Size((2, 1))],
+    ]
+
+
+def test_replaced_abi_tensor_rejects_descriptor_and_uses_legacy_fallback():
+    formatted = feature_maps_format(_features())
+    layout = (
+        ((7, 5), (4, 3), (2, 2), (1, 1)),
+    ) * 4
+    receipt = feature_map_layout_receipt(formatted, layout)
+    expected = feature_maps_format(formatted, inverse=True)
+    formatted[1] = formatted[1].clone()
+    assert trusted_feature_map_layout(formatted, receipt) is None
+    actual = feature_maps_format(formatted, inverse=True)
+    for actual_group, expected_group in zip(actual, expected):
+        for value, parent in zip(actual_group, expected_group):
+            assert torch.equal(value, parent)
+            assert value.stride() == parent.stride()
+
+
+def test_inplace_metadata_change_invalidates_layout_receipt():
+    formatted = feature_maps_format(_features())
+    layout = (
+        ((7, 5), (4, 3), (2, 2), (1, 1)),
+    ) * 4
+    receipt = feature_map_layout_receipt(formatted, layout)
+    formatted[1][:, 0] = torch.tensor((5, 7), dtype=formatted[1].dtype)
+
+    assert trusted_feature_map_layout(formatted, receipt) is None
+    expected = feature_maps_format(list(formatted), inverse=True)
+    actual = feature_maps_format(formatted, inverse=True)
+    for actual_group, expected_group in zip(actual, expected):
+        for value, parent in zip(actual_group, expected_group):
+            assert torch.equal(value, parent)
+            assert value.shape == parent.shape
+            assert value.stride() == parent.stride()
+
+
+def test_forward_formatter_remains_plain_pytree_and_fullgraph_compilable():
+    from torch.utils import _pytree
+
+    def format_one(value):
+        return feature_maps_format([value])
+
+    value = torch.randn(1, 2, 3, 5, 4)
+    compiled = torch.compile(format_one, backend="eager", fullgraph=True)
+    formatted = compiled(value)
+    leaves, _ = _pytree.tree_flatten(formatted)
+
+    assert type(formatted) is list
+    assert len(leaves) == 3
+    assert all(torch.is_tensor(leaf) for leaf in leaves)
 
 
 def test_single_copy_layout_removes_one_full_feature_storage():

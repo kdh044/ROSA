@@ -178,7 +178,7 @@ def _half_fov_radians(
     return torch.deg2rad(fov * 0.5)[:, :, None, None]
 
 
-def ocam_project_points(
+def _ocam_project_points_impl(
     points: Tensor,
     metas: dict,
     image_wh: Tensor,
@@ -186,8 +186,9 @@ def ocam_project_points(
     contract: str = "legacy_front_only",
     camera_transform: str = "homogeneous_4x4",
     inference_storage_reuse: bool = False,
-) -> Tensor:
-    """Project lidar-frame points to normalized native-fisheye pixels.
+    preserve_raw_camera_xyz: bool = False,
+) -> tuple[Tensor, Tensor | None]:
+    """Internal projection core with optional exact-strided raw XYZ capture.
 
     ``legacy_front_only`` exactly preserves the projection validity used to
     train the published checkpoints.  It adds a front-plane test and therefore
@@ -200,6 +201,8 @@ def ocam_project_points(
         raise ValueError(f"unknown OCam projection contract: {contract}")
     if not isinstance(inference_storage_reuse, bool):
         raise TypeError("inference_storage_reuse must be a bool")
+    if not isinstance(preserve_raw_camera_xyz, bool):
+        raise TypeError("preserve_raw_camera_xyz must be a bool")
     if inference_storage_reuse and torch.is_grad_enabled():
         raise RuntimeError(
             "OCam inference storage reuse requires torch.no_grad() or "
@@ -220,6 +223,18 @@ def ocam_project_points(
         camera_xyz = _camera_xyz_affine(points, lidar2cam)
     else:
         raise ValueError(f"unknown OCam camera transform: {camera_transform}")
+    raw_camera_xyz = None
+    if preserve_raw_camera_xyz:
+        # The matmul result is an XYZ view over a four-wide homogeneous
+        # backing tensor.  Keep that stride so the later normalize reduction
+        # sees the same layout as the historical second transform.
+        raw_camera_xyz = torch.empty_strided(
+            camera_xyz.shape,
+            camera_xyz.stride(),
+            dtype=camera_xyz.dtype,
+            device=camera_xyz.device,
+        )
+        raw_camera_xyz.copy_(camera_xyz)
     if inference_storage_reuse:
         safe_xyz, geometry_valid = _sanitize_camera_xyz_inference_storage_reuse(
             camera_xyz
@@ -343,16 +358,65 @@ def ocam_project_points(
             sentinel,
             out=projected[..., 1],
         )
-        return projected
+        return projected, raw_camera_xyz
     normalized_u = pixel_u / width.clamp_min(1)
     normalized_v = pixel_v / height.clamp_min(1)
-    return torch.stack(
+    projected = torch.stack(
         (
             torch.where(valid, normalized_u, 2.0),
             torch.where(valid, normalized_v, 2.0),
         ),
         dim=-1,
     )
+    return projected, raw_camera_xyz
+
+
+def ocam_project_points(
+    points: Tensor,
+    metas: dict,
+    image_wh: Tensor,
+    *,
+    contract: str = "legacy_front_only",
+    camera_transform: str = "homogeneous_4x4",
+    inference_storage_reuse: bool = False,
+) -> Tensor:
+    """Project lidar-frame points to normalized native-fisheye pixels."""
+
+    projected, _ = _ocam_project_points_impl(
+        points,
+        metas,
+        image_wh,
+        contract=contract,
+        camera_transform=camera_transform,
+        inference_storage_reuse=inference_storage_reuse,
+        preserve_raw_camera_xyz=False,
+    )
+    return projected
+
+
+def _ocam_project_points_with_raw_camera_xyz(
+    points: Tensor,
+    metas: dict,
+    image_wh: Tensor,
+    *,
+    contract: str = "legacy_front_only",
+    camera_transform: str = "homogeneous_4x4",
+    inference_storage_reuse: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """Project once and retain the unsanitized camera transform exactly."""
+
+    projected, raw_camera_xyz = _ocam_project_points_impl(
+        points,
+        metas,
+        image_wh,
+        contract=contract,
+        camera_transform=camera_transform,
+        inference_storage_reuse=inference_storage_reuse,
+        preserve_raw_camera_xyz=True,
+    )
+    if raw_camera_xyz is None:  # pragma: no cover - internal invariant
+        raise RuntimeError("raw OCam camera coordinates were not preserved")
+    return projected, raw_camera_xyz
 
 
 def ocam_projection_scales(

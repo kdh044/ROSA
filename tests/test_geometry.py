@@ -1,10 +1,17 @@
 import math
 
+import pytest
 import torch
 
-from rosa.geometry import ocam_project_points, ocam_projection_scales
-from rosa.observation import project_and_describe
+import rosa.observation as observation_module
+from rosa.geometry import (
+    _ocam_project_points_with_raw_camera_xyz,
+    ocam_project_points,
+    ocam_projection_scales,
+)
+from rosa.observation import _camera_xyz, project_and_describe
 from rosa.refiner import ROSAConfig
+from rosa.types import RayFeatureRelation
 
 
 def _metas():
@@ -29,6 +36,282 @@ def _ray_at_incidence(degrees):
         (math.sin(angle), 0.0, -math.cos(angle)),
         dtype=torch.float32,
     ).reshape(1, 1, 1, 3)
+
+
+def _raw_equal(left, right):
+    integer_dtype = {
+        torch.float16: torch.int16,
+        torch.bfloat16: torch.int16,
+        torch.float32: torch.int32,
+        torch.float64: torch.int64,
+    }[left.dtype]
+    return torch.equal(
+        left.contiguous().view(integer_dtype),
+        right.contiguous().view(integer_dtype),
+    )
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+)
+@pytest.mark.parametrize("noncontiguous", (False, True))
+def test_single_transform_candidate_preserves_projection_and_raw_xyz(
+    dtype,
+    noncontiguous,
+):
+    metas = {
+        name: value.to(dtype=dtype) if torch.is_tensor(value) else value
+        for name, value in _metas().items()
+    }
+    values = torch.tensor(
+        (
+            (0.0, -0.0, -1.0),
+            (0.5, -0.25, -2.0),
+            (float("nan"), 0.0, -1.0),
+            (float("inf"), float("-inf"), 0.0),
+            (9999.0, 0.0, -1.0),
+            (10000.0, 0.0, -1.0),
+        ),
+        dtype=dtype,
+    ).reshape(1, 1, 6, 3)
+    if noncontiguous:
+        backing = torch.empty(1, 1, 6, 6, dtype=dtype)
+        backing[..., ::2] = values
+        points = backing[..., ::2]
+        assert not points.is_contiguous()
+    else:
+        points = values
+
+    with torch.no_grad():
+        expected_projection = ocam_project_points(
+            points,
+            metas,
+            metas["image_wh"],
+            contract="full_fov",
+            inference_storage_reuse=True,
+        )
+        actual_projection, raw_camera_xyz = (
+            _ocam_project_points_with_raw_camera_xyz(
+                points,
+                metas,
+                metas["image_wh"],
+                contract="full_fov",
+                inference_storage_reuse=True,
+            )
+        )
+        expected_camera_xyz = _camera_xyz(points, metas["lidar2cam"])
+
+    assert _raw_equal(actual_projection, expected_projection)
+    assert _raw_equal(raw_camera_xyz, expected_camera_xyz)
+    assert raw_camera_xyz.shape == expected_camera_xyz.shape
+    assert raw_camera_xyz.stride() == expected_camera_xyz.stride()
+    assert raw_camera_xyz.dtype == expected_camera_xyz.dtype
+    assert raw_camera_xyz._base is None
+
+
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+)
+@pytest.mark.parametrize(
+    ("projection_contract", "compact_relation"),
+    (
+        ("legacy_front_only", False),
+        ("legacy_front_only", True),
+        ("full_fov", False),
+        ("full_fov", True),
+    ),
+)
+def test_single_transform_candidate_is_raw_exact_end_to_end(
+    dtype,
+    projection_contract,
+    compact_relation,
+    monkeypatch,
+):
+    metas = {
+        name: value.to(dtype=dtype) if torch.is_tensor(value) else value
+        for name, value in _metas().items()
+    }
+    keypoints = torch.tensor(
+        [[[[0.0, -0.0, -1.0], [0.5, 0.0, -2.0],
+           [float("nan"), 0.0, -1.0], [10000.0, 0.0, -1.0]]]],
+        dtype=dtype,
+    )
+    anchor = torch.zeros(1, 1, 11, dtype=dtype)
+    anchor[..., :3] = torch.tensor((0.25, 0.0, -1.0), dtype=dtype)
+    anchor[..., 3:6] = torch.tensor(
+        (1.5, 3.0, 1.5),
+        dtype=dtype,
+    ).log()
+    anchor[..., 7] = 1.0
+
+    with torch.no_grad():
+        expected = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            projection_contract,
+            compact_relation=compact_relation,
+        )
+        monkeypatch.setattr(
+            observation_module,
+            "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+            True,
+        )
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            projection_contract,
+            compact_relation=compact_relation,
+        )
+
+    for candidate, parent in zip(actual, expected):
+        if type(candidate) is RayFeatureRelation:
+            assert type(parent) is RayFeatureRelation
+            assert _raw_equal(candidate.ray, parent.ray)
+            assert torch.equal(candidate.valid, parent.valid)
+        elif candidate.is_floating_point():
+            assert candidate.dtype == parent.dtype
+            assert _raw_equal(candidate, parent)
+        else:
+            assert torch.equal(candidate, parent)
+
+
+def test_single_transform_candidate_fails_closed_for_extension_surfaces(
+    monkeypatch,
+):
+    metas = _metas()
+    keypoints = torch.zeros(1, 1, 1, 3)
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        True,
+    )
+
+    assert not observation_module._can_reuse_camera_transform(
+        keypoints,
+        metas,
+    )
+    with torch.no_grad():
+        assert observation_module._can_reuse_camera_transform(
+            keypoints,
+            metas,
+        )
+        custom_mapping = type("CustomMetadata", (dict,), {})(metas)
+        assert not observation_module._can_reuse_camera_transform(
+            keypoints,
+            custom_mapping,
+        )
+        released_geometry_camera_xyz = (
+            observation_module._geometry._camera_xyz
+        )
+        monkeypatch.setattr(
+            observation_module._geometry,
+            "_camera_xyz",
+            lambda points, lidar2cam: released_geometry_camera_xyz(
+                points,
+                lidar2cam,
+            ),
+        )
+        assert not observation_module._can_reuse_camera_transform(
+            keypoints,
+            metas,
+        )
+        monkeypatch.setattr(
+            observation_module._geometry,
+            "_camera_xyz",
+            released_geometry_camera_xyz,
+        )
+        released_camera_xyz = observation_module._camera_xyz
+        monkeypatch.setattr(
+            observation_module,
+            "_camera_xyz",
+            lambda points, lidar2cam: released_camera_xyz(points, lidar2cam),
+        )
+        assert not observation_module._can_reuse_camera_transform(
+            keypoints,
+            metas,
+        )
+
+
+def test_single_transform_candidate_does_not_expand_conditioned_input_api(
+    monkeypatch,
+):
+    metas = _metas()
+    conditioned = _ray_at_incidence(45.0)[:, None]
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 7] = 1.0
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        True,
+    )
+
+    with torch.no_grad(), pytest.raises(
+        ValueError,
+        match=r"points must be \[B,N,P,3\]",
+    ):
+        project_and_describe(
+            conditioned,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+
+@pytest.mark.parametrize("candidate_enabled", (False, True))
+def test_no_grad_descriptor_remains_fullgraph_compilable(
+    candidate_enabled,
+    monkeypatch,
+):
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, 0.0, -1.0], [0.5, 0.0, -1.0]]]],
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+    anchor[..., 7] = 1.0
+    monkeypatch.setattr(
+        observation_module,
+        "_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE",
+        candidate_enabled,
+    )
+
+    def describe(points, boxes, lidar2cam, intrinsic, polynomial, image_wh):
+        metadata = {
+            "lidar2cam": lidar2cam,
+            "ocam_intrinsic": intrinsic,
+            "ocam_pol": polynomial,
+            "image_wh": image_wh,
+        }
+        return project_and_describe(
+            points,
+            boxes,
+            metadata,
+            "full_fov",
+        )
+
+    inputs = (
+        keypoints,
+        anchor,
+        metas["lidar2cam"],
+        metas["ocam_intrinsic"],
+        metas["ocam_pol"],
+        metas["image_wh"],
+    )
+    compiled = torch.compile(describe, backend="eager", fullgraph=True)
+    with torch.no_grad():
+        expected = describe(*inputs)
+        actual = compiled(*inputs)
+
+    for candidate, parent in zip(actual, expected):
+        assert candidate.dtype == parent.dtype
+        if candidate.is_floating_point():
+            assert _raw_equal(candidate, parent)
+        else:
+            assert torch.equal(candidate, parent)
 
 
 def test_legacy_contract_reproduces_front_plane_clip():
@@ -308,3 +591,85 @@ def test_bottom_z_descriptor_uses_the_geometric_box_center():
         centered_geometry[..., -1],
         torch.full_like(centered_geometry[..., -1], 0.5),
     )
+
+
+def test_project_and_describe_eval_storage_reuse_is_raw_exact():
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, 0.0, -1.0], [0.5, 0.0, -1.0], [float("nan"), 0.0, -1.0]]]]
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., :3] = torch.tensor((0.25, 0.0, -1.0))
+    anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+    anchor[..., 7] = 1.0
+
+    expected = project_and_describe(
+        keypoints,
+        anchor,
+        metas,
+        "full_fov",
+    )
+    with torch.no_grad():
+        actual = project_and_describe(
+            keypoints,
+            anchor,
+            metas,
+            "full_fov",
+        )
+
+    for candidate, parent in zip(actual, expected):
+        if type(candidate) is RayFeatureRelation:
+            assert type(parent) is RayFeatureRelation
+            assert torch.equal(candidate.ray, parent.ray)
+            assert torch.equal(candidate.valid, parent.valid)
+            continue
+        if candidate.is_floating_point():
+            integer_dtype = {
+                torch.float16: torch.int16,
+                torch.bfloat16: torch.int16,
+                torch.float32: torch.int32,
+                torch.float64: torch.int64,
+            }[candidate.dtype]
+            assert torch.equal(
+                candidate.contiguous().view(integer_dtype),
+                parent.contiguous().view(integer_dtype),
+            )
+        else:
+            assert torch.equal(candidate, parent)
+
+
+def test_compact_rfl_relation_preserves_legacy_values_and_owns_storage():
+    metas = _metas()
+    keypoints = torch.tensor(
+        [[[[0.0, 0.0, -1.0], [0.5, 0.0, -1.0], [0.0, 0.5, -1.0]]]]
+    )
+    anchor = torch.zeros(1, 1, 11)
+    anchor[..., 3:6] = torch.tensor((1.5, 3.0, 1.5)).log()
+    anchor[..., 7] = 1.0
+    _, geometry, legacy, valid = project_and_describe(
+        keypoints,
+        anchor,
+        metas,
+        "full_fov",
+    )
+    _, compact_geometry, compact, compact_valid = project_and_describe(
+        keypoints,
+        anchor,
+        metas,
+        "full_fov",
+        compact_relation=True,
+    )
+
+    assert type(compact) is RayFeatureRelation
+    legacy_bncp = legacy.permute(0, 2, 1, 3, 4)
+    assert torch.equal(compact.ray, legacy_bncp[..., 8:11])
+    assert torch.equal(compact.valid, legacy_bncp[..., 13] > 0)
+    assert torch.equal(compact_geometry, geometry)
+    assert torch.equal(compact_valid, valid)
+    assert compact.ray._base is None
+    assert compact.valid._base is None
+
+    compact.ray.zero_()
+    compact.valid.logical_not_()
+    assert torch.equal(compact_geometry, geometry)
+    assert torch.equal(compact_valid, valid)

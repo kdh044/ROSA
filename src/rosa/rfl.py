@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .types import RayFeatureRelation
+
 
 class SphericalRayFeatureLifting(nn.Module):
     """Lift sparse appearance features into a low-order spherical ray basis.
@@ -29,10 +31,9 @@ class SphericalRayFeatureLifting(nn.Module):
 
     Inputs:
         keypoint_features: Weighted sampled features ``[B,N,C,P,D]``.
-        relation: ROSA relation tensor ``[B,C,N,P,19]``.  Only calibrated
-            camera-frame unit rays (channels 8:11) and validity (channel 13)
-            are read.  In particular, the KB scale/anisotropy channels are not
-            part of this SH-only experiment.
+        relation: Compact calibrated rays/validity.  Historical
+            ``[B,C,N,P,19]`` relation tensors remain accepted for checkpoint
+            and API compatibility.
 
     Returns:
         Per-keypoint residuals ``[B,N,C,P,D]``.  Invalid observations are
@@ -125,10 +126,43 @@ class SphericalRayFeatureLifting(nn.Module):
         basis = torch.where(valid[..., None], basis, torch.zeros_like(basis))
         return basis, valid
 
+    @classmethod
+    def compact_basis_and_valid(
+        cls,
+        relation: RayFeatureRelation,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Build the legacy-exact basis without a sparse 19-channel carrier."""
+
+        if (
+            type(relation) is not RayFeatureRelation
+            or relation.ray.ndim != 5
+            or relation.ray.shape[-1] != 3
+            or relation.valid.shape != relation.ray.shape[:-1]
+        ):
+            raise ValueError(
+                "compact RFL relation must contain [B,N,C,P,3] rays and "
+                "aligned validity"
+            )
+        ray = torch.nan_to_num(
+            relation.ray.float(),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
+        valid = torch.nan_to_num(
+            relation.valid.to(dtype=torch.float32),
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        ).gt(0.0)
+        basis = cls.real_sh_degree_2(ray)
+        basis = torch.where(valid[..., None], basis, torch.zeros_like(basis))
+        return basis, valid
+
     def forward(
         self,
         keypoint_features: torch.Tensor,
-        relation: torch.Tensor,
+        relation: torch.Tensor | RayFeatureRelation,
     ) -> torch.Tensor:
         if keypoint_features.ndim != 5:
             raise ValueError(
@@ -140,25 +174,42 @@ class SphericalRayFeatureLifting(nn.Module):
             raise ValueError(
                 f"RFL feature width must be {self.embed_dims}, got {embed_dims}"
             )
-        expected_relation = (
-            bs,
-            num_cams,
-            num_anchor,
-            num_pts,
-            self.relation_dims,
-        )
-        if tuple(relation.shape) != expected_relation:
-            raise ValueError(
-                "RFL relation shape mismatch: "
-                f"{tuple(relation.shape)} vs {expected_relation}"
-            )
-
         original_dtype = keypoint_features.dtype
         features = torch.nan_to_num(
             keypoint_features.float(), nan=0.0, posinf=0.0, neginf=0.0
         )
-        relation_bncp = relation.permute(0, 2, 1, 3, 4).contiguous()
-        basis, valid = self.basis_and_valid(relation_bncp)
+        if type(relation) is RayFeatureRelation:
+            expected_ray = (
+                bs,
+                num_anchor,
+                num_cams,
+                num_pts,
+                3,
+            )
+            if tuple(relation.ray.shape) != expected_ray:
+                raise ValueError(
+                    "compact RFL relation shape mismatch: "
+                    f"{tuple(relation.ray.shape)} vs {expected_ray}"
+                )
+            basis, valid = self.compact_basis_and_valid(relation)
+        else:
+            expected_relation = (
+                bs,
+                num_cams,
+                num_anchor,
+                num_pts,
+                self.relation_dims,
+            )
+            if not torch.is_tensor(relation) or tuple(relation.shape) != (
+                expected_relation
+            ):
+                observed = getattr(relation, "shape", None)
+                raise ValueError(
+                    "RFL relation shape mismatch: "
+                    f"{observed} vs {expected_relation}"
+                )
+            relation_bncp = relation.permute(0, 2, 1, 3, 4).contiguous()
+            basis, valid = self.basis_and_valid(relation_bncp)
 
         appearance = self.appearance_proj(self.feature_norm(features))
         lifted = basis[..., :, None] * appearance[..., None, :]

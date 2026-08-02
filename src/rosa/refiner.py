@@ -24,6 +24,7 @@ from .sampling import (
     DeterministicBilinearSampler,
     FusedBilinearSampler,
 )
+from .rfl import SphericalRayFeatureLifting
 from .types import ObservationEncoding, ROSAOutput
 
 _SIZE = slice(3, 6)
@@ -33,6 +34,8 @@ _LEGACY_SIGMA_POINTS = (-2.0, -1.0, 0.0, 1.0, 2.0)
 # intermediate re-observations in the vectorized profile.
 _COMPACT_SIGMA_POINTS = (-2.0, 0.0, 2.0)
 KeypointGenerator = Callable[[Tensor, Tensor], Tensor]
+_RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
+_RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
 
 
 @dataclass
@@ -394,12 +397,43 @@ class ROSARefiner(nn.Module):
         fpn: Sequence[Tensor],
         metadata: dict,
     ) -> ObservationEncoding:
+        rfl = getattr(self.rosa, "rfl", None)
+        released_relation_surface = bool(
+            type(self.rosa) is PointwiseROSA
+            and "forward" not in self.rosa.__dict__
+            and type(self.rosa).forward is _RELEASED_POINTWISE_ROSA_FORWARD
+            and type(rfl) is SphericalRayFeatureLifting
+            and "forward" not in rfl.__dict__
+            and type(rfl).forward is _RELEASED_RFL_FORWARD
+        )
+        relation_modules = tuple(
+            module for module in (self.rosa, rfl) if isinstance(module, nn.Module)
+        )
+        relation_hooks_active = bool(
+            any(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+                for module in relation_modules
+            )
+            or torch.nn.modules.module._global_forward_pre_hooks
+            or torch.nn.modules.module._global_forward_hooks
+            or torch.nn.modules.module._global_backward_pre_hooks
+            or torch.nn.modules.module._global_backward_hooks
+        )
         uv, geometry, relation, valid = project_and_describe(
             keypoints,
             anchor,
             metadata,
             self.cfg.projection_contract,
             anchor_z_is_bottom=self.cfg.anchor_z_is_bottom,
+            # Preserve the historical Tensor relation seen by local/global
+            # hooks.  Ordinary hook-free execution uses the compact owned
+            # ray/valid carrier and avoids two large 19-channel copies.
+            compact_relation=(
+                released_relation_surface and not relation_hooks_active
+            ),
         )
         features = sample_multiscale_features(
             fpn,
@@ -986,7 +1020,11 @@ class ROSARefiner(nn.Module):
         fpn: Sequence[Tensor],
         metas: dict,
         keypoint_generator: KeypointGenerator,
+        *,
+        materialize_diagnostics: bool = True,
     ) -> ROSAOutput:
+        if not isinstance(materialize_diagnostics, bool):
+            raise TypeError("materialize_diagnostics must be a bool")
         base = baseline_anchor.detach()
         query_sidecar = query.detach()
         sigma_points = base.new_tensor(
@@ -1022,31 +1060,38 @@ class ROSARefiner(nn.Module):
             if self.cfg.architecture_profile == "legacy"
             else final.feedback.detach()
         )
-        quality_raw = (
-            self.quality_head(quality_feedback).tanh()
-            if self.quality_head is not None
-            else torch.zeros_like(final.feedback[..., :1])
-        )
-        if self.cfg.enable_quality_score:
-            quality_delta = self.cfg.max_quality_delta_logit * quality_raw
-            if self.cfg.architecture_profile == "legacy":
-                quality_delta = (
-                    quality_delta
-                    * final.radial_gate.detach()[..., None]
-                )
+        if self.quality_head is None:
+            # Compact profiles without score refinement have no quality
+            # parameters or loss edge.  Materialize their exact-zero public
+            # result once instead of running multiply/where zero kernels.
+            quality_delta = torch.zeros_like(final.feedback[..., :1])
         else:
-            quality_delta = quality_raw * 0.0
-        quality_delta = torch.where(
-            final.candidates.supported.any(dim=2)[..., None],
-            quality_delta,
-            torch.zeros_like(quality_delta),
-        )
+            quality_raw = self.quality_head(quality_feedback).tanh()
+            if self.cfg.enable_quality_score:
+                quality_delta = self.cfg.max_quality_delta_logit * quality_raw
+                if self.cfg.architecture_profile == "legacy":
+                    quality_delta = (
+                        quality_delta
+                        * final.radial_gate.detach()[..., None]
+                    )
+            else:
+                quality_delta = quality_raw * 0.0
+            quality_delta = torch.where(
+                final.candidates.supported.any(dim=2)[..., None],
+                quality_delta,
+                torch.zeros_like(quality_delta),
+            )
         if len(steps) == 2:
             second_size = final.shape_size_delta
             second_yaw = final.shape_yaw_delta
         else:
             second_size = torch.zeros_like(first.shape_size_delta)
             second_yaw = torch.zeros_like(first.shape_yaw_delta)
+
+        def diagnostic_stack(values) -> Tensor | None:
+            if not materialize_diagnostics:
+                return None
+            return torch.stack(tuple(values), dim=2)
 
         return ROSAOutput(
             final_anchor=current,
@@ -1075,85 +1120,67 @@ class ROSARefiner(nn.Module):
             distribution_mean=final.distribution_mean,
             distribution_std=final.distribution_std,
             candidate_offsets=final.candidates.offsets,
-            iteration_base_anchors=torch.stack(
-                [step.base_anchor for step in steps],
-                dim=2,
+            iteration_base_anchors=diagnostic_stack(
+                step.base_anchor for step in steps
             ),
-            iteration_anchors=torch.stack(
-                [step.anchor for step in steps],
-                dim=2,
+            iteration_anchors=diagnostic_stack(
+                step.anchor for step in steps
             ),
-            iteration_distribution_mean=torch.stack(
-                [step.distribution_mean for step in steps],
-                dim=2,
+            iteration_distribution_mean=diagnostic_stack(
+                step.distribution_mean for step in steps
             ),
-            iteration_distribution_std=torch.stack(
-                [step.distribution_std for step in steps],
-                dim=2,
+            iteration_distribution_std=diagnostic_stack(
+                step.distribution_std for step in steps
             ),
-            iteration_candidate_offsets=torch.stack(
-                [step.candidates.offsets for step in steps],
-                dim=2,
+            iteration_candidate_offsets=diagnostic_stack(
+                step.candidates.offsets for step in steps
             ),
-            iteration_candidate_probabilities=torch.stack(
-                [step.candidates.probabilities for step in steps],
-                dim=2,
+            iteration_candidate_probabilities=diagnostic_stack(
+                step.candidates.probabilities for step in steps
             ),
-            iteration_candidate_supported=torch.stack(
-                [step.candidates.supported for step in steps],
-                dim=2,
+            iteration_candidate_supported=diagnostic_stack(
+                step.candidates.supported for step in steps
             ),
-            iteration_observation_supported=torch.stack(
-                [step.observation.supported for step in steps],
-                dim=2,
+            iteration_observation_supported=diagnostic_stack(
+                step.observation.supported for step in steps
             ),
-            iteration_radial_proposal=torch.stack(
-                [step.radial_proposal for step in steps],
-                dim=2,
+            iteration_radial_proposal=diagnostic_stack(
+                step.radial_proposal for step in steps
             ),
-            iteration_radial_gate=torch.stack(
-                [step.radial_gate for step in steps],
-                dim=2,
+            iteration_radial_gate=diagnostic_stack(
+                step.radial_gate for step in steps
             ),
-            iteration_radial_gate_logit=torch.stack(
-                [step.radial_gate_logit for step in steps],
-                dim=2,
+            iteration_radial_gate_logit=diagnostic_stack(
+                step.radial_gate_logit for step in steps
             ),
-            iteration_radial_safe=torch.stack(
-                [step.radial_safe for step in steps],
-                dim=2,
+            iteration_radial_safe=diagnostic_stack(
+                step.radial_safe for step in steps
             ),
-            iteration_tangent_delta=torch.stack(
-                [step.tangent_delta for step in steps],
-                dim=2,
+            iteration_tangent_delta=diagnostic_stack(
+                step.tangent_delta for step in steps
             ),
-            iteration_yaw_raw_delta=torch.stack(
-                [step.yaw_raw_delta for step in steps],
-                dim=2,
+            iteration_yaw_raw_delta=diagnostic_stack(
+                step.yaw_raw_delta for step in steps
             ),
-            iteration_yaw_gate=torch.stack(
-                [step.yaw_gate for step in steps],
-                dim=2,
+            iteration_yaw_gate=diagnostic_stack(
+                step.yaw_gate for step in steps
             ),
-            iteration_yaw_gate_logit=torch.stack(
-                [step.yaw_gate_logit for step in steps],
-                dim=2,
+            iteration_yaw_gate_logit=diagnostic_stack(
+                step.yaw_gate_logit for step in steps
             ),
-            iteration_yaw_delta=torch.stack(
-                [step.shape_yaw_delta for step in steps],
-                dim=2,
+            iteration_yaw_delta=diagnostic_stack(
+                step.shape_yaw_delta for step in steps
             ),
-            iteration_reliability_context=torch.stack(
-                [step.reliability_context for step in steps],
-                dim=2,
+            iteration_reliability_context=diagnostic_stack(
+                step.reliability_context for step in steps
             ),
-            iteration_camera_weight_mean=torch.stack(
-                [step.observation.camera_weight_mean.detach() for step in steps],
-                dim=2,
+            iteration_camera_weight_mean=diagnostic_stack(
+                step.observation.camera_weight_mean.detach()
+                for step in steps
             ),
-            iteration_camera_geometry_summary=torch.stack(
-                [step.observation.camera_geometry_summary.detach() for step in steps],
-                dim=2,
+            iteration_camera_geometry_summary=diagnostic_stack(
+                step.observation.camera_geometry_summary.detach()
+                for step in steps
             ),
         )
 

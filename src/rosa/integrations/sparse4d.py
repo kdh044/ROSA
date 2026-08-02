@@ -39,7 +39,6 @@ except ImportError as exc:  # pragma: no cover - exercised in host environment
     ) from exc
 
 from ..geometry import ocam_project_points
-from ..ops import bitwise_equal
 from ..refiner import ROSAConfig, ROSARefiner
 from .sparse4d_losses import (
     evaluator_aligned_centerness_target,
@@ -51,9 +50,11 @@ from .sparse4d_runtime import (
     detached_fpn,
     find_operation_indices,
     remap_legacy_refiner_state_dict,
+    validate_detector_owned_rosa_output,
     validate_native_call,
 )
 from .sparse4d_scores import (
+    compose_native_identity_rank,
     compose_quality_rank,
     decode_frozen_jointscore_rank,
 )
@@ -62,6 +63,7 @@ _NATIVE_DECODERS = 6
 _NATIVE_FINAL = 5
 _ROSA_OUTPUT = 6
 _RELEASED_MHA_FORWARD = torch.nn.MultiheadAttention.forward
+_RELEASED_LINEAR_FORWARD = torch.nn.Linear.forward
 _HOST_CONTROL_DEFAULTS = {
     "max_temporal_gnn_interactions": 0,
     "cache_decoder_index": _NATIVE_FINAL,
@@ -336,6 +338,7 @@ class ROSARefinementHead(Sparse4DHead):
     """
 
     aux_record_key = "rosa_refinement_aux"
+    requires_feature_map_layout_receipt = True
 
     def __init__(
         self,
@@ -422,6 +425,30 @@ class ROSARefinementHead(Sparse4DHead):
         """Read-only compatibility for released analysis utilities."""
 
         return self.rosa_cfg
+
+    def _lean_inference(self) -> bool:
+        """Select the sealed latency path only on ordinary no-grad eval."""
+
+        observed_modules = (self, self.rosa_refiner)
+        hooks_active = bool(
+            any(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+                for module in observed_modules
+            )
+            or torch.nn.modules.module._global_forward_pre_hooks
+            or torch.nn.modules.module._global_forward_hooks
+            or torch.nn.modules.module._global_backward_pre_hooks
+            or torch.nn.modules.module._global_backward_hooks
+        )
+        return bool(
+            not self.training
+            and not torch.is_grad_enabled()
+            and not self.rosa_cfg.export_diagnostics
+            and not hooks_active
+        )
 
     def _validate_native_topology(self) -> None:
         if int(self.num_decoder) != _NATIVE_DECODERS:
@@ -527,21 +554,84 @@ class ROSARefinementHead(Sparse4DHead):
             raise RuntimeError("native D5 class/quality must materialize")
         return anchor, classification, quality
 
+    def _pre_refine_query_feature(
+        self,
+        *,
+        decoder_index: int,
+        instance_feature: Tensor,
+        anchor: Tensor,
+        anchor_embed: Tensor,
+        feature_maps,
+        metas: dict,
+        predictions,
+        classifications,
+        qualities,
+        num_free_instance: int,
+        classification_feature: Tensor | None,
+        regression_feature: Tensor | None,
+        score_alignment_feature: Tensor | None,
+    ) -> Tensor:
+        """Capture D5 through the host's identity extension point."""
+
+        query = super()._pre_refine_query_feature(
+            decoder_index=decoder_index,
+            instance_feature=instance_feature,
+            anchor=anchor,
+            anchor_embed=anchor_embed,
+            feature_maps=feature_maps,
+            metas=metas,
+            predictions=predictions,
+            classifications=classifications,
+            qualities=qualities,
+            num_free_instance=num_free_instance,
+            classification_feature=classification_feature,
+            regression_feature=regression_feature,
+            score_alignment_feature=score_alignment_feature,
+        )
+        if int(decoder_index) == _NATIVE_FINAL:
+            populated_sidecars = {
+                name
+                for name, value in (
+                    ("classification_feature", classification_feature),
+                    ("regression_feature", regression_feature),
+                    ("score_alignment_feature", score_alignment_feature),
+                )
+                if value is not None
+            }
+            if populated_sidecars:
+                raise RuntimeError(
+                    "native refine sidecars must be None at the audited "
+                    f"call boundary: {sorted(populated_sidecars)}"
+                )
+        if int(decoder_index) == _NATIVE_FINAL and not self.__dict__.get(
+            "_rosa_capture_via_hook",
+            False,
+        ):
+            if self.__dict__.get("_rosa_captured_query") is not None:
+                raise RuntimeError("native D5 query was captured more than once")
+            self._rosa_captured_query = query
+        return query
+
     def _append_rosa(
         self,
         output: dict,
-        call,
+        native_query: Tensor,
         live_fpn: list[Tensor],
         metas: dict,
     ) -> None:
+        lean_inference = self._lean_inference()
+        native_identity_rank = bool(
+            lean_inference and not self.rosa_cfg.enable_quality_score
+        )
         baseline_anchor, baseline_cls, baseline_quality = self._native_output(output)
         num_free = int(baseline_anchor.shape[1])
         if (
-            call.query.shape[0] != baseline_anchor.shape[0]
-            or call.query.shape[1] < num_free
+            not torch.is_tensor(native_query)
+            or native_query.shape[0] != baseline_anchor.shape[0]
+            or native_query.shape[1] < num_free
         ):
             raise RuntimeError("captured query and D5 proposal axes disagree")
-        query = call.query[:, :num_free]
+        query = native_query[:, :num_free]
         refine_count = min(int(self.rosa_cfg.refine_topk), num_free)
         if refine_count < num_free:
             with torch.no_grad():
@@ -591,60 +681,74 @@ class ROSARefinementHead(Sparse4DHead):
             live_fpn,
             rosa_metadata,
             deformable.kps_generator,
+            materialize_diagnostics=not lean_inference,
         )
         if selected_indices is None:
             final_anchor = result.final_anchor
-            quality_delta = result.quality_delta
-            supported = result.candidate_supported.any(dim=2)
+            if not native_identity_rank:
+                quality_delta = result.quality_delta
+                supported = result.candidate_supported.any(dim=2)
         else:
             final_anchor = baseline_anchor.detach().scatter(
                 1, anchor_index, result.final_anchor
             )
-            scalar_index = selected_indices[..., None]
-            quality_delta = torch.zeros_like(baseline_cls[..., :1]).scatter(
-                1, scalar_index, result.quality_delta
+            if not native_identity_rank:
+                scalar_index = selected_indices[..., None]
+                quality_delta = torch.zeros_like(baseline_cls[..., :1]).scatter(
+                    1, scalar_index, result.quality_delta
+                )
+                supported = torch.zeros(
+                    baseline_anchor.shape[:2],
+                    dtype=torch.bool,
+                    device=baseline_anchor.device,
+                ).scatter(
+                    1,
+                    selected_indices,
+                    result.candidate_supported.any(dim=2),
+                )
+        if native_identity_rank:
+            rank = compose_native_identity_rank(
+                baseline_cls,
+                baseline_quality,
+                centerness_index=CNS,
             )
-            supported = torch.zeros(
-                baseline_anchor.shape[:2],
-                dtype=torch.bool,
-                device=baseline_anchor.device,
-            ).scatter(
-                1,
-                selected_indices,
-                result.candidate_supported.any(dim=2),
+        else:
+            rank = compose_quality_rank(
+                baseline_cls,
+                baseline_quality,
+                quality_delta,
+                supported,
+                centerness_index=CNS,
+                validate_values=not lean_inference,
             )
-        rank = compose_quality_rank(
-            baseline_cls,
-            baseline_quality,
-            quality_delta,
-            supported,
-            centerness_index=CNS,
-        )
         final_cls = baseline_cls.detach()
         final_quality = baseline_quality.detach()
-        if (
-            not bitwise_equal(final_cls, baseline_cls)
-            or not bitwise_equal(final_quality, baseline_quality)
-            or not bitwise_equal(final_anchor[..., 2:3], baseline_anchor[..., 2:3])
-            or not bitwise_equal(final_anchor[..., 8:], baseline_anchor[..., 8:])
-        ):
-            raise RuntimeError("ROSA changed a detector-owned field")
-        if selected_indices is not None:
-            untouched = torch.ones(
-                baseline_anchor.shape[:2],
-                dtype=torch.bool,
-                device=baseline_anchor.device,
+        if not lean_inference:
+            validate_detector_owned_rosa_output(
+                baseline_anchor,
+                final_anchor,
+                baseline_cls,
+                final_cls,
+                baseline_quality,
+                final_quality,
+                selected_indices,
             )
-            untouched.scatter_(1, selected_indices, False)
-            if not bitwise_equal(
-                final_anchor[untouched],
-                baseline_anchor.detach()[untouched],
-            ):
-                raise RuntimeError("ROSA changed an unselected query")
 
         output["prediction"] = [*output["prediction"], final_anchor]
         output["classification"] = [*output["classification"], final_cls]
         output["quality"] = [*output["quality"], final_quality]
+        if lean_inference:
+            # Post-processing needs only these three tensors.  Keeping the
+            # full training/analysis record here would retain every candidate
+            # observation until decoding even though none is exported.
+            output[self.aux_record_key] = {
+                "frozen_native_label": rank["frozen_label"],
+                "native_selected_probability": rank[
+                    "native_selected_probability"
+                ],
+                "emitted_joint_score": rank["emitted_joint_score"],
+            }
+            return
         record = {
             "native_route": _NATIVE_FINAL,
             "rosa_route": _ROSA_OUTPUT,
@@ -721,17 +825,54 @@ class ROSARefinementHead(Sparse4DHead):
         output[self.aux_record_key] = record
 
     def forward(self, feature_maps, metas: dict):
-        capture = SingleCallCapture(force_return_cls=True)
+        if "_rosa_captured_query" in self.__dict__:
+            raise RuntimeError("ROSA head forward is not reentrant")
         native_refine = self.layers[self._native_refine_layer_index]
-        handle = native_refine.register_forward_pre_hook(capture, with_kwargs=True)
+        # A pre-hook may legally replace the query before the native box head
+        # sees it.  The host extension point is allocation-free in production,
+        # while this compatibility fallback is registered after all existing
+        # hooks and therefore observes their final positional arguments.
+        capture_via_hook = bool(
+            native_refine._forward_pre_hooks
+            or torch.nn.modules.module._global_forward_pre_hooks
+        )
+        capture = None
+        handle = None
+        self._rosa_captured_query = None
+        self._rosa_capture_via_hook = capture_via_hook
         try:
+            if capture_via_hook:
+                capture = SingleCallCapture(force_return_cls=True)
+                handle = native_refine.register_forward_pre_hook(
+                    capture,
+                    with_kwargs=True,
+                )
             output = Sparse4DHead.forward(self, feature_maps, metas)
+            if capture is None:
+                native_query = self._rosa_captured_query
+                if native_query is None:
+                    raise RuntimeError("native D5 query was not captured")
+            else:
+                call = capture.take()
+                validate_native_call(call)
+                native_query = call.query
+            self._append_rosa(
+                output,
+                native_query,
+                detached_fpn(
+                    feature_maps,
+                    layout_receipt=metas.get("_feature_map_layout_receipt"),
+                ),
+                metas,
+            )
+            return output
         finally:
-            handle.remove()
-        call = capture.take()
-        validate_native_call(call)
-        self._append_rosa(output, call, detached_fpn(feature_maps), metas)
-        return output
+            try:
+                if handle is not None:
+                    handle.remove()
+            finally:
+                self.__dict__.pop("_rosa_captured_query", None)
+                self.__dict__.pop("_rosa_capture_via_hook", None)
 
     def loss(self, model_outs, data, feature_maps=None):
         if not self.training:
@@ -759,6 +900,7 @@ class ROSARefinementHead(Sparse4DHead):
         record = model_outs.get(self.aux_record_key)
         if record is None:
             raise RuntimeError("missing ROSA decode record")
+        lean_inference = self._lean_inference()
         results = decode_frozen_jointscore_rank(
             self.decoder,
             model_outs["classification"],
@@ -768,6 +910,8 @@ class ROSARefinementHead(Sparse4DHead):
             record["emitted_joint_score"],
             instance_id=model_outs.get("instance_id"),
             output_idx=_ROSA_OUTPUT,
+            validate_values=not lean_inference,
+            pack_host_transfers=lean_inference,
         )
         if not self.rosa_cfg.export_diagnostics:
             return results
@@ -877,6 +1021,7 @@ def _can_use_inplace_official_residual(
 ) -> bool:
     """Match the exact no-grad surface where the decoupled query is owned."""
 
+    fc_after = head.fc_after
     return bool(
         type(head) is ROSAOfficialResidualNativeBaselineHead
         and head.decouple_attn is True
@@ -890,6 +1035,14 @@ def _can_use_inplace_official_residual(
         and not layer._forward_pre_hooks
         and not layer._backward_hooks
         and not layer._backward_pre_hooks
+        and type(fc_after) is torch.nn.Linear
+        and "forward" not in fc_after.__dict__
+        and type(fc_after).forward is _RELEASED_LINEAR_FORWARD
+        and not fc_after.training
+        and not fc_after._forward_hooks
+        and not fc_after._forward_pre_hooks
+        and not fc_after._backward_hooks
+        and not fc_after._backward_pre_hooks
         and not torch.nn.modules.module._global_forward_hooks
         and not torch.nn.modules.module._global_forward_pre_hooks
         and not torch.nn.modules.module._global_backward_hooks

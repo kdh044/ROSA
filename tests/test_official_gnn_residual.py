@@ -246,6 +246,31 @@ def test_c32_matches_the_released_mmcv_wrapper_and_preserves_state() -> None:
                 ) is False
             finally:
                 del layer.forward
+            fc_hook = candidate.head.fc_after.register_forward_pre_hook(
+                lambda *args: None
+            )
+            try:
+                assert original_inplace_guard(
+                    candidate.head,
+                    layer,
+                    owned_query,
+                    attention,
+                ) is False
+            finally:
+                fc_hook.remove()
+            original_fc_forward = candidate.head.fc_after.forward
+            candidate.head.fc_after.forward = lambda value: original_fc_forward(
+                value
+            )
+            try:
+                assert original_inplace_guard(
+                    candidate.head,
+                    layer,
+                    owned_query,
+                    attention,
+                ) is False
+            finally:
+                del candidate.head.fc_after.forward
 
         baseline.eval()
         current_port = baseline.head.graph_model(

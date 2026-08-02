@@ -1,3 +1,5 @@
+import types
+
 import pytest
 import torch
 
@@ -86,6 +88,106 @@ def test_closed_loop_sidecar_has_finite_backward():
     ]
     assert gradients
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
+
+
+@pytest.mark.parametrize(
+    ("module_name", "relation_index"),
+    (("rosa", 2), ("rfl", 1)),
+)
+def test_local_relation_hooks_keep_the_legacy_tensor_abi(
+    module_name,
+    relation_index,
+):
+    stage, anchor, query, fpn, metas, generator = _fixture()
+    module = stage.rosa if module_name == "rosa" else stage.rosa.rfl
+    observed = []
+
+    def inspect_relation(_module, args):
+        relation = args[relation_index]
+        assert torch.is_tensor(relation)
+        assert relation.shape[-1] == 19
+        observed.append(relation[..., 13])
+
+    handle = module.register_forward_pre_hook(inspect_relation)
+    try:
+        output = stage(anchor, query, fpn, metas, generator)
+    finally:
+        handle.remove()
+
+    assert observed
+    assert torch.equal(output.final_anchor, anchor)
+
+
+def test_global_relation_hook_keeps_the_legacy_tensor_abi():
+    stage, anchor, query, fpn, metas, generator = _fixture()
+    observed = []
+
+    def inspect_relation(module, args):
+        if module is stage.rosa.rfl:
+            relation = args[1]
+            assert torch.is_tensor(relation)
+            assert relation.shape[-1] == 19
+            observed.append(relation[..., 8:11])
+
+    handle = torch.nn.modules.module.register_module_forward_pre_hook(
+        inspect_relation
+    )
+    try:
+        output = stage(anchor, query, fpn, metas, generator)
+    finally:
+        handle.remove()
+
+    assert observed
+    assert torch.equal(output.final_anchor, anchor)
+
+
+def test_instance_rfl_forward_override_keeps_the_legacy_tensor_abi():
+    stage, anchor, query, fpn, metas, generator = _fixture()
+    released_forward = stage.rosa.rfl.forward
+    observed = []
+
+    def custom_forward(_self, features, relation):
+        assert torch.is_tensor(relation)
+        assert relation.shape[-1] == 19
+        observed.append(relation[..., 13])
+        return released_forward(features, relation)
+
+    stage.rosa.rfl.forward = types.MethodType(
+        custom_forward,
+        stage.rosa.rfl,
+    )
+    output = stage(anchor, query, fpn, metas, generator)
+
+    assert observed
+    assert torch.equal(output.final_anchor, anchor)
+
+
+def test_class_pointwise_forward_override_keeps_the_legacy_tensor_abi(
+    monkeypatch,
+):
+    stage, anchor, query, fpn, metas, generator = _fixture()
+    pointwise_type = type(stage.rosa)
+    released_forward = pointwise_type.forward
+    observed = []
+
+    def custom_forward(self, features, geometry, relation, valid, sidecar_query):
+        assert torch.is_tensor(relation)
+        assert relation.shape[-1] == 19
+        observed.append(relation[..., 8:11])
+        return released_forward(
+            self,
+            features,
+            geometry,
+            relation,
+            valid,
+            sidecar_query,
+        )
+
+    monkeypatch.setattr(pointwise_type, "forward", custom_forward)
+    output = stage(anchor, query, fpn, metas, generator)
+
+    assert observed
+    assert torch.equal(output.final_anchor, anchor)
 
 
 def test_iterative_distribution_is_identity_and_distance_adaptive():
@@ -362,6 +464,45 @@ def test_fast_profile_uses_one_vectorized_refinement_pass():
     assert query_counts == [2, 6]
     assert output.iteration_candidate_offsets.shape == (1, 2, 1, 3)
     assert output.iteration_anchors.shape == (1, 2, 1, 11)
+
+
+def test_lean_inference_skips_only_diagnostic_materialization():
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    with torch.no_grad():
+        full = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=True,
+        )
+        lean = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+        )
+
+    for name, expected in vars(full).items():
+        actual = getattr(lean, name)
+        if name.startswith("iteration_"):
+            assert torch.is_tensor(expected)
+            assert actual is None
+        elif torch.is_tensor(expected):
+            assert torch.equal(actual, expected), name
+        else:
+            assert actual == expected
 
 
 def test_compact_refiner_parameter_contract():

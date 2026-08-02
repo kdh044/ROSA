@@ -15,9 +15,12 @@ from rosa.integrations.sparse4d_runtime import (
     SingleCallCapture,
     detached_fpn,
     remap_legacy_refiner_state_dict,
+    validate_detector_owned_rosa_output,
     validate_native_call,
 )
 from rosa.integrations.sparse4d_scores import (
+    _pack_frozen_decode_fields,
+    compose_native_identity_rank,
     compose_quality_rank,
     decode_frozen_jointscore_rank,
     stable_joint_probability,
@@ -25,6 +28,21 @@ from rosa.integrations.sparse4d_scores import (
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def _raw_equal(left: torch.Tensor, right: torch.Tensor) -> bool:
+    integer_dtype = {
+        torch.float16: torch.int16,
+        torch.bfloat16: torch.int16,
+        torch.float32: torch.int32,
+        torch.float64: torch.int64,
+    }.get(left.dtype, left.dtype)
+    return bool(
+        torch.equal(
+            left.contiguous().view(integer_dtype),
+            right.contiguous().view(integer_dtype),
+        )
+    )
 
 
 def _detector_host() -> Path:
@@ -161,6 +179,182 @@ def test_compact_sidecar_preserves_paired_native_initialization_and_rng():
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_rosa_query_capture_observes_replacing_hooks_and_cleans_up():
+    host = _detector_host()
+    if not host.is_dir():
+        pytest.skip("optional Sparse4D detector host is not available")
+    code = textwrap.dedent(
+        """
+        import types
+        from types import SimpleNamespace
+        import torch
+        from rosa.integrations import sparse4d as integration
+
+        class NativeRefine(torch.nn.Module):
+            def forward(self, query, anchor, anchor_embed, **kwargs):
+                return anchor, None, None
+
+        def make_head(native=None):
+            head = object.__new__(integration.ROSARefinementHead)
+            torch.nn.Module.__init__(head)
+            head.layers = torch.nn.ModuleList([native or NativeRefine()])
+            head._native_refine_layer_index = 0
+            observed = []
+            def append(_self, _output, query, _fpn, _metas):
+                observed.append(query.clone())
+            head._append_rosa = types.MethodType(append, head)
+            return head, observed
+
+        def native_forward(self, feature_maps, metas):
+            query = torch.zeros(1, 2, 4)
+            anchor = torch.zeros(1, 2, 11)
+            anchor_embed = torch.zeros(1, 2, 4)
+            query = self._pre_refine_query_feature(
+                decoder_index=5,
+                instance_feature=query,
+                anchor=anchor,
+                anchor_embed=anchor_embed,
+                feature_maps=feature_maps,
+                metas=metas,
+                predictions=[],
+                classifications=[],
+                qualities=[],
+                num_free_instance=2,
+                classification_feature=None,
+                regression_feature=None,
+                score_alignment_feature=None,
+            )
+            self.layers[0](
+                query,
+                anchor,
+                anchor_embed,
+                time_interval=None,
+                return_cls=True,
+                classification_feature=None,
+                regression_feature=None,
+                score_alignment_feature=None,
+            )
+            return {}
+
+        feature_maps = [torch.zeros(1, 1, 4, 2, 2)]
+        probe, _ = make_head()
+        probe.rosa_refiner = torch.nn.Identity()
+        probe.rosa_cfg = SimpleNamespace(export_diagnostics=False)
+        probe.eval()
+        with torch.no_grad():
+            assert probe._lean_inference() is True
+            hook = probe.rosa_refiner.register_forward_hook(
+                lambda *_args: None
+            )
+            try:
+                assert probe._lean_inference() is False
+            finally:
+                hook.remove()
+            global_hook = torch.nn.modules.module.register_module_forward_hook(
+                lambda *_args: None
+            )
+            try:
+                assert probe._lean_inference() is False
+            finally:
+                global_hook.remove()
+
+        released_forward = integration.Sparse4DHead.forward
+        integration.Sparse4DHead.forward = native_forward
+        try:
+            head, observed = make_head()
+            local = head.layers[0].register_forward_pre_hook(
+                lambda _module, args, kwargs: (
+                    (args[0] + 3.0, *args[1:]),
+                    kwargs,
+                ),
+                with_kwargs=True,
+            )
+            integration.ROSARefinementHead.forward(head, feature_maps, {})
+            assert torch.equal(observed[0], torch.full((1, 2, 4), 3.0))
+            assert len(head.layers[0]._forward_pre_hooks) == 1
+            assert "_rosa_captured_query" not in head.__dict__
+            assert "_rosa_capture_via_hook" not in head.__dict__
+            local.remove()
+
+            head, observed = make_head()
+            def replace_globally(module, args):
+                if module is head.layers[0]:
+                    return (args[0] + 5.0, *args[1:])
+            global_handle = (
+                torch.nn.modules.module.register_module_forward_pre_hook(
+                    replace_globally
+                )
+            )
+            try:
+                integration.ROSARefinementHead.forward(head, feature_maps, {})
+            finally:
+                global_handle.remove()
+            assert torch.equal(observed[0], torch.full((1, 2, 4), 5.0))
+            assert not head.layers[0]._forward_pre_hooks
+
+            for capture_via_hook in (False, True):
+                head, _ = make_head()
+                head._rosa_capture_via_hook = capture_via_hook
+                try:
+                    head._pre_refine_query_feature(
+                        decoder_index=5,
+                        instance_feature=torch.zeros(1, 2, 4),
+                        anchor=torch.zeros(1, 2, 11),
+                        anchor_embed=torch.zeros(1, 2, 4),
+                        feature_maps=feature_maps,
+                        metas={},
+                        predictions=[],
+                        classifications=[],
+                        qualities=[],
+                        num_free_instance=2,
+                        classification_feature=torch.zeros(1, 2, 4),
+                        regression_feature=None,
+                        score_alignment_feature=None,
+                    )
+                except RuntimeError as error:
+                    assert "sidecars must be None" in str(error)
+                else:
+                    raise AssertionError("native sidecar was accepted")
+                finally:
+                    head.__dict__.pop("_rosa_capture_via_hook", None)
+
+            head, _ = make_head()
+            local = head.layers[0].register_forward_pre_hook(
+                lambda *_args: None
+            )
+            integration.Sparse4DHead.forward = lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(RuntimeError("injected failure"))
+            )
+            try:
+                integration.ROSARefinementHead.forward(head, feature_maps, {})
+            except RuntimeError as error:
+                assert str(error) == "injected failure"
+            else:
+                raise AssertionError("injected native failure was swallowed")
+            assert len(head.layers[0]._forward_pre_hooks) == 1
+            assert "_rosa_captured_query" not in head.__dict__
+            assert "_rosa_capture_via_hook" not in head.__dict__
+            local.remove()
+        finally:
+            integration.Sparse4DHead.forward = released_forward
+        """
+    )
+    environment = os.environ.copy()
+    pythonpath = [str(ROOT / "src"), str(host)]
+    if environment.get("PYTHONPATH"):
+        pythonpath.append(environment["PYTHONPATH"])
+    environment["PYTHONPATH"] = os.pathsep.join(pythonpath)
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        env=environment,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_released_config_aliases_keep_legacy_projection_default():
     config = ROSAConfig.from_mapping(
         {
@@ -253,7 +447,10 @@ def test_packed_fpn_restore_is_zero_copy_and_sampler_equivalent():
         """
         import torch
 
-        from projects.mmdet3d_plugin.ops import feature_maps_format
+        from projects.mmdet3d_plugin.ops import (
+            feature_map_layout_receipt,
+            feature_maps_format,
+        )
         from rosa.integrations.sparse4d_runtime import detached_fpn, restore_fpn
         from rosa.sampling import (
             DeterministicBilinearSampler,
@@ -267,8 +464,12 @@ def test_packed_fpn_restore_is_zero_copy_and_sampler_equivalent():
             for height, width in ((9, 11), (5, 7), (3, 4), (2, 2))
         ]
         packed = feature_maps_format(levels)
-        restored = restore_fpn(packed)
-        detached = detached_fpn(packed)
+        level_layout = tuple(tuple(value.shape[-2:]) for value in levels)
+        layout = (level_layout,) * cameras
+        receipt = feature_map_layout_receipt(packed, layout)
+        assert receipt is not None
+        restored = restore_fpn(packed, layout_receipt=receipt)
+        detached = detached_fpn(packed, layout_receipt=receipt)
         packed_pointer = packed[0].untyped_storage().data_ptr()
 
         assert len(restored) == len(levels)
@@ -354,6 +555,96 @@ def test_legacy_checkpoint_prefix_remaps_without_overwriting_modern_key():
     assert state["head.rosa_refiner.b"] is modern_weight
 
 
+@pytest.mark.parametrize(
+    "dtype",
+    (torch.float16, torch.bfloat16, torch.float32, torch.float64),
+)
+def test_frozen_decode_field_packing_preserves_raw_values_and_ownership(dtype):
+    decoded = torch.arange(48, dtype=dtype).reshape(2, 3, 8)
+    decoded[0, 0, :4] = torch.tensor(
+        (float("nan"), float("inf"), float("-inf"), -0.0),
+        dtype=dtype,
+    )
+    scores = torch.tensor(((0.0, -0.0, 1.0), (2.0, 3.0, 4.0)), dtype=dtype)
+    origins = torch.tensor(((5.0, 6.0, 7.0), (8.0, 9.0, 10.0)), dtype=dtype)
+    labels = torch.tensor(((0, 1, 2), (3, 4, 5)))
+    indices = torch.tensor(((2, 0, 1), (1, 2, 0)))
+    instance_ids = torch.tensor(((12, 10, 11), (21, 22, 20)))
+
+    packed = _pack_frozen_decode_fields(
+        decoded,
+        scores,
+        labels,
+        indices,
+        origins,
+        instance_ids,
+    )
+
+    expected_fields = {
+        "boxes_3d": decoded,
+        "scores_3d": scores,
+        "labels_3d": labels,
+        "query_indices": indices,
+        "cls_scores": origins,
+        "instance_ids": instance_ids,
+    }
+    assert len(packed) == 2
+    for batch_index, item in enumerate(packed):
+        pointers = []
+        for name, expected in expected_fields.items():
+            actual = item[name]
+            assert _raw_equal(actual, expected[batch_index])
+            assert actual._base is None
+            assert actual.is_contiguous()
+            pointers.append(actual.untyped_storage().data_ptr())
+        assert len(set(pointers)) == len(pointers)
+
+
+def test_detector_owned_output_audit_rejects_each_forbidden_mutation():
+    anchor = torch.arange(66, dtype=torch.float32).reshape(2, 3, 11)
+    classification = torch.arange(36, dtype=torch.float32).reshape(2, 3, 6)
+    quality = torch.arange(12, dtype=torch.float32).reshape(2, 3, 2)
+    selected = torch.tensor(((0, 2), (0, 2)))
+    validate_detector_owned_rosa_output(
+        anchor,
+        anchor.clone(),
+        classification,
+        classification.detach(),
+        quality,
+        quality.detach(),
+        selected,
+    )
+
+    mutations = []
+    changed_classification = classification.clone()
+    changed_classification[0, 0, 0] += 1
+    mutations.append((anchor.clone(), changed_classification, quality.detach()))
+    changed_quality = quality.clone()
+    changed_quality[0, 0, 0] += 1
+    mutations.append((anchor.clone(), classification.detach(), changed_quality))
+    changed_z = anchor.clone()
+    changed_z[0, 0, 2] += 1
+    mutations.append((changed_z, classification.detach(), quality.detach()))
+    changed_velocity = anchor.clone()
+    changed_velocity[0, 0, 8] += 1
+    mutations.append((changed_velocity, classification.detach(), quality.detach()))
+    changed_unselected = anchor.clone()
+    changed_unselected[0, 1, 0] += 1
+    mutations.append((changed_unselected, classification.detach(), quality.detach()))
+
+    for final_anchor, final_classification, final_quality in mutations:
+        with pytest.raises(RuntimeError, match="ROSA changed"):
+            validate_detector_owned_rosa_output(
+                anchor,
+                final_anchor,
+                classification,
+                final_classification,
+                quality,
+                final_quality,
+                selected,
+            )
+
+
 def test_zero_quality_delta_is_exact_native_joint_score():
     classification = torch.tensor([[[0.5, -0.25], [1.0, 0.1]]])
     quality = torch.tensor([[[0.2], [-0.3]]])
@@ -378,6 +669,67 @@ def test_zero_quality_delta_is_exact_native_joint_score():
     assert delta.grad is not None
 
 
+@pytest.mark.parametrize(
+    ("classification_dtype", "quality_dtype"),
+    (
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+        (torch.float16, torch.float32),
+        (torch.float32, torch.float64),
+    ),
+)
+def test_native_identity_rank_is_raw_exact_to_zero_quality_residual(
+    classification_dtype,
+    quality_dtype,
+):
+    generator = torch.Generator().manual_seed(3407)
+    classification = torch.randn(
+        2,
+        7,
+        6,
+        generator=generator,
+        dtype=classification_dtype,
+    )
+    quality = torch.randn(
+        2,
+        7,
+        2,
+        generator=generator,
+        dtype=quality_dtype,
+    )
+    supported = torch.rand(2, 7, generator=generator) > 0.25
+    full = compose_quality_rank(
+        classification,
+        quality,
+        torch.zeros(2, 7, 1, dtype=classification_dtype),
+        supported,
+        centerness_index=0,
+    )
+    identity = compose_native_identity_rank(
+        classification,
+        quality,
+        centerness_index=0,
+    )
+
+    assert torch.equal(identity["frozen_label"], full["frozen_label"])
+    assert identity["native_selected_probability"].dtype == full[
+        "native_selected_probability"
+    ].dtype
+    assert _raw_equal(
+        identity["native_selected_probability"],
+        full["native_selected_probability"],
+    )
+    assert identity["emitted_joint_score"].dtype == full[
+        "emitted_joint_score"
+    ].dtype
+    assert _raw_equal(
+        identity["emitted_joint_score"],
+        full["emitted_joint_score"],
+    )
+
+
 class _IdentityBoxDecoder:
     selection_score_mode = "legacy"
     sorted = True
@@ -387,6 +739,67 @@ class _IdentityBoxDecoder:
     @staticmethod
     def decode_box(boxes):
         return boxes
+
+
+def test_packed_decode_fallback_never_speculates_or_repeats_decoder_calls():
+    class CountingDecoder(_IdentityBoxDecoder):
+        def __init__(self):
+            self.calls = 0
+
+        def decode_box(self, boxes):
+            self.calls += 1
+            return boxes
+
+    decoder = CountingDecoder()
+    classification = torch.randn(2, 3, 2)
+    boxes = torch.randn(2, 3, 11)
+    labels = torch.tensor(((0, 1, 0), (1, 0, 1)))
+    class_probability = torch.rand(2, 3)
+    joint_score = torch.rand(2, 3)
+    instance_ids = torch.tensor(((10, 11, 12), (20, 21, 22)))
+
+    result = decode_frozen_jointscore_rank(
+        decoder,
+        [classification],
+        [boxes],
+        labels,
+        class_probability,
+        joint_score,
+        instance_id=instance_ids,
+        output_idx=0,
+        validate_values=False,
+        pack_host_transfers=True,
+    )
+
+    assert len(result) == 2
+    assert decoder.calls == 2
+
+
+def test_packed_decode_accepts_empty_batch_without_decoder_calls():
+    class CountingDecoder(_IdentityBoxDecoder):
+        def __init__(self):
+            self.calls = 0
+
+        def decode_box(self, boxes):
+            self.calls += 1
+            return boxes
+
+    decoder = CountingDecoder()
+    result = decode_frozen_jointscore_rank(
+        decoder,
+        [torch.empty(0, 3, 2)],
+        [torch.empty(0, 3, 11)],
+        torch.empty(0, 3, dtype=torch.long),
+        torch.empty(0, 3),
+        torch.empty(0, 3),
+        instance_id=torch.empty(0, 3, dtype=torch.long),
+        output_idx=0,
+        validate_values=False,
+        pack_host_transfers=True,
+    )
+
+    assert result == []
+    assert decoder.calls == 0
 
 
 def test_quality_residual_changes_only_query_ranking_at_inference():

@@ -21,6 +21,14 @@ class ObservationEncoding:
     camera_geometry_summary: Tensor
 
 
+@dataclass(frozen=True)
+class RayFeatureRelation:
+    """Only the calibrated ray and validity channels consumed by RFL."""
+
+    ray: Tensor
+    valid: Tensor
+
+
 @dataclass
 class ROSAOutput:
     """Refined boxes and compact diagnostics used by training and analysis."""
@@ -73,4 +81,4 @@ class ROSAOutput:
     iteration_camera_geometry_summary: Tensor | None = None
 
 
-__all__ = ["ObservationEncoding", "ROSAOutput"]
+__all__ = ["ObservationEncoding", "ROSAOutput", "RayFeatureRelation"]

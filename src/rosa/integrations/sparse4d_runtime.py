@@ -8,6 +8,8 @@ from typing import Any, Mapping, Sequence
 import torch
 from torch import Tensor, nn
 
+from ..ops import bitwise_equal
+
 _REQUIRED_NATIVE_REFINE_KWARGS = {
     "time_interval",
     "return_cls",
@@ -94,7 +96,58 @@ def validate_native_call(call: NativeRefineCall) -> None:
         raise RuntimeError("native capture must materialize class/quality")
 
 
-def restore_fpn(feature_maps) -> list[Tensor]:
+def validate_detector_owned_rosa_output(
+    baseline_anchor: Tensor,
+    final_anchor: Tensor,
+    baseline_classification: Tensor,
+    final_classification: Tensor,
+    baseline_quality: Tensor,
+    final_quality: Tensor,
+    selected_indices: Tensor | None,
+) -> None:
+    """Audit fields that the ROSA sidecar is forbidden to change.
+
+    This intentionally performs exact device comparisons and is therefore an
+    offline/training diagnostic, not part of the latency-sensitive inference
+    path.
+    """
+
+    if (
+        baseline_anchor.shape != final_anchor.shape
+        or baseline_classification.shape != final_classification.shape
+        or baseline_quality.shape != final_quality.shape
+    ):
+        raise RuntimeError("ROSA changed a detector-owned tensor shape")
+    if (
+        not bitwise_equal(final_classification, baseline_classification)
+        or not bitwise_equal(final_quality, baseline_quality)
+        or not bitwise_equal(final_anchor[..., 2:3], baseline_anchor[..., 2:3])
+        or not bitwise_equal(final_anchor[..., 8:], baseline_anchor[..., 8:])
+    ):
+        raise RuntimeError("ROSA changed a detector-owned field")
+    if selected_indices is None:
+        return
+    if (
+        selected_indices.dtype != torch.long
+        or selected_indices.ndim != 2
+        or selected_indices.shape[0] != baseline_anchor.shape[0]
+        or selected_indices.device != baseline_anchor.device
+    ):
+        raise RuntimeError("ROSA selected-index audit contract changed")
+    untouched = torch.ones(
+        baseline_anchor.shape[:2],
+        dtype=torch.bool,
+        device=baseline_anchor.device,
+    )
+    untouched.scatter_(1, selected_indices, False)
+    if not bitwise_equal(
+        final_anchor[untouched],
+        baseline_anchor.detach()[untouched],
+    ):
+        raise RuntimeError("ROSA changed an unselected query")
+
+
+def restore_fpn(feature_maps, layout_receipt=None) -> list[Tensor]:
     """Convert packed Sparse4D features to ``[B,C,D,H,W]`` levels.
 
     The import of the Sparse4D CUDA/plugin package is intentionally delayed
@@ -114,12 +167,20 @@ def restore_fpn(feature_maps) -> list[Tensor]:
         and feature_maps[0].ndim == 3
     ):
         try:
-            from projects.mmdet3d_plugin.ops import feature_maps_format
+            from projects.mmdet3d_plugin.ops import (
+                feature_maps_format,
+                trusted_feature_map_layout,
+            )
         except ImportError as exc:  # pragma: no cover - framework environment
             raise ImportError(
                 "packed FPN restoration requires the Sparse4D plugin on " "PYTHONPATH"
             ) from exc
-        camera_groups = feature_maps_format(feature_maps, inverse=True)
+        layout = trusted_feature_map_layout(feature_maps, layout_receipt)
+        camera_groups = feature_maps_format(
+            feature_maps,
+            inverse=True,
+            layout=layout,
+        )
         if not camera_groups or not camera_groups[0]:
             raise RuntimeError("packed FPN restored no camera/level tensors")
         num_levels = len(camera_groups[0])
@@ -151,10 +212,10 @@ def restore_fpn(feature_maps) -> list[Tensor]:
     raise TypeError("unsupported Sparse4D FPN representation")
 
 
-def detached_fpn(feature_maps) -> list[Tensor]:
+def detached_fpn(feature_maps, layout_receipt=None) -> list[Tensor]:
     """Restore the FPN and close the gradient boundary to the detector."""
 
-    restored = restore_fpn(feature_maps)
+    restored = restore_fpn(feature_maps, layout_receipt=layout_receipt)
     values = [value.detach() for value in restored]
     for value, source in zip(values, restored):
         if value.requires_grad or value.grad_fn is not None:
@@ -209,5 +270,6 @@ __all__ = [
     "find_operation_indices",
     "remap_legacy_refiner_state_dict",
     "restore_fpn",
+    "validate_detector_owned_rosa_output",
     "validate_native_call",
 ]

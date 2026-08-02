@@ -8,11 +8,14 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from . import geometry as _geometry
 from .geometry import (
+    _ocam_project_points_with_raw_camera_xyz,
     ocam_full_fov_boundary,
     ocam_project_points,
     ocam_projection_scales,
 )
+from .types import RayFeatureRelation
 
 
 def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
@@ -28,6 +31,54 @@ def _camera_xyz(points: Tensor, lidar2cam: Tensor) -> Tensor:
     ).squeeze(-1)[..., :3]
 
 
+_RELEASED_OBSERVATION_CAMERA_XYZ = _camera_xyz
+_RELEASED_OCAM_PROJECT_POINTS = ocam_project_points
+_RELEASED_OCAM_PROJECT_WITH_XYZ = _ocam_project_points_with_raw_camera_xyz
+_RELEASED_GEOMETRY_CAMERA_XYZ = _geometry._camera_xyz
+_RELEASED_OCAM_PROJECT_IMPL = _geometry._ocam_project_points_impl
+# CUDA raw-bit parity must be established before this candidate becomes the
+# production default.  CPU tests exercise the complete guarded implementation.
+_ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE = False
+
+
+def _can_reuse_camera_transform(keypoints: Tensor, metadata: dict) -> bool:
+    if (
+        not _ENABLE_SINGLE_CAMERA_TRANSFORM_CANDIDATE
+        or torch.is_grad_enabled()
+        or type(metadata) is not dict
+        or type(keypoints) is not torch.Tensor
+        or keypoints.ndim != 4
+        or keypoints.shape[-1] != 3
+        or _camera_xyz is not _RELEASED_OBSERVATION_CAMERA_XYZ
+        or ocam_project_points is not _RELEASED_OCAM_PROJECT_POINTS
+        or _ocam_project_points_with_raw_camera_xyz
+        is not _RELEASED_OCAM_PROJECT_WITH_XYZ
+        or _geometry._camera_xyz is not _RELEASED_GEOMETRY_CAMERA_XYZ
+        or _geometry._ocam_project_points_impl
+        is not _RELEASED_OCAM_PROJECT_IMPL
+        or torch.jit.is_scripting()
+        or torch.jit.is_tracing()
+        or torch._dynamo.is_compiling()
+    ):
+        return False
+    tensors = (
+        keypoints,
+        metadata.get("lidar2cam"),
+        metadata.get("image_wh"),
+        metadata.get("ocam_intrinsic"),
+        metadata.get("ocam_pol"),
+    )
+    return bool(
+        all(type(value) is torch.Tensor for value in tensors)
+        and all(value.layout == torch.strided for value in tensors)
+        and all(not value.is_quantized for value in tensors)
+        and all(
+            all(name is None for name in value.names)
+            for value in tensors
+        )
+    )
+
+
 def project_and_describe(
     keypoints: Tensor,
     anchor: Tensor,
@@ -35,8 +86,12 @@ def project_and_describe(
     projection_contract: str,
     *,
     anchor_z_is_bottom: bool = False,
-) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    compact_relation: bool = False,
+) -> tuple[Tensor, Tensor, Tensor | RayFeatureRelation, Tensor]:
     """Project keypoints and encode calibrated observation geometry."""
+
+    if not isinstance(compact_relation, bool):
+        raise TypeError("compact_relation must be a bool")
 
     required = (
         "lidar2cam",
@@ -48,12 +103,27 @@ def project_and_describe(
     if missing:
         raise KeyError(f"OCam camera metadata missing: {missing}")
 
-    projected = ocam_project_points(
-        keypoints,
-        metadata,
-        metadata["image_wh"],
-        contract=projection_contract,
+    reuse_projection_storage = bool(
+        not torch.is_grad_enabled()
+        and not torch._dynamo.is_compiling()
     )
+    if _can_reuse_camera_transform(keypoints, metadata):
+        projected, camera_xyz = _ocam_project_points_with_raw_camera_xyz(
+            keypoints,
+            metadata,
+            metadata["image_wh"],
+            contract=projection_contract,
+            inference_storage_reuse=True,
+        )
+    else:
+        projected = ocam_project_points(
+            keypoints,
+            metadata,
+            metadata["image_wh"],
+            contract=projection_contract,
+            inference_storage_reuse=reuse_projection_storage,
+        )
+        camera_xyz = None
     valid = (
         torch.isfinite(projected).all(dim=-1)
         & projected[..., 0].ge(0)
@@ -66,7 +136,8 @@ def project_and_describe(
         torch.nan_to_num(projected),
         torch.zeros_like(projected),
     )
-    camera_xyz = _camera_xyz(keypoints, metadata["lidar2cam"])
+    if camera_xyz is None:
+        camera_xyz = _camera_xyz(keypoints, metadata["lidar2cam"])
     ray = F.normalize(
         torch.nan_to_num(camera_xyz),
         dim=-1,
@@ -161,14 +232,22 @@ def project_and_describe(
     valid = valid.permute(0, 2, 1, 3).contiguous()
     uv = safe_uv.permute(0, 2, 1, 3, 4).contiguous()
 
-    relation = torch.zeros(
-        geometry.shape[:-1] + (19,),
-        device=geometry.device,
-        dtype=geometry.dtype,
-    )
-    relation[..., 8:11] = geometry[..., :3]
-    relation[..., 13] = valid.to(geometry.dtype)
-    relation = relation.permute(0, 2, 1, 3, 4).contiguous()
+    if compact_relation:
+        # Preserve the historical carrier's independent ownership so an RFL
+        # pre-hook cannot mutate the geometry/validity returned to ROSA.
+        relation = RayFeatureRelation(
+            ray=geometry[..., :3].clone(),
+            valid=valid.clone(),
+        )
+    else:
+        relation = torch.zeros(
+            geometry.shape[:-1] + (19,),
+            device=geometry.device,
+            dtype=geometry.dtype,
+        )
+        relation[..., 8:11] = geometry[..., :3]
+        relation[..., 13] = valid.to(geometry.dtype)
+        relation = relation.permute(0, 2, 1, 3, 4).contiguous()
     return uv, geometry, relation, valid
 
 
@@ -188,11 +267,29 @@ def sample_multiscale_features(
     sample_uv = uv.unsqueeze(4)
     sampled = [sampler(feature, sample_uv).squeeze(4) for feature in fpn]
     levels = torch.stack(sampled, dim=2)
+    # ``stack`` owns the fused level storage.  Drop the four per-level outputs
+    # before allocating any subsequent tensor; keeping the Python list alive
+    # otherwise retains another full multiscale observation batch.
+    del sampled
     weights = torch.softmax(
         level_head(query).float(),
         dim=-1,
     ).to(levels.dtype)
-    return (levels * weights[:, :, :, None, None, None]).sum(dim=2)
+    expanded_weights = weights[:, :, :, None, None, None]
+    if (
+        not torch.is_grad_enabled()
+        and type(levels) is torch.Tensor
+        and levels.layout == torch.strided
+        and levels._base is None
+        and not levels.is_quantized
+        and all(name is None for name in levels.names)
+    ):
+        # ``levels`` is the private result of ``stack``.  Evaluation can reuse
+        # that storage for the weighted reduction instead of materializing a
+        # second tensor of the same [B,N,L,C,P,D] size.
+        levels.mul_(expanded_weights)
+        return levels.sum(dim=2)
+    return (levels * expanded_weights).sum(dim=2)
 
 
 __all__ = ["project_and_describe", "sample_multiscale_features"]

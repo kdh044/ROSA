@@ -11,6 +11,52 @@ from torch import Tensor
 import torch.nn.functional as F
 
 
+def _pack_frozen_decode_fields(
+    decoded_boxes: Tensor,
+    scores: Tensor,
+    labels: Tensor,
+    indices: Tensor,
+    class_origin: Tensor,
+    instance_ids: Tensor,
+) -> list[dict]:
+    """Consolidate an already-decoded batch into two host transfers."""
+
+    box_width = decoded_boxes.shape[-1]
+    floating_cpu = torch.cat(
+        (decoded_boxes, scores[..., None], class_origin[..., None]),
+        dim=-1,
+    ).cpu()
+    integer_cpu = torch.stack((labels, indices, instance_ids), dim=-1).cpu()
+    return [
+        {
+            "boxes_3d": floating_cpu[index, :, :box_width].clone(),
+            "scores_3d": floating_cpu[index, :, box_width].clone(),
+            "labels_3d": integer_cpu[index, :, 0].clone(),
+            "query_indices": integer_cpu[index, :, 1].clone(),
+            "cls_scores": floating_cpu[index, :, box_width + 1].clone(),
+            "instance_ids": integer_cpu[index, :, 2].clone(),
+        }
+        for index in range(decoded_boxes.shape[0])
+    ]
+
+
+def _matches_released_sparse4d_decoder(decoder) -> bool:
+    """Seal the host decoder implementation before batching its transfers."""
+
+    try:
+        from projects.mmdet3d_plugin.models.detection3d.decoder import (
+            SparseBox3DDecoder,
+            _RELEASED_DECODE_BOX_IMPL,
+        )
+    except ImportError:
+        return False
+    return bool(
+        type(decoder) is SparseBox3DDecoder
+        and "decode_box" not in decoder.__dict__
+        and type(decoder).decode_box is _RELEASED_DECODE_BOX_IMPL
+    )
+
+
 def _probability_dtype(dtype: torch.dtype) -> torch.dtype:
     return torch.float32 if dtype in (torch.float16, torch.bfloat16) else dtype
 
@@ -18,16 +64,23 @@ def _probability_dtype(dtype: torch.dtype) -> torch.dtype:
 def stable_native_joint_logit(
     selected_class_logit: Tensor,
     centerness_logit: Tensor,
+    *,
+    validate_values: bool = True,
 ) -> Tensor:
     """Compute ``logit(sigmoid(class) * sigmoid(centerness))`` stably."""
 
     if (
         selected_class_logit.shape != centerness_logit.shape
         or not selected_class_logit.is_floating_point()
-        or not bool(torch.isfinite(selected_class_logit).all())
+    ):
+        raise ValueError("native class/centerness logits must be floating/aligned")
+    if not isinstance(validate_values, bool):
+        raise TypeError("validate_values must be a bool")
+    if validate_values and (
+        not bool(torch.isfinite(selected_class_logit).all())
         or not bool(torch.isfinite(centerness_logit).all())
     ):
-        raise ValueError("native class/centerness logits must be finite/aligned")
+        raise ValueError("native class/centerness logits must be finite")
     dtype = _probability_dtype(selected_class_logit.dtype)
     selected = selected_class_logit.detach().to(dtype=dtype)
     centerness = centerness_logit.detach().to(dtype=dtype)
@@ -35,7 +88,7 @@ def stable_native_joint_logit(
         torch.stack((-selected, -centerness, -selected - centerness), dim=-1),
         dim=-1,
     )
-    if not bool(torch.isfinite(result).all()):
+    if validate_values and not bool(torch.isfinite(result).all()):
         raise FloatingPointError("native joint logit is non-finite")
     return result.detach()
 
@@ -44,6 +97,8 @@ def stable_joint_probability(
     joint_logit: Tensor,
     native_joint_score: Tensor,
     effective_delta: Tensor,
+    *,
+    validate_values: bool = True,
 ) -> Tensor:
     """Emit sigmoid score with a bit-exact zero-residual identity bridge."""
 
@@ -53,13 +108,15 @@ def stable_joint_probability(
         or effective_delta.shape != joint_logit.shape
     ):
         raise ValueError("joint score tensors are misaligned")
+    if not isinstance(validate_values, bool):
+        raise TypeError("validate_values must be a bool")
     dtype = _probability_dtype(joint_logit.dtype)
     raw = joint_logit.to(dtype=dtype).sigmoid()
     native = native_joint_score.detach().to(dtype=dtype)
     delta = effective_delta.to(dtype=dtype)
     exact_identity = native + (raw - raw.detach())
     probability = torch.where(delta.eq(0), exact_identity, raw)
-    if not bool(torch.isfinite(probability).all()):
+    if validate_values and not bool(torch.isfinite(probability).all()):
         raise FloatingPointError("joint probability is non-finite")
     return probability
 
@@ -71,6 +128,7 @@ def compose_quality_rank(
     supported: Tensor,
     *,
     centerness_index: int,
+    validate_values: bool = True,
 ) -> dict[str, Tensor]:
     """Compose ROSA quality residual with frozen native class identity."""
 
@@ -93,13 +151,22 @@ def compose_quality_rank(
     centerness_logit = baseline_quality[..., int(centerness_index)].detach()
     centerness_probability = centerness_logit.sigmoid()
     native_joint_score = (selected_probability * centerness_probability).detach()
-    native_joint_logit = stable_native_joint_logit(selected_logit, centerness_logit)
+    native_joint_logit = stable_native_joint_logit(
+        selected_logit,
+        centerness_logit,
+        validate_values=validate_values,
+    )
     eligible = supported.detach() & torch.isfinite(delta.squeeze(-1))
     effective_delta = torch.where(
         eligible, delta.squeeze(-1), torch.zeros_like(delta.squeeze(-1))
     )
     joint_logit = native_joint_logit + effective_delta
-    emitted = stable_joint_probability(joint_logit, native_joint_score, effective_delta)
+    emitted = stable_joint_probability(
+        joint_logit,
+        native_joint_score,
+        effective_delta,
+        validate_values=validate_values,
+    )
     return {
         "frozen_label": frozen_label,
         "native_selected_probability": selected_probability.detach(),
@@ -109,6 +176,43 @@ def compose_quality_rank(
         "effective_delta": effective_delta,
         "emitted_joint_score": emitted,
         "eligible": eligible,
+    }
+
+
+def compose_native_identity_rank(
+    baseline_classification: Tensor,
+    baseline_quality: Tensor,
+    *,
+    centerness_index: int,
+) -> dict[str, Tensor]:
+    """Build the three decode fields when score refinement is disabled."""
+
+    if (
+        baseline_classification.ndim != 3
+        or baseline_quality.shape[:2] != baseline_classification.shape[:2]
+    ):
+        raise ValueError("native identity-rank tensors are misaligned")
+    native_probability = baseline_classification.detach().sigmoid()
+    frozen_label = native_probability.argmax(dim=-1)
+    selected_probability = torch.gather(
+        native_probability,
+        -1,
+        frozen_label[..., None],
+    ).squeeze(-1)
+    centerness_probability = baseline_quality[
+        ..., int(centerness_index)
+    ].detach().sigmoid()
+    # The released zero-residual bridge promotes half/bfloat16 probabilities
+    # to FP32 after forming the native low-precision product.  Preserve both
+    # that arithmetic order and its public dtype without rebuilding the
+    # log-sum-exp identity machinery.
+    emitted = (selected_probability * centerness_probability).to(
+        dtype=_probability_dtype(baseline_classification.dtype)
+    ).detach()
+    return {
+        "frozen_label": frozen_label,
+        "native_selected_probability": selected_probability.detach(),
+        "emitted_joint_score": emitted,
     }
 
 
@@ -239,6 +343,8 @@ def decode_frozen_jointscore_rank(
     *,
     instance_id: Tensor | None,
     output_idx: int,
+    validate_values: bool = True,
+    pack_host_transfers: bool = False,
 ) -> list[dict]:
     """Decode once from the frozen native label and ROSA joint score."""
 
@@ -268,7 +374,11 @@ def decode_frozen_jointscore_rank(
         raise RuntimeError("positive score-threshold filtering is forbidden")
     if instance_id is None or instance_id.shape != expected:
         raise RuntimeError("decode requires aligned non-null instance IDs")
-    if not all(
+    if not isinstance(validate_values, bool):
+        raise TypeError("validate_values must be a bool")
+    if not isinstance(pack_host_transfers, bool):
+        raise TypeError("pack_host_transfers must be a bool")
+    if validate_values and not all(
         bool(torch.isfinite(value).all())
         for value in (
             final_classification,
@@ -288,13 +398,76 @@ def decode_frozen_jointscore_rank(
     indices = torch.gather(indices, 1, order)
     labels = torch.gather(labels, 1, order)
     class_origin = torch.gather(class_origin, 1, order)
+
+    decoded_per_batch = None
+    floating_inputs = (box_predictions, scores, class_origin)
+    integer_inputs = (labels, indices, instance_id)
+    can_pack = bool(
+        pack_host_transfers
+        and not validate_values
+        and not torch.is_grad_enabled()
+        and batch_size > 0
+        and all(
+            type(value) is torch.Tensor
+            for value in floating_inputs + integer_inputs
+        )
+        and all(
+            value.layout == torch.strided
+            for value in floating_inputs + integer_inputs
+        )
+        and all(
+            not value.is_quantized
+            for value in floating_inputs + integer_inputs
+        )
+        and all(
+            value.device.type == "cuda"
+            for value in floating_inputs + integer_inputs
+        )
+        and all(
+            value.device == box_predictions.device
+            for value in floating_inputs + integer_inputs
+        )
+        and all(value.dtype == box_predictions.dtype for value in floating_inputs)
+        and all(value.dtype == torch.long for value in integer_inputs)
+        and all(
+            all(name is None for name in value.names)
+            for value in floating_inputs + integer_inputs
+        )
+    )
+    if can_pack and _matches_released_sparse4d_decoder(decoder):
+        decoded_per_batch = [
+            decoder.decode_box(box_predictions[index, indices[index]])
+            for index in range(batch_size)
+        ]
+        decoded_boxes = torch.stack(decoded_per_batch, dim=0)
+        if (
+            type(decoded_boxes) is torch.Tensor
+            and decoded_boxes.layout == torch.strided
+            and not decoded_boxes.is_quantized
+            and decoded_boxes.device == box_predictions.device
+            and decoded_boxes.dtype == box_predictions.dtype
+            and all(name is None for name in decoded_boxes.names)
+        ):
+            selected_instance_ids = torch.gather(instance_id, 1, indices)
+            return _pack_frozen_decode_fields(
+                decoded_boxes,
+                scores,
+                labels,
+                indices,
+                class_origin,
+                selected_instance_ids,
+            )
+
     output = []
     for batch_index in range(batch_size):
         query_indices = indices[batch_index]
+        decoded = (
+            decoded_per_batch[batch_index]
+            if decoded_per_batch is not None
+            else decoder.decode_box(box_predictions[batch_index, query_indices])
+        )
         item = {
-            "boxes_3d": decoder.decode_box(
-                box_predictions[batch_index, query_indices]
-            ).cpu(),
+            "boxes_3d": decoded.cpu(),
             "scores_3d": scores[batch_index].cpu(),
             "labels_3d": labels[batch_index].cpu(),
             "query_indices": query_indices.cpu(),
@@ -312,6 +485,7 @@ def decode_frozen_jointscore_rank(
 
 __all__ = [
     "JointScoreLoss",
+    "compose_native_identity_rank",
     "compose_quality_rank",
     "ddp_mean_mask_count",
     "decode_frozen_jointscore_rank",

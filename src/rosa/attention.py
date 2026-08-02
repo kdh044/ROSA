@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from .config import ROSAConfig
 from .rfl import SphericalRayFeatureLifting
-from .types import ObservationEncoding
+from .types import ObservationEncoding, RayFeatureRelation
 
 
 def masked_softmax(logits: Tensor, valid: Tensor, dim: int) -> Tensor:
@@ -109,7 +109,7 @@ class PointwiseROSA(nn.Module):
         self,
         features: Tensor,
         geometry: Tensor,
-        relation: Tensor,
+        relation: Tensor | RayFeatureRelation,
         valid: Tensor,
         query: Tensor,
     ) -> ObservationEncoding:
