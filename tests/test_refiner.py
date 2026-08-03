@@ -12,6 +12,7 @@ import rosa.rfl as rfl_module
 from rosa.refiner import (
     _CandidateEvidence,
     _candidate_confidence,
+    _yaw_reliability_gate,
     ROSAConfig,
     ROSARefiner,
 )
@@ -1404,6 +1405,40 @@ def test_fixed_base_gate_feedback_contains_the_applied_proposal(monkeypatch):
     assert len(feedback) == 1
     proposal_slot = feedback[0][..., 2 * config.embed_dims]
     torch.testing.assert_close(proposal_slot, expected)
+
+
+@pytest.mark.parametrize("mode", ("none", "support", "anisotropy_gap"))
+def test_yaw_reliability_helper_matches_the_released_gate(mode):
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "yaw_gate_mode": mode,
+        }
+    )
+    context = torch.zeros(1, 3, 6)
+    context[..., 1] = torch.tensor((0.25, 0.5, 1.0))
+    context[..., 3] = torch.tensor((0.2, 0.4, 0.6))
+    supported = torch.tensor([[True, False, True]])
+
+    actual = _yaw_reliability_gate(context, supported, config)
+    if mode == "none":
+        expected = torch.ones_like(actual)
+    elif mode == "support":
+        expected = supported[..., None].to(context.dtype)
+    else:
+        overlap = torch.sigmoid(
+            (config.yaw_anisotropy_threshold - context[..., 3:4])
+            / config.yaw_anisotropy_temperature
+        )
+        expected = torch.where(
+            context[..., 1:2] * config.num_cameras >= 2,
+            overlap,
+            torch.ones_like(overlap),
+        ) * supported[..., None].to(context.dtype)
+
+    assert torch.equal(actual, expected)
 
 
 def test_corrected_geometry_normalizes_yaw_without_changing_native_box():

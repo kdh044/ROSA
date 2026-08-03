@@ -180,10 +180,7 @@ def _sequential_center_targets(
     _, tangent = _radial_basis(step_base[..., :2])
     error_xy = target_xy - step_base[..., :2]
     tangent_target = (error_xy * tangent).sum(dim=-1)
-    tangent_anchor = (
-        step_base[..., :2]
-        + tangent * tangent_delta.detach()[..., None]
-    )
+    tangent_anchor = step_base[..., :2] + tangent * tangent_delta.detach()[..., None]
     radial, _ = _radial_basis(tangent_anchor)
     radial_target = ((target_xy - tangent_anchor) * radial).sum(dim=-1)
     base_range = torch.linalg.vector_norm(
@@ -233,9 +230,8 @@ def _candidate_target_distribution(
 ) -> Tensor:
     """Build a normalized target over candidates visible to the query."""
 
-    logits = (
-        -(offsets.detach() - radial_target[..., None]).square()
-        / (2 * sigma[..., None].square())
+    logits = -(offsets.detach() - radial_target[..., None]).square() / (
+        2 * sigma[..., None].square()
     )
     valid = supported & selected[..., None]
     if use_masked_softmax:
@@ -342,10 +338,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         size_mask = guarded_mask if cfg.mask_unsupported_updates else matched
         yaw_mask = (
             guarded_mask
-            if (
-                cfg.mask_unsupported_updates
-                or cfg.yaw_update_mode == "guarded_shared"
-            )
+            if (cfg.mask_unsupported_updates or cfg.yaw_update_mode == "guarded_shared")
             else matched
         )
         center_mask = (
@@ -395,8 +388,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                     step_base[..., _YAW],
                 )
                 yaw_keep = (
-                    yaw_mask
-                    & base_yaw_error.lt(cfg.yaw_keep_threshold_rad)
+                    yaw_mask & base_yaw_error.lt(cfg.yaw_keep_threshold_rad)
                 ).detach()
                 yaw_keep_loss = yaw_keep_loss + weight * _yaw_selected_mean(
                     F.smooth_l1_loss(
@@ -459,12 +451,8 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         center_aux_mask = center_mask
         if cfg.center_supervision_mode == "move_or_keep":
             center_aux_mask = center_aux_mask & move
-        radial_aux_active = (
-            cfg.enable_radial or cfg.train_disabled_branch_aux
-        )
-        tangent_aux_active = (
-            cfg.enable_tangent or cfg.train_disabled_branch_aux
-        )
+        radial_aux_active = cfg.enable_radial or cfg.train_disabled_branch_aux
+        tangent_aux_active = cfg.enable_tangent or cfg.train_disabled_branch_aux
 
         mean = record["iteration_distribution_mean"][:, :, step]
         std = record["iteration_distribution_std"][:, :, step]
@@ -476,9 +464,8 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             reduction="none",
         )
         if radial_aux_active:
-            distribution_loss = (
-                distribution_loss
-                + weight * _selected_mean(nll, center_aux_mask)
+            distribution_loss = distribution_loss + weight * _selected_mean(
+                nll, center_aux_mask
             )
         offsets = record["iteration_candidate_offsets"][:, :, step]
         supported = record["iteration_candidate_supported"][:, :, step]
@@ -503,9 +490,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                 sigma,
                 supported,
                 center_aux_mask,
-                use_masked_softmax=(
-                    cfg.candidate_target_mode == "fixed_sigma"
-                ),
+                use_masked_softmax=(cfg.candidate_target_mode == "fixed_sigma"),
             )
         per_query = -(target_distribution * probabilities.clamp_min(1e-8).log()).sum(
             dim=-1
@@ -579,7 +564,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                     gate_bce,
                     gate_supervision_mask,
                 )
-                with torch.no_grad():
+                if cfg.center_target_mode == "fixed_base":
                     center_gate_supervised_count = (
                         center_gate_supervised_count
                         + ddp_mean_mask_count(
@@ -624,10 +609,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         if cfg.architecture_profile == "legacy":
             quality_target = (
                 torch.stack(
-                    [
-                        final_distance.le(threshold)
-                        for threshold in _BEV_THRESHOLDS
-                    ],
+                    [final_distance.le(threshold) for threshold in _BEV_THRESHOLDS],
                     dim=-1,
                 )
                 .float()
@@ -667,12 +649,13 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             safe_target[..., _YAW],
         ).abs()
         yaw_improved = final_yaw_error.lt(baseline_yaw_error)
-        final_center_error = torch.linalg.vector_norm(
-            final_reg[..., :2] - safe_target[..., :2],
-            dim=-1,
-        )
-        center_improved = final_center_error.lt(initial_distance)
-        center_harmed = final_center_error.gt(initial_distance)
+        if cfg.center_target_mode == "fixed_base":
+            final_center_error = torch.linalg.vector_norm(
+                final_reg[..., :2] - safe_target[..., :2],
+                dim=-1,
+            )
+            center_improved = final_center_error.lt(initial_distance)
+            center_harmed = final_center_error.gt(initial_distance)
         iteration_yaw_raw = record.get("iteration_yaw_raw_delta")
         iteration_yaw_gate = record.get("iteration_yaw_gate")
         iteration_yaw_delta = record.get("iteration_yaw_delta")
@@ -688,25 +671,20 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             iteration_support = matched[..., None].expand(-1, -1, num_steps)
         yaw_limits = final_reg.new_tensor(
             [
-                cfg.max_yaw_delta_rad
-                if index == 0
-                else cfg.max_second_yaw_delta_rad
+                cfg.max_yaw_delta_rad if index == 0 else cfg.max_second_yaw_delta_rad
                 for index in range(num_steps)
             ]
         )
         yaw_saturated = (
-            iteration_yaw_raw.squeeze(-1).abs()
-            >= 0.95 * yaw_limits[None, None, :]
+            iteration_yaw_raw.squeeze(-1).abs() >= 0.95 * yaw_limits[None, None, :]
         )
-        yaw_diagnostic_mask = (
-            matched_base[..., None] & iteration_support
-        )
+        yaw_diagnostic_mask = matched_base[..., None] & iteration_support
     yaw_loss_weight = (
         cfg.shape_loss_weight
         if cfg.yaw_update_mode == "legacy_shared"
         else cfg.yaw_loss_weight
     )
-    return {
+    losses = {
         "loss_cl_shape_size_6": size_loss * cfg.shape_loss_weight,
         "loss_cl_shape_yaw_6": yaw_loss * yaw_loss_weight,
         "loss_cl_yaw_keep_6": yaw_keep_loss * cfg.yaw_keep_loss_weight,
@@ -729,28 +707,10 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         "cl_radial_gate_mean": record["radial_gate"].detach().mean(),
         "cl_radial_abs_mean": record["radial_safe"].detach().abs().mean(),
         "cl_tangent_abs_mean": (record["tangent_delta"].detach().abs().mean()),
-        "cl_center_baseline_error_mean": _selected_mean(
-            initial_distance, matched
-        ).detach(),
-        "cl_center_final_error_mean": _selected_mean(
-            final_center_error, matched
-        ).detach(),
-        "cl_center_improvement_rate": _selected_mean(
-            center_improved.to(final_reg.dtype), matched
-        ).detach(),
-        "cl_center_harm_rate": _selected_mean(
-            center_harmed.to(final_reg.dtype), matched
-        ).detach(),
-        "cl_center_gate_supervised_count": center_gate_supervised_count,
-        "cl_center_gate_positive_rate": (
-            center_gate_positive_count / center_gate_supervised_count.clamp_min(1.0)
-        ),
         "cl_yaw_baseline_error_mean": _selected_mean(
             baseline_yaw_error, matched
         ).detach(),
-        "cl_yaw_final_error_mean": _selected_mean(
-            final_yaw_error, matched
-        ).detach(),
+        "cl_yaw_final_error_mean": _selected_mean(final_yaw_error, matched).detach(),
         "cl_yaw_improvement_rate": _selected_mean(
             yaw_improved.to(final_reg.dtype), matched
         ).detach(),
@@ -768,6 +728,29 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         "cl_range_distribution_std_mean": (record["distribution_std"].detach().mean()),
         "cl_quality_delta_abs_mean": (record["quality_delta"].detach().abs().mean()),
     }
+    if cfg.center_target_mode == "fixed_base":
+        losses.update(
+            {
+                "cl_center_baseline_error_mean": _selected_mean(
+                    initial_distance, matched
+                ).detach(),
+                "cl_center_final_error_mean": _selected_mean(
+                    final_center_error, matched
+                ).detach(),
+                "cl_center_improvement_rate": _selected_mean(
+                    center_improved.to(final_reg.dtype), matched
+                ).detach(),
+                "cl_center_harm_rate": _selected_mean(
+                    center_harmed.to(final_reg.dtype), matched
+                ).detach(),
+                "cl_center_gate_supervised_count": center_gate_supervised_count,
+                "cl_center_gate_positive_rate": (
+                    center_gate_positive_count
+                    / center_gate_supervised_count.clamp_min(1.0)
+                ),
+            }
+        )
+    return losses
 
 
 __all__ = [

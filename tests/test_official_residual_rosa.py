@@ -127,6 +127,7 @@ def test_fixed_base_v4_changes_only_the_center_frame_contract() -> None:
         "center_target_mode": "fixed_base",
     }
     assert fixed_base.train_cfg.max_epochs == 30
+    assert fixed_base.sealed_resume_contract == sequential.sealed_resume_contract
     assert fixed_base.experiment_contract.refined_queries == 50
     assert fixed_base.experiment_contract.refinement_steps == 1
     assert fixed_base.experiment_contract.learned_refiner_parameters == 87_935

@@ -52,7 +52,7 @@ def _stable_source_identity(monkeypatch):
     monkeypatch.setattr(run_tool, "_current_source_identity", _source_identity)
 
 
-def _config(*, role: str = "candidate") -> Config:
+def _config(*, role: str = "candidate", fixed_base: bool = False) -> Config:
     head_type = {
         "candidate": "ROSAOfficialResidualRefinementHead",
         "control": "ROSAOfficialResidualNativeBaselineHead",
@@ -60,6 +60,8 @@ def _config(*, role: str = "candidate") -> Config:
     head = {"type": head_type}
     if role == "candidate":
         head["rosa_cfg"] = {"profile": "fast"}
+        if fixed_base:
+            head["rosa_cfg"]["center_target_mode"] = "fixed_base"
     else:
         head["rosa_cfg"] = None
     return Config(
@@ -216,8 +218,8 @@ def _scheduler_state(*, horizon: int = 3000, progress: int = 800) -> list[dict]:
     ]
 
 
-def _checkpoint(*, training_state: bool = True) -> dict:
-    config = _config()
+def _checkpoint(*, training_state: bool = True, fixed_base: bool = False) -> dict:
+    config = _config(fixed_base=fixed_base)
     state = _model_state()
     metadata = run_tool._checkpoint_contract_metadata(config)
     assert metadata is not None
@@ -256,6 +258,38 @@ def test_exact_candidate_checkpoint_accepts_full_resume_state(tmp_path: Path):
     assert payload["model_state"]["sidecar_key_count"] > 0
     assert payload["optimizer_state"]["group_count"] == 2
     assert payload["scheduler_state"]["scheduler_count"] == 2
+
+
+def test_fixed_base_checkpoint_resumes_only_with_its_resolved_config(tmp_path: Path):
+    fixed_path = tmp_path / "fixed_base_epoch_8.pth"
+    _save(fixed_path, _checkpoint(fixed_base=True))
+    assert (
+        run_tool._validate_checkpoint_contract(
+            fixed_path,
+            _config(fixed_base=True),
+            allow_mismatch=False,
+            require_resume_state=True,
+        )
+        is not None
+    )
+
+    with pytest.raises(ValueError, match="config sha256"):
+        run_tool._validate_checkpoint_contract(
+            fixed_path,
+            _config(),
+            allow_mismatch=False,
+            require_resume_state=True,
+        )
+
+    sequential_path = tmp_path / "sequential_epoch_8.pth"
+    _save(sequential_path, _checkpoint())
+    with pytest.raises(ValueError, match="config sha256"):
+        run_tool._validate_checkpoint_contract(
+            sequential_path,
+            _config(fixed_base=True),
+            allow_mismatch=False,
+            require_resume_state=True,
+        )
 
 
 def test_wrong_c0_or_control_head_cannot_resume_candidate(tmp_path: Path):

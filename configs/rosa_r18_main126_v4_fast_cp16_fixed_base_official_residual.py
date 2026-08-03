@@ -15,7 +15,7 @@ model = dict(
 work_dir = "work_dirs/rosa_r18_main126_v4_fast_cp16_fixed_base_official_residual"
 
 sealed_resume_contract = dict(
-    contract="rosa.c32-fast-cp16-fixed-base.30e-pair.v1",
+    contract="rosa.c32-fast-cp16.30e-pair.v1",
     role="candidate",
 )
 

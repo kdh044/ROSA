@@ -342,6 +342,27 @@ def test_checkpoint_contract_rejects_box_coordinate_geometry(tmp_path: Path):
         )
 
 
+def test_checkpoint_contract_rejects_a_different_center_frame(tmp_path: Path):
+    checkpoint = tmp_path / "wrong_center_frame.pth"
+    target = _config("balanced")
+    source_config = run_tool._effective_rosa_config(target)
+    assert source_config.center_target_mode == "sequential"
+    metadata = run_tool._checkpoint_contract_metadata(target)
+    assert metadata is not None
+    metadata["rosa_config"] = {
+        **source_config.__dict__,
+        "center_target_mode": "fixed_base",
+    }
+    _save_factorized_checkpoint(checkpoint, metadata=metadata)
+
+    with pytest.raises(ValueError, match="box-coordinate geometry"):
+        run_tool._validate_checkpoint_contract(
+            checkpoint,
+            target,
+            allow_mismatch=False,
+        )
+
+
 def test_checkpoint_contract_fails_closed_without_metadata(tmp_path: Path):
     checkpoint = tmp_path / "unknown_rosa.pth"
     _save_checkpoint(checkpoint, has_rosa=True)

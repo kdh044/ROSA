@@ -49,7 +49,7 @@ _ROSA_TOPOLOGY_FIELDS = (
     "num_levels",
     "enable_quality_score",
 )
-_ROSA_GEOMETRY_FIELDS = ("anchor_z_is_bottom",)
+_ROSA_GEOMETRY_FIELDS = ("anchor_z_is_bottom", "center_target_mode")
 _ROSA_REFINER_STATE_PREFIXES = {
     "modern": "head.rosa_refiner.",
     "legacy": "head.canonical_sixth_block.",
