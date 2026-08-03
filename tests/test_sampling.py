@@ -9,6 +9,7 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from rosa.observation import (
     _can_use_prepared_multiscale,
+    _can_use_streaming_multiscale,
     _sample_multiscale_features_prepared_inference,
     sample_multiscale_features,
 )
@@ -27,8 +28,14 @@ def _released_multiscale(fpn, uv, query, sampler, level_head):
 
 
 def _raw_equal(left, right):
-    integer_dtype = torch.int32 if left.dtype == torch.float32 else torch.int64
-    return torch.equal(left.view(integer_dtype), right.view(integer_dtype))
+    return bool(
+        left.dtype == right.dtype
+        and left.shape == right.shape
+        and torch.equal(
+            left.detach().contiguous().view(torch.uint8),
+            right.detach().contiguous().view(torch.uint8),
+        )
+    )
 
 
 def _prepared_fixture():
@@ -39,6 +46,60 @@ def _prepared_fixture():
     uv = torch.rand(1, 5, 4, 13, 2, generator=generator)
     query = torch.randn(1, 5, 8, generator=generator)
     return fpn, uv, query, torch.nn.Linear(8, 4), FusedBilinearSampler().eval()
+
+
+def _streaming_fixture(
+    dtype=torch.float32,
+    *,
+    noncontiguous=False,
+    tied_weights=False,
+):
+    generator = torch.Generator().manual_seed(91_817)
+    fpn = [
+        torch.randn(1, 4, 8, size, size, generator=generator).to(dtype)
+        for size in (8, 6, 4, 2)
+    ]
+    uv = torch.rand(1, 7, 4, 13, 2, generator=generator).to(dtype)
+    uv[0, 6, 0, :4].copy_(
+        torch.tensor(
+            (
+                (float("nan"), float("inf")),
+                (float("-inf"), -0.0),
+                (0.0, 1.0),
+                (-1.0, 2.0),
+            ),
+            dtype=dtype,
+        )
+    )
+    fpn[0][0, 0, 0, 0, 0] = float("nan")
+    fpn[1][0, 1, 1, 0, 0] = float("inf")
+    fpn[2][0, 2, 2, 0, 0] = float("-inf")
+    fpn[3][0, 3, 3, 0, 0] = -0.0
+    uv[0, 0, 0, 0] = 0.5 / 8.0
+    uv[0, 1, 1, 1] = 0.5 / 6.0
+    uv[0, 2, 2, 2] = 0.5 / 4.0
+    uv[0, 3, 3, 3] = 0.5 / 2.0
+    if noncontiguous:
+        fpn = [feature.transpose(-1, -2) for feature in fpn]
+        uv_storage = torch.empty(*uv.shape[:-1], 4, dtype=dtype)
+        uv_storage[..., ::2].copy_(uv)
+        uv = uv_storage[..., ::2]
+        assert not uv.is_contiguous()
+        assert all(not feature.is_contiguous() for feature in fpn)
+    query = torch.randn(1, 7, 8, generator=generator)
+    level_head = torch.nn.Linear(8, 4).eval()
+    if tied_weights:
+        with torch.no_grad():
+            level_head.weight.zero_()
+            level_head.bias.zero_()
+    return fpn, uv, query, level_head, FusedBilinearSampler().eval()
+
+
+def _stacked_prepared_weighted(fpn, uv, query, level_head, sampler):
+    levels = sampler._sample_multiscale_prepared_stacked(fpn, uv.unsqueeze(4))
+    weights = torch.softmax(level_head(query).float(), dim=-1).to(levels.dtype)
+    levels.mul_(weights[:, :, :, None, None, None])
+    return levels.sum(dim=2)
 
 
 def _capture_compiled(fpn, uv, query, level_head, sampler):
@@ -450,6 +511,391 @@ def test_direct_level_buffer_matches_stack_under_cpu_autocast():
 
     assert expected.dtype == torch.float32
     assert actual.dtype == expected.dtype
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize("dtype", (torch.float32, torch.float16, torch.bfloat16))
+@pytest.mark.parametrize("noncontiguous", (False, True))
+@pytest.mark.parametrize("tied_weights", (False, True))
+def test_streaming_sampling_is_exact_or_falls_back_to_stacked(
+    dtype,
+    noncontiguous,
+    tied_weights,
+):
+    fpn, uv, query, level_head, sampler = _streaming_fixture(
+        dtype,
+        noncontiguous=noncontiguous,
+        tied_weights=tied_weights,
+    )
+    fpn_before = tuple(feature.clone() for feature in fpn)
+    uv_before = uv.clone()
+    query_before = query.clone()
+    autocast = (
+        torch.autocast("cpu", dtype=dtype)
+        if dtype is not torch.float32
+        else torch.autocast("cpu", enabled=False)
+    )
+    with torch.no_grad(), autocast:
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+        admitted = _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+
+    assert admitted is (dtype is torch.float32 and not noncontiguous)
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+    assert all(_raw_equal(feature, before) for feature, before in zip(fpn, fpn_before))
+    assert _raw_equal(uv, uv_before)
+    assert _raw_equal(query, query_before)
+
+
+def test_private_eager_uses_streaming_without_the_stacked_level_buffer():
+    fpn, uv, query, level_head, sampler = _streaming_fixture(tied_weights=True)
+    codes = {
+        "prepared_tuple": type(sampler)._sample_multiscale_prepared.__code__,
+        "prepared_stacked": type(sampler)._sample_multiscale_prepared_stacked.__code__,
+        "prepared_streaming": (
+            type(sampler)._sample_multiscale_prepared_weighted_streaming.__code__
+        ),
+    }
+    calls = {name: 0 for name in codes}
+
+    def profile(frame, event, _arg):
+        if event == "call":
+            for name, code in codes.items():
+                if frame.f_code is code:
+                    calls[name] += 1
+        return profile
+
+    with torch.no_grad():
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+        previous_profile = sys.getprofile()
+        sys.setprofile(profile)
+        try:
+            actual = _sample_multiscale_features_prepared_inference(
+                fpn,
+                uv,
+                query,
+                sampler,
+                level_head,
+            )
+        finally:
+            sys.setprofile(previous_profile)
+
+    assert calls == {
+        "prepared_tuple": 0,
+        "prepared_stacked": 0,
+        "prepared_streaming": 1,
+    }
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_streaming_helper_has_four_samples_and_no_stack_or_sum():
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    weights = torch.softmax(level_head(query).float(), dim=-1)
+
+    class OperationLog(TorchDispatchMode):
+        def __init__(self):
+            super().__init__()
+            self.operations = []
+
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            self.operations.append(str(func))
+            return func(*args, **(kwargs or {}))
+
+    operation_log = OperationLog()
+    with torch.no_grad(), operation_log:
+        sampler._sample_multiscale_prepared_weighted_streaming(
+            fpn,
+            uv.unsqueeze(4),
+            weights,
+        )
+    operations = operation_log.operations
+    assert sum("grid_sampler_2d" in name for name in operations) == 4
+    assert operations.count("aten.mul_.Tensor") == 4
+    assert operations.count("aten.add_.Tensor") == 3
+    assert operations.count("aten.copy_.default") == 1
+    assert not any("aten.stack" in name for name in operations)
+    assert not any("aten.sum.dim_IntList" in name for name in operations)
+
+
+def test_streaming_helper_releases_each_grid_result_before_the_next(monkeypatch):
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    weights = torch.softmax(level_head(query).float(), dim=-1)
+    released_grid_sample = torch.nn.functional.grid_sample
+    prior_results = []
+
+    def tracked_grid_sample(*args, **kwargs):
+        assert all(reference() is None for reference in prior_results)
+        result = released_grid_sample(*args, **kwargs)
+        prior_results.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(torch.nn.functional, "grid_sample", tracked_grid_sample)
+    with torch.no_grad():
+        sampler._sample_multiscale_prepared_weighted_streaming(
+            fpn,
+            uv.unsqueeze(4),
+            weights,
+        )
+    assert len(prior_results) == 4
+    assert all(reference() is None for reference in prior_results)
+
+
+def test_streaming_method_override_falls_back_before_invocation(monkeypatch):
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    with torch.no_grad():
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden streaming sampler executed")
+
+    monkeypatch.setattr(
+        sampler,
+        "_sample_multiscale_prepared_weighted_streaming",
+        must_not_run,
+    )
+    with torch.no_grad():
+        assert not _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("owner", "helper_name"),
+    (
+        (torch.nn.functional, "grid_sample"),
+        (torch, "softmax"),
+        (torch.Tensor, "float"),
+        (torch.Tensor, "to"),
+        (torch.Tensor, "mul_"),
+        (torch.Tensor, "sum"),
+        (torch.Tensor, "new_empty"),
+        (torch.Tensor, "copy_"),
+    ),
+)
+def test_streaming_preserves_overridden_stacked_helpers(
+    owner,
+    helper_name,
+    monkeypatch,
+):
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    with torch.no_grad():
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+    released = getattr(owner, helper_name)
+    calls = []
+
+    def observed(*args, **kwargs):
+        calls.append(True)
+        return released(*args, **kwargs)
+
+    monkeypatch.setattr(owner, helper_name, observed)
+    with torch.no_grad():
+        assert not _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert calls
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+@pytest.mark.parametrize(
+    ("owner", "helper_name"),
+    ((torch, "empty"), (torch.Tensor, "add_")),
+)
+def test_streaming_falls_back_before_overridden_new_helpers(
+    owner,
+    helper_name,
+    monkeypatch,
+):
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    with torch.no_grad():
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden streaming-only helper executed")
+
+    monkeypatch.setattr(owner, helper_name, must_not_run)
+    with torch.no_grad():
+        assert not _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_streaming_preserves_level_head_hooks():
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    with torch.no_grad():
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+    calls = []
+    handle = level_head.register_forward_hook(lambda *_args: calls.append(True))
+    try:
+        with torch.no_grad():
+            assert not _can_use_streaming_multiscale(
+                fpn,
+                uv,
+                query,
+                sampler,
+                level_head,
+            )
+            actual = _sample_multiscale_features_prepared_inference(
+                fpn,
+                uv,
+                query,
+                sampler,
+                level_head,
+            )
+    finally:
+        handle.remove()
+    assert calls == [True]
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_streaming_falls_back_under_cpu_autocast():
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    with torch.no_grad(), torch.autocast("cpu", dtype=torch.bfloat16):
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+        assert not _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    assert actual.stride() == expected.stride()
+    assert _raw_equal(actual, expected)
+
+
+def test_streaming_fails_closed_before_overridden_autocast_state(monkeypatch):
+    fpn, uv, query, level_head, sampler = _streaming_fixture()
+    with torch.no_grad():
+        expected = _stacked_prepared_weighted(
+            fpn,
+            uv,
+            query,
+            level_head,
+            sampler,
+        )
+
+    def must_not_run(*_args, **_kwargs):
+        raise AssertionError("overridden autocast-state helper executed")
+
+    monkeypatch.setattr(torch, "is_autocast_enabled", must_not_run)
+    with torch.no_grad():
+        assert not _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+        actual = _sample_multiscale_features_prepared_inference(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
     assert actual.stride() == expected.stride()
     assert _raw_equal(actual, expected)
 

@@ -62,6 +62,23 @@ _RELEASED_FUSED_SAMPLER_FORWARD = FusedBilinearSampler.forward
 _RELEASED_PREPARE_GRID = FusedBilinearSampler._prepare_grid
 _RELEASED_PREPARED_MULTISCALE = FusedBilinearSampler._sample_multiscale_prepared
 _RELEASED_PREPARED_STACKED = FusedBilinearSampler._sample_multiscale_prepared_stacked
+_RELEASED_PREPARED_STREAMING = (
+    FusedBilinearSampler._sample_multiscale_prepared_weighted_streaming
+)
+_RELEASED_MODULE_CALL = nn.Module.__call__
+_RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
+_RELEASED_LINEAR_FORWARD = nn.Linear.forward
+_RELEASED_GRID_SAMPLE = F.grid_sample
+_RELEASED_TORCH_SOFTMAX = torch.softmax
+_RELEASED_TENSOR_FLOAT = torch.Tensor.float
+_RELEASED_TENSOR_TO = torch.Tensor.to
+_RELEASED_TENSOR_MUL_INPLACE = torch.Tensor.mul_
+_RELEASED_TENSOR_SUM = torch.Tensor.sum
+_RELEASED_TENSOR_NEW_EMPTY = torch.Tensor.new_empty
+_RELEASED_TORCH_EMPTY = torch.empty
+_RELEASED_TENSOR_COPY_INPLACE = torch.Tensor.copy_
+_RELEASED_TENSOR_ADD_INPLACE = torch.Tensor.add_
+_RELEASED_IS_AUTOCAST_ENABLED = torch.is_autocast_enabled
 # This isolated candidate branch enables the eager optimization for sealed
 # CUDA A/B validation.  Promotion to the release branch still requires raw-bit
 # full-model parity plus the preregistered latency and memory gates.
@@ -530,6 +547,105 @@ def _can_use_prepared_multiscale(
     return True
 
 
+def _can_use_streaming_multiscale(
+    fpn: Sequence[Tensor],
+    uv: Tensor,
+    query: Tensor,
+    sampler: nn.Module,
+    level_head: nn.Linear,
+) -> bool:
+    """Seal streaming reduction to the released hook-free eager boundary."""
+
+    if torch.is_autocast_enabled is not _RELEASED_IS_AUTOCAST_ENABLED:
+        return False
+    try:
+        cuda_autocast = torch.is_autocast_enabled()
+        try:
+            cpu_autocast = torch.is_autocast_enabled("cpu")
+        except TypeError:  # PyTorch 2.1 compatibility.
+            cpu_autocast_state = getattr(torch, "is_autocast_cpu_enabled", None)
+            if not callable(cpu_autocast_state):
+                return False
+            cpu_autocast = cpu_autocast_state()
+    except Exception:
+        return False
+    if (
+        type(cuda_autocast) is not bool
+        or type(cpu_autocast) is not bool
+        or cuda_autocast
+        or cpu_autocast
+    ):
+        return False
+    if not _can_use_prepared_multiscale(
+        fpn,
+        uv,
+        sampler,
+        private_eager_inference=True,
+    ):
+        return False
+    modules = (sampler, level_head)
+    if (
+        torch._dynamo.is_compiling()
+        or "_sample_multiscale_prepared_weighted_streaming" in sampler.__dict__
+        or type(sampler)._sample_multiscale_prepared_weighted_streaming
+        is not _RELEASED_PREPARED_STREAMING
+        or type(level_head) is not nn.Linear
+        or level_head.training
+        or getattr(level_head, "_compiled_call_impl", None) is not None
+        or "forward" in level_head.__dict__
+        or type(level_head).forward is not _RELEASED_LINEAR_FORWARD
+        or level_head.out_features != len(fpn)
+        or level_head.bias is None
+        or type(query) is not torch.Tensor
+        or query.ndim != 3
+        or query.shape[:2] != (fpn[0].shape[0], uv.shape[1])
+        or query.shape[-1] != level_head.in_features
+        or query.layout != torch.strided
+        or query.is_quantized
+        or query.requires_grad
+        or query.device != uv.device
+        or query.device.type not in ("cpu", "cuda")
+        or any(name is not None for name in query.names)
+        or any(
+            "__call__" in module.__dict__
+            or type(module).__call__ is not _RELEASED_MODULE_CALL
+            or "_call_impl" in module.__dict__
+            or type(module)._call_impl is not _RELEASED_MODULE_CALL_IMPL
+            or getattr(module, "_compiled_call_impl", None) is not None
+            or module._forward_pre_hooks
+            or module._forward_hooks
+            or module._backward_pre_hooks
+            or module._backward_hooks
+            for module in modules
+        )
+        or torch.nn.modules.module._global_backward_pre_hooks
+        or torch.nn.modules.module._global_backward_hooks
+        or F.grid_sample is not _RELEASED_GRID_SAMPLE
+        or torch.softmax is not _RELEASED_TORCH_SOFTMAX
+        or torch.Tensor.float is not _RELEASED_TENSOR_FLOAT
+        or torch.Tensor.to is not _RELEASED_TENSOR_TO
+        or torch.Tensor.mul_ is not _RELEASED_TENSOR_MUL_INPLACE
+        or torch.Tensor.sum is not _RELEASED_TENSOR_SUM
+        or torch.Tensor.new_empty is not _RELEASED_TENSOR_NEW_EMPTY
+        or torch.empty is not _RELEASED_TORCH_EMPTY
+        or torch.Tensor.copy_ is not _RELEASED_TENSOR_COPY_INPLACE
+        or torch.Tensor.add_ is not _RELEASED_TENSOR_ADD_INPLACE
+    ):
+        return False
+
+    parameters = (level_head.weight, level_head.bias)
+    tensors = (*fpn, uv, query, *parameters)
+    return bool(
+        all(type(parameter) is nn.Parameter for parameter in parameters)
+        and all(tensor.device == query.device for tensor in tensors)
+        and all(tensor.layout == torch.strided for tensor in tensors)
+        and all(not tensor.is_quantized for tensor in tensors)
+        and all(tensor.is_contiguous() for tensor in tensors)
+        and all(all(name is None for name in tensor.names) for tensor in tensors)
+        and all(tensor.dtype is torch.float32 for tensor in tensors)
+    )
+
+
 def _sample_multiscale_features_impl(
     fpn: Sequence[Tensor],
     uv: Tensor,
@@ -552,6 +668,28 @@ def _sample_multiscale_features_impl(
         sampler,
         private_eager_inference=private_prepared_inference,
     )
+    streaming = bool(
+        prepared
+        and private_prepared_inference
+        and not torch._dynamo.is_compiling()
+        and _can_use_streaming_multiscale(
+            fpn,
+            uv,
+            query,
+            sampler,
+            level_head,
+        )
+    )
+    if streaming:
+        weights = torch.softmax(
+            level_head(query).float(),
+            dim=-1,
+        )
+        return sampler._sample_multiscale_prepared_weighted_streaming(
+            fpn,
+            sample_uv,
+            weights,
+        )
     if prepared and private_prepared_inference and not torch._dynamo.is_compiling():
         # The final contiguous level tensor is private to this hook-free eager
         # path.  Fill it level by level so four grid-sample outputs are not all

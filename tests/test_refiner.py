@@ -242,6 +242,9 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
         "direct_level_buffer": type(
             stage.sampler
         )._sample_multiscale_prepared_stacked.__code__,
+        "streaming_level_reduction": type(
+            stage.sampler
+        )._sample_multiscale_prepared_weighted_streaming.__code__,
         "owned_rfl_delta": rfl_module._mask_cast_and_add_owned_delta.__code__,
         "prepared_rfl_basis": rfl_module._prepared_compact_basis_and_valid.__code__,
         "single_ocam_transform": (
@@ -307,7 +310,7 @@ def test_cumulative_eager_optimizations_match_forced_parent_fallback_raw_exact(
 
     assert candidate_calls == Counter(
         {
-            "direct_level_buffer": 2,
+            "streaming_level_reduction": 2,
             "owned_rfl_delta": 2,
             "prepared_rfl_basis": 2,
             "single_ocam_transform": 2,

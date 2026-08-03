@@ -217,5 +217,73 @@ class FusedBilinearSampler(nn.Module):
         assert levels is not None
         return levels
 
+    def _sample_multiscale_prepared_weighted_streaming(
+        self,
+        features: Sequence[Tensor],
+        uv: Tensor,
+        weights: Tensor,
+    ) -> Tensor:
+        """Sample, weight, and reduce one prepared FPN level at a time.
+
+        This is an experimental eager inference carrier. Its released caller
+        admits only FP32 because low-precision CUDA reductions do not preserve
+        the stacked path's raw bits.
+        """
+
+        batch, cameras, channels = features[0].shape[:3]
+        grid, (queries, samples, patch) = self._prepare_grid(
+            uv,
+            batch,
+            cameras,
+        )
+        if patch != 1:
+            raise ValueError("streaming multiscale sampling requires one patch point")
+        if weights.shape != (batch, queries, len(features)):
+            raise ValueError("streaming multiscale weights are misaligned")
+
+        accumulator = None
+        typed_weights = None
+        output_shape = (batch, queries, cameras, samples, channels)
+        for level_index, feature in enumerate(features):
+            height, width = feature.shape[-2:]
+            sampled = F.grid_sample(
+                feature.reshape(batch * cameras, channels, height, width),
+                grid,
+                mode="bilinear",
+                padding_mode="zeros",
+                align_corners=False,
+            )
+            sampled = (
+                sampled.reshape(
+                    batch,
+                    cameras,
+                    channels,
+                    queries,
+                    samples,
+                    patch,
+                )
+                .permute(0, 3, 1, 4, 5, 2)
+                .squeeze(4)
+            )
+            if accumulator is None:
+                if sampled.dtype is not torch.float32:
+                    raise RuntimeError("streaming multiscale sampling requires FP32")
+                typed_weights = weights.to(dtype=sampled.dtype)
+            assert typed_weights is not None
+            sampled.mul_(typed_weights[:, :, level_index, None, None, None])
+            if accumulator is None:
+                accumulator = torch.empty(
+                    output_shape,
+                    dtype=sampled.dtype,
+                    device=sampled.device,
+                )
+                accumulator.copy_(sampled)
+            else:
+                accumulator.add_(sampled)
+            del sampled
+
+        assert accumulator is not None
+        return accumulator
+
 
 __all__ = ["DeterministicBilinearSampler", "FusedBilinearSampler"]
