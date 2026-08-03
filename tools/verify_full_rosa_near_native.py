@@ -12,9 +12,11 @@ input, rejects a non-default current stream and concurrent GPU processes, then
 measures the exact same captured batches in one isolated native/compiled-fast,
 native/compiled-fast-bounded, native/eager-fast, or native/balanced paired
 alternating protocol.  The bounded arm is a separately labelled benchmark-only
-route: ranking and score fields remain raw-exact while decoded box floats use a
-fixed tight tolerance, and official full-metric parity remains mandatory before
-promotion.  The default native detector is C0; ``--detector-pair c32`` selects
+route: output rows are matched by query ID, their labels and instance IDs remain
+exact, and probabilities plus decoded boxes use fixed unit-based absolute
+tolerances.  An eager-repeat baseline is recorded, and official full-metric
+parity remains mandatory before promotion.  The default native detector is C0;
+``--detector-pair c32`` selects
 the exact official-residual C32 head on both sides of the ROSA-only derivation.
 Candidate variants are deliberately separate process invocations with separate
 output directories.
@@ -72,23 +74,49 @@ BOUNDED_PARITY_COMPILED_ARMS = frozenset((FAST_COMPILED_BOUNDED_ARM,))
 RAW_EXACT_FAST_COMPILE_MODE = "reduce-overhead"
 BOUNDED_FAST_COMPILE_MODE = "max-autotune-no-cudagraphs"
 COMPILED_FAST_FULLGRAPH = False
-COMPILED_BOUNDED_BOX_MAX_ABS = 1.0e-5
-COMPILED_BOUNDED_BOX_MAX_REL = 1.0e-5
-COMPILED_BOUNDED_BOX_RELATIVE_FLOOR = 1.0e-12
-COMPILED_BOUNDED_BOX_FIELDS = ("bboxes_3d",)
-COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS = (
+COMPILED_BOUNDED_QUERY_FIELD = "query_indices"
+COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS = (
+    "labels_3d",
+    "instance_ids",
+)
+COMPILED_BOUNDED_SCORE_FIELDS = (
     "scores_3d",
     "cls_scores",
 )
-COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS = (
-    "labels_3d",
-    "query_indices",
-    "instance_ids",
+COMPILED_BOUNDED_BOX_FIELD = "bboxes_3d"
+COMPILED_BOUNDED_BOX_COMPONENTS = (
+    "x_m",
+    "y_m",
+    "z_m",
+    "width_m",
+    "length_m",
+    "height_m",
+    "yaw_rad",
+    "vx_m_per_s",
+    "vy_m_per_s",
+    "vz_m_per_s",
 )
-COMPILED_BOUNDED_RAW_EXACT_FIELDS = (
-    *COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS,
-    *COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS,
-)
+COMPILED_BOUNDED_OUTPUT_COUNT = 50
+COMPILED_BOUNDED_QUERY_COUNT = 300
+COMPILED_BOUNDED_SCORE_MAX_ABS = {
+    "scores_3d": 3.5e-6,
+    "cls_scores": 4.0e-6,
+}
+COMPILED_BOUNDED_BOX_MAX_ABS = 3.0e-3
+COMPILED_BOUNDED_NUMERICAL_TIE_MAX_GAP = 7.0e-6
+# The fixed ceilings are the deterministic eager-repeat maxima plus at most a
+# 1.5x envelope; no value is calibrated from the candidate under test.
+COMPILED_BOUNDED_CALIBRATION_SCREEN = {
+    "route": "eager_vs_eager",
+    "passes": 4,
+    "pairs": 6,
+    "observed_max_abs": {
+        "scores_3d": 2.3134053e-6,
+        "cls_scores": 2.6524067e-6,
+        "bboxes_3d": 1.82723999e-3,
+    },
+    "maximum_envelope_multiplier": 1.5,
+}
 INDUCTOR_COMPILE_TASK_MODULE_PREFIX = "torch._inductor.runtime.compile_tasks."
 WARMUP_ITERATIONS_PER_ARM = 60
 MEASURED_ITERATIONS_PER_ARM = 300
@@ -463,15 +491,46 @@ def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
     if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
         return {
             "applicable": True,
-            "mode": "raw_exact_ranking_and_scores_bounded_box_floats_v1",
+            "mode": "query_aligned_fixed_absolute_tolerance_v2",
             "all_output_values_raw_exact": False,
-            "raw_exact_fields": list(COMPILED_BOUNDED_RAW_EXACT_FIELDS),
-            "bounded_box_fields": list(COMPILED_BOUNDED_BOX_FIELDS),
-            "box_thresholds": {
-                "max_abs_inclusive": COMPILED_BOUNDED_BOX_MAX_ABS,
-                "max_rel_inclusive": COMPILED_BOUNDED_BOX_MAX_REL,
-                "relative_denominator": ("max(abs(eager), abs(compiled), 1e-12)"),
+            "alignment_key": COMPILED_BOUNDED_QUERY_FIELD,
+            "exact_fields_after_alignment": list(
+                COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS
+            ),
+            "bounded_float_fields": [
+                *COMPILED_BOUNDED_SCORE_FIELDS,
+                COMPILED_BOUNDED_BOX_FIELD,
+            ],
+            "absolute_thresholds": {
+                **COMPILED_BOUNDED_SCORE_MAX_ABS,
+                "bboxes_3d_by_component": {
+                    name: COMPILED_BOUNDED_BOX_MAX_ABS
+                    for name in COMPILED_BOUNDED_BOX_COMPONENTS
+                },
             },
+            "threshold_basis": {
+                "decoded_box": "3 mm, 0.003 rad, or 3 mm/s by component unit",
+                "dynamic_candidate_calibration_forbidden": True,
+                "fixed_calibration_screen": copy.deepcopy(
+                    COMPILED_BOUNDED_CALIBRATION_SCREEN
+                ),
+            },
+            "query_contract": {
+                "count": COMPILED_BOUNDED_OUTPUT_COUNT,
+                "unique": True,
+                "inclusive_range": [0, COMPILED_BOUNDED_QUERY_COUNT - 1],
+                "set_exact_across_all_three_comparisons": True,
+            },
+            "rank_inversion_policy": {
+                "maximum_reference_score_gap": (COMPILED_BOUNDED_NUMERICAL_TIE_MAX_GAP),
+                "larger_gap_inversion_forbidden": True,
+            },
+            "required_comparisons": [
+                "eager_reference_a_vs_eager_reference_b",
+                "eager_reference_a_vs_compiled",
+                "eager_reference_b_vs_compiled",
+            ],
+            "rank_displacement_recorded": True,
             "benchmark_only": True,
             "official_full_metric_parity_required_before_promotion": True,
         }
@@ -1815,7 +1874,12 @@ def _capture_detached_cpu_parity_payload(verifier, torch, output):
     if not isinstance(output, Sequence) or isinstance(output, (str, bytes)):
         raise ProtocolError("parity payload requires a prediction sequence")
     payload = []
-    field_names = (*COMPILED_BOUNDED_BOX_FIELDS, *COMPILED_BOUNDED_RAW_EXACT_FIELDS)
+    field_names = (
+        COMPILED_BOUNDED_BOX_FIELD,
+        *COMPILED_BOUNDED_SCORE_FIELDS,
+        *COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS,
+        COMPILED_BOUNDED_QUERY_FIELD,
+    )
     for sample_index, sample in enumerate(output):
         fields = {}
         for name in field_names:
@@ -2437,7 +2501,7 @@ def _require_all_batch_compiled_parity(
 
 def _error_distribution_record(torch, values) -> dict[str, Any]:
     if values.ndim != 1 or not bool(torch.isfinite(values).all()):
-        raise ProtocolError("box parity errors must be a finite vector")
+        raise ProtocolError("parity errors must be a finite vector")
     count = int(values.numel())
     if not count:
         return {"count": 0, "max": 0.0, "mean": 0.0, "p99_nearest_rank": 0.0}
@@ -2451,30 +2515,180 @@ def _error_distribution_record(torch, values) -> dict[str, Any]:
     }
 
 
-def _paired_payload_values(torch, eager_payload, compiled_payload, field: str):
-    eager_values, compiled_values = [], []
-    for sample_index, (eager_sample, compiled_sample) in enumerate(
-        zip(eager_payload, compiled_payload)
+def _paired_sample_field(
+    torch,
+    reference_sample: Mapping[str, Any],
+    candidate_sample: Mapping[str, Any],
+    field: str,
+    *,
+    sample_index: int,
+    comparison_label: str,
+):
+    reference = _require_owned_cpu_tensor(
+        torch,
+        reference_sample.get(field),
+        f"{comparison_label} reference {field}[{sample_index}]",
+    )
+    candidate = _require_owned_cpu_tensor(
+        torch,
+        candidate_sample.get(field),
+        f"{comparison_label} candidate {field}[{sample_index}]",
+    )
+    if (
+        reference.dtype != candidate.dtype
+        or reference.shape != candidate.shape
+        or reference.stride() != candidate.stride()
     ):
-        if not isinstance(eager_sample, Mapping) or not isinstance(
-            compiled_sample, Mapping
-        ):
-            raise ProtocolError("bounded parity sample is not a mapping")
-        eager = _require_owned_cpu_tensor(
-            torch, eager_sample.get(field), f"eager {field}[{sample_index}]"
+        raise ProtocolError(
+            f"{comparison_label} changed {field} tensor schema in sample "
+            f"{sample_index}"
         )
-        compiled = _require_owned_cpu_tensor(
-            torch, compiled_sample.get(field), f"compiled {field}[{sample_index}]"
+    return reference, candidate
+
+
+def _query_aligned_sample(
+    torch,
+    reference_sample: Mapping[str, Any],
+    candidate_sample: Mapping[str, Any],
+    *,
+    sample_index: int,
+    comparison_label: str,
+):
+    if not isinstance(reference_sample, Mapping) or not isinstance(
+        candidate_sample, Mapping
+    ):
+        raise ProtocolError(f"{comparison_label} sample is not a mapping")
+    reference_query, candidate_query = _paired_sample_field(
+        torch,
+        reference_sample,
+        candidate_sample,
+        COMPILED_BOUNDED_QUERY_FIELD,
+        sample_index=sample_index,
+        comparison_label=comparison_label,
+    )
+    count = int(reference_query.numel())
+    if any(
+        value.ndim != 1
+        or value.dtype == torch.bool
+        or value.is_floating_point()
+        or value.is_complex()
+        for value in (reference_query, candidate_query)
+    ):
+        raise ProtocolError(f"{comparison_label} query_indices must be integral")
+    if count != COMPILED_BOUNDED_OUTPUT_COUNT:
+        raise ProtocolError(
+            f"{comparison_label} must contain exactly "
+            f"{COMPILED_BOUNDED_OUTPUT_COUNT} queries per sample"
         )
-        if (
-            eager.dtype != compiled.dtype
-            or eager.shape != compiled.shape
-            or eager.stride() != compiled.stride()
+    if any(
+        bool((value < 0).any()) or bool((value >= COMPILED_BOUNDED_QUERY_COUNT).any())
+        for value in (reference_query, candidate_query)
+    ):
+        raise ProtocolError(
+            f"{comparison_label} query_indices must be in [0, "
+            f"{COMPILED_BOUNDED_QUERY_COUNT - 1}]"
+        )
+    if any(
+        int(torch.unique(value).numel()) != count
+        for value in (reference_query, candidate_query)
+    ):
+        raise ProtocolError(
+            f"{comparison_label} query_indices must be unique in sample {sample_index}"
+        )
+    reference_order = torch.argsort(reference_query)
+    candidate_order = torch.argsort(candidate_query)
+    query_set = reference_query[reference_order]
+    if not torch.equal(query_set, candidate_query[candidate_order]):
+        raise ProtocolError(
+            f"{comparison_label} changed the query set in sample {sample_index}"
+        )
+
+    aligned = {}
+    for field in (
+        *COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS,
+        *COMPILED_BOUNDED_SCORE_FIELDS,
+        COMPILED_BOUNDED_BOX_FIELD,
+    ):
+        reference, candidate = _paired_sample_field(
+            torch,
+            reference_sample,
+            candidate_sample,
+            field,
+            sample_index=sample_index,
+            comparison_label=comparison_label,
+        )
+        if reference.ndim == 0 or int(reference.shape[0]) != count:
+            raise ProtocolError(
+                f"{comparison_label} {field} has no value for every query"
+            )
+        aligned[field] = (
+            reference[reference_order],
+            candidate[candidate_order],
+        )
+
+    exact = {}
+    for field in COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS:
+        reference, candidate = aligned[field]
+        if any(
+            value.ndim != 1
+            or value.dtype == torch.bool
+            or value.is_floating_point()
+            or value.is_complex()
+            for value in (reference, candidate)
         ):
-            raise ProtocolError(f"compiled bounded arm changed {field} schema")
-        eager_values.append(eager)
-        compiled_values.append(compiled)
-    return eager_values, compiled_values
+            raise ProtocolError(f"{comparison_label} {field} must be integral")
+        if not torch.equal(reference, candidate):
+            raise ProtocolError(
+                f"{comparison_label} changed query-aligned exact field {field} "
+                f"in sample {sample_index}"
+            )
+        exact[field] = reference
+
+    score_errors = {}
+    for field in COMPILED_BOUNDED_SCORE_FIELDS:
+        reference, candidate = aligned[field]
+        if reference.ndim != 1 or not reference.is_floating_point():
+            raise ProtocolError(f"{comparison_label} {field} must be a float vector")
+        if not bool(torch.isfinite(reference).all()) or not bool(
+            torch.isfinite(candidate).all()
+        ):
+            raise ProtocolError(f"{comparison_label} {field} contains NaN/Inf")
+        score_errors[field] = (candidate.double() - reference.double()).abs()
+
+    reference_rank = reference_order[:, None] - reference_order[None, :]
+    candidate_rank = candidate_order[:, None] - candidate_order[None, :]
+    inversions = torch.triu(reference_rank * candidate_rank < 0, diagonal=1)
+    reference_scores = aligned["scores_3d"][0].double()
+    inversion_gaps = (reference_scores[:, None] - reference_scores[None, :]).abs()[
+        inversions
+    ]
+    if bool((inversion_gaps > COMPILED_BOUNDED_NUMERICAL_TIE_MAX_GAP).any()):
+        raise ProtocolError(
+            f"{comparison_label} rank inversion crossed a non-tied score gap "
+            f"in sample {sample_index}"
+        )
+
+    reference_box, candidate_box = aligned[COMPILED_BOUNDED_BOX_FIELD]
+    expected_box_shape = (count, len(COMPILED_BOUNDED_BOX_COMPONENTS))
+    if (
+        tuple(reference_box.shape) != expected_box_shape
+        or not reference_box.is_floating_point()
+    ):
+        raise ProtocolError(
+            f"{comparison_label} decoded boxes must have shape {expected_box_shape}"
+        )
+    if not bool(torch.isfinite(reference_box).all()) or not bool(
+        torch.isfinite(candidate_box).all()
+    ):
+        raise ProtocolError(f"{comparison_label} decoded boxes contain NaN/Inf")
+    return {
+        "query_set": query_set,
+        "rank_displacement": (candidate_order - reference_order).abs().double(),
+        "rank_inversion_gaps": inversion_gaps,
+        "exact": exact,
+        "score_errors": score_errors,
+        "box_errors": (candidate_box.double() - reference_box.double()).abs(),
+    }
 
 
 def _require_all_batch_compiled_bounded_parity(
@@ -2486,8 +2700,12 @@ def _require_all_batch_compiled_bounded_parity(
     compiled_payload_by_batch: Mapping[str, Any],
     *,
     batch_count: int,
+    comparison_label: str = "eager_reference_vs_compiled",
 ) -> dict[str, Any]:
-    """Require raw-exact ranking/scores and tightly bounded box floats."""
+    """Match rows by query ID, then apply the immutable absolute-error gate."""
+
+    if not isinstance(comparison_label, str) or not comparison_label:
+        raise TypeError("comparison_label must be a non-empty string")
 
     expected_keys = {str(index) for index in range(batch_count)}
     mappings = (
@@ -2498,7 +2716,7 @@ def _require_all_batch_compiled_bounded_parity(
     )
     if any(set(mapping) != expected_keys for mapping in mappings):
         raise ProtocolError(
-            "bounded eager/compiled parity did not cover every captured batch"
+            f"{comparison_label} parity did not cover every captured batch"
         )
 
     parity = {}
@@ -2509,7 +2727,7 @@ def _require_all_batch_compiled_bounded_parity(
         if not isinstance(eager_record, Mapping) or not isinstance(
             compiled_record, Mapping
         ):
-            raise ProtocolError("bounded eager/compiled record is not a mapping")
+            raise ProtocolError(f"{comparison_label} record is not a mapping")
         for field in (
             "sample_count",
             "detections_per_sample",
@@ -2518,12 +2736,12 @@ def _require_all_batch_compiled_bounded_parity(
         ):
             if field not in eager_record or field not in compiled_record:
                 raise ProtocolError(
-                    f"bounded eager/compiled record lacks schema field {field}"
+                    f"{comparison_label} record lacks schema field {field}"
                 )
             if eager_record[field] != compiled_record[field]:
                 raise ProtocolError(
-                    "compiled bounded arm changed output schema/stream field "
-                    f"{field} for captured batch {batch_index}"
+                    f"{comparison_label} changed output schema/stream field {field} "
+                    f"for captured batch {batch_index}"
                 )
 
         eager_payload = eager_payload_by_batch[key]
@@ -2537,84 +2755,95 @@ def _require_all_batch_compiled_bounded_parity(
             or len(eager_payload) != eager_record["sample_count"]
         ):
             raise ProtocolError(
-                f"bounded parity payload shape drifted for captured batch {batch_index}"
+                f"{comparison_label} payload shape drifted for captured batch "
+                f"{batch_index}"
             )
 
-        exact_field_records = {}
-        for field in COMPILED_BOUNDED_RAW_EXACT_FIELDS:
-            eager_values, compiled_values = _paired_payload_values(
-                torch, eager_payload, compiled_payload, field
+        query_sets = []
+        rank_displacements = []
+        rank_inversion_gaps = []
+        exact_reference = {
+            field: [] for field in COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS
+        }
+        score_errors = {field: [] for field in COMPILED_BOUNDED_SCORE_FIELDS}
+        box_errors = []
+        for sample_index, (reference_sample, candidate_sample) in enumerate(
+            zip(eager_payload, compiled_payload)
+        ):
+            aligned = _query_aligned_sample(
+                torch,
+                reference_sample,
+                candidate_sample,
+                sample_index=sample_index,
+                comparison_label=comparison_label,
             )
-            if field in COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS:
-                if any(not value.is_floating_point() for value in eager_values):
-                    raise ProtocolError(f"score field {field} must be floating point")
-                if any(not bool(torch.isfinite(value).all()) for value in eager_values):
-                    raise ProtocolError(f"score field {field} contains NaN or Inf")
-            elif any(
-                value.is_floating_point() or value.is_complex()
-                for value in eager_values
-            ):
-                raise ProtocolError(f"integer field {field} changed type")
-            eager_fingerprint = verifier.raw_fingerprint(eager_values)
-            compiled_fingerprint = verifier.raw_fingerprint(compiled_values)
-            if eager_fingerprint != compiled_fingerprint:
-                raise ProtocolError(
-                    f"compiled bounded arm changed raw-exact field {field} "
-                    f"for captured batch {batch_index}"
-                )
-            exact_field_records[field] = {
-                "raw_exact": True,
-                "fingerprint": eager_fingerprint,
+            query_sets.append(aligned["query_set"])
+            rank_displacements.append(aligned["rank_displacement"])
+            rank_inversion_gaps.append(aligned["rank_inversion_gaps"])
+            for field in COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS:
+                exact_reference[field].append(aligned["exact"][field])
+            for field in COMPILED_BOUNDED_SCORE_FIELDS:
+                score_errors[field].append(aligned["score_errors"][field])
+            absolute = aligned["box_errors"]
+            box_errors.append(absolute.reshape(-1))
+
+        exact_field_records = {
+            field: {
+                "query_aligned_raw_exact": True,
+                "fingerprint": verifier.raw_fingerprint(values),
             }
+            for field, values in exact_reference.items()
+        }
+        bounded_field_records = {}
+        for field, errors in score_errors.items():
+            record = _error_distribution_record(torch, torch.cat(errors))
+            if record["max"] > COMPILED_BOUNDED_SCORE_MAX_ABS[field]:
+                raise ProtocolError(
+                    f"{comparison_label} exceeded {field} absolute tolerance in "
+                    f"captured batch {batch_index}: max_abs={record['max']}, "
+                    f"limit={COMPILED_BOUNDED_SCORE_MAX_ABS[field]}"
+                )
+            bounded_field_records[field] = {"absolute_error": record}
 
-        field = COMPILED_BOUNDED_BOX_FIELDS[0]
-        eager_values, compiled_values = _paired_payload_values(
-            torch, eager_payload, compiled_payload, field
-        )
-        if any(not value.is_floating_point() for value in eager_values):
-            raise ProtocolError(f"bounded box field {field} must be floating point")
-        eager_flat = torch.cat([value.double().reshape(-1) for value in eager_values])
-        compiled_flat = torch.cat(
-            [value.double().reshape(-1) for value in compiled_values]
-        )
-        if not bool(torch.isfinite(eager_flat).all()) or not bool(
-            torch.isfinite(compiled_flat).all()
-        ):
-            raise ProtocolError("bounded box payload contains NaN or Inf")
-        absolute = (compiled_flat - eager_flat).abs()
-        scale = torch.maximum(eager_flat.abs(), compiled_flat.abs()).clamp_min(
-            COMPILED_BOUNDED_BOX_RELATIVE_FLOOR
-        )
-        absolute_record = _error_distribution_record(torch, absolute)
-        relative_record = _error_distribution_record(torch, absolute / scale)
-        if (
-            absolute_record["max"] > COMPILED_BOUNDED_BOX_MAX_ABS
-            or relative_record["max"] > COMPILED_BOUNDED_BOX_MAX_REL
-        ):
+        aggregate_box_record = _error_distribution_record(torch, torch.cat(box_errors))
+        if aggregate_box_record["max"] > COMPILED_BOUNDED_BOX_MAX_ABS:
             raise ProtocolError(
-                "compiled bounded arm exceeded box tolerance for "
-                f"{field} in captured batch {batch_index}: "
-                f"max_abs={absolute_record['max']}, max_rel={relative_record['max']}"
+                f"{comparison_label} exceeded decoded-box absolute tolerance in "
+                f"captured batch {batch_index}: max_abs={aggregate_box_record['max']}, "
+                f"limit={COMPILED_BOUNDED_BOX_MAX_ABS}"
             )
+        bounded_field_records[COMPILED_BOUNDED_BOX_FIELD] = {
+            "absolute_error": aggregate_box_record,
+        }
+        rank_record = _error_distribution_record(torch, torch.cat(rank_displacements))
+        rank_record["changed_query_count"] = int(
+            torch.count_nonzero(torch.cat(rank_displacements)).item()
+        )
+        inversion_gaps = torch.cat(rank_inversion_gaps)
+        rank_record["inversion_count"] = int(inversion_gaps.numel())
+        rank_record["maximum_inversion_score_gap"] = (
+            float(inversion_gaps.max().item()) if inversion_gaps.numel() else 0.0
+        )
         parity[key] = {
-            "mode": "raw_exact_ranking_and_scores_bounded_box_floats_v1",
+            "mode": "query_aligned_fixed_absolute_tolerance_v2",
+            "comparison": comparison_label,
             "passed": True,
             "schema_and_stream_exact": True,
-            "raw_exact_fields": exact_field_records,
-            "bounded_box_fields": {
-                field: {
-                    "absolute_error": absolute_record,
-                    "relative_error": relative_record,
-                }
+            "query_alignment": {
+                "key": COMPILED_BOUNDED_QUERY_FIELD,
+                "query_set_exact": True,
+                "query_ids_unique_per_sample": True,
+                "fingerprint": verifier.raw_fingerprint(query_sets),
             },
-            "aggregate_box_error": {
-                "absolute_error": absolute_record,
-                "relative_error": relative_record,
-            },
-            "thresholds": {
-                "max_abs_inclusive": COMPILED_BOUNDED_BOX_MAX_ABS,
-                "max_rel_inclusive": COMPILED_BOUNDED_BOX_MAX_REL,
-                "relative_denominator_floor": (COMPILED_BOUNDED_BOX_RELATIVE_FLOOR),
+            "rank_displacement": rank_record,
+            "exact_fields_after_alignment": exact_field_records,
+            "bounded_float_fields": bounded_field_records,
+            "absolute_thresholds": {
+                **COMPILED_BOUNDED_SCORE_MAX_ABS,
+                "bboxes_3d_by_component": {
+                    name: COMPILED_BOUNDED_BOX_MAX_ABS
+                    for name in COMPILED_BOUNDED_BOX_COMPONENTS
+                },
                 "p99_definition": "nearest-rank ceil(0.99 * count)",
             },
             "owned_detached_cpu_payloads": True,
@@ -2926,6 +3155,9 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
 
         eager_candidate_preflight = None
         eager_candidate_payloads = None
+        eager_repeat_preflight = None
+        eager_repeat_payloads = None
+        eager_repeat_parity = None
         eager_candidate_rng = None
         eager_candidate_state = None
         timing_compile_invocation_attestation = None
@@ -2958,12 +3190,48 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 != eager_candidate_state
             ):
                 raise ProtocolError("eager fast preflight mutated model state")
+            if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
+                verifier._restore_rng(eager_candidate_rng)
+                (
+                    eager_repeat_preflight,
+                    eager_repeat_payloads,
+                ) = _candidate_preflight_by_batch(
+                    verifier,
+                    torch,
+                    models[candidate_arm],
+                    sources,
+                    device,
+                    candidate_arm,
+                    capture_detached_payload=True,
+                )
+                verifier.require_same_fingerprint(
+                    "second eager reference RNG",
+                    eager_candidate_rng,
+                    verifier._capture_rng(),
+                )
+                if (
+                    verifier.raw_fingerprint(models[candidate_arm].state_dict())
+                    != eager_candidate_state
+                ):
+                    raise ProtocolError(
+                        "second eager reference preflight mutated model state"
+                    )
+                eager_repeat_parity = _require_all_batch_compiled_bounded_parity(
+                    verifier,
+                    torch,
+                    eager_candidate_preflight,
+                    eager_repeat_preflight,
+                    eager_candidate_payloads,
+                    eager_repeat_payloads,
+                    batch_count=len(sources),
+                    comparison_label=("eager_reference_a_vs_eager_reference_b"),
+                )
             timing_compile_state_attestations.append(
                 _attest_candidate_compile_state(
                     models[candidate_arm],
                     candidate_arm,
                     expected_compiled=False,
-                    phase="after eager reference preflight",
+                    phase="after eager reference preflight(s)",
                 )
             )
             verifier._restore_rng(eager_candidate_rng)
@@ -3061,7 +3329,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                     batch_count=len(sources),
                 )
             elif candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
-                compiled_parity = _require_all_batch_compiled_bounded_parity(
+                compiled_vs_eager_a = _require_all_batch_compiled_bounded_parity(
                     verifier,
                     torch,
                     eager_candidate_preflight,
@@ -3069,10 +3337,36 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                     eager_candidate_payloads,
                     compiler_warmup_payloads,
                     batch_count=len(sources),
+                    comparison_label="eager_reference_a_vs_compiled",
                 )
-                eager_candidate_payloads.clear()
-                compiler_warmup_payloads.clear()
+                compiled_vs_eager_b = _require_all_batch_compiled_bounded_parity(
+                    verifier,
+                    torch,
+                    eager_repeat_preflight,
+                    compiler_warmup_by_batch,
+                    eager_repeat_payloads,
+                    compiler_warmup_payloads,
+                    batch_count=len(sources),
+                    comparison_label="eager_reference_b_vs_compiled",
+                )
+                compiled_parity = {
+                    "mode": "query_aligned_fixed_absolute_tolerance_v2",
+                    "passed": True,
+                    "comparisons": {
+                        "eager_reference_a_vs_eager_reference_b": (eager_repeat_parity),
+                        "eager_reference_a_vs_compiled": compiled_vs_eager_a,
+                        "eager_reference_b_vs_compiled": compiled_vs_eager_b,
+                    },
+                    "promotion_status": "PENDING_OFFICIAL_FULL_METRIC_PARITY",
+                }
+                for payload_mapping in (
+                    eager_candidate_payloads,
+                    eager_repeat_payloads,
+                    compiler_warmup_payloads,
+                ):
+                    payload_mapping.clear()
                 eager_candidate_payloads = None
+                eager_repeat_payloads = None
                 compiler_warmup_payloads = None
                 gc.collect()
                 parity_payload_release = {
@@ -3081,6 +3375,11 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                     "retained_output_containers": False,
                     "retained_cuda_or_cudagraph_storage": False,
                     "payload_mappings_cleared_before_recorded_timing": True,
+                    "released_payload_sets": [
+                        "eager_reference_a",
+                        "eager_reference_b",
+                        "compiled",
+                    ],
                 }
             else:
                 raise ProtocolError("compiled arm has no parity contract")

@@ -171,22 +171,47 @@ with tempfile.TemporaryDirectory() as raw_temp:
                 'fullgraph': False,
             }
             assert parity['mode'] == (
-                'raw_exact_ranking_and_scores_bounded_box_floats_v1'
+                'query_aligned_fixed_absolute_tolerance_v2'
             )
-            assert parity['box_thresholds'] == {
-                'max_abs_inclusive': 1e-5,
-                'max_rel_inclusive': 1e-5,
-                'relative_denominator': (
-                    'max(abs(eager), abs(compiled), 1e-12)'
-                ),
-            }
-            assert parity['raw_exact_fields'] == [
-                'scores_3d',
-                'cls_scores',
+            assert parity['alignment_key'] == 'query_indices'
+            assert parity['exact_fields_after_alignment'] == [
                 'labels_3d',
-                'query_indices',
                 'instance_ids',
             ]
+            assert parity['bounded_float_fields'] == [
+                'scores_3d',
+                'cls_scores',
+                'bboxes_3d',
+            ]
+            assert parity['absolute_thresholds'] == {
+                'scores_3d': 3.5e-6,
+                'cls_scores': 4e-6,
+                'bboxes_3d_by_component': {
+                    name: 0.003
+                    for name in module.COMPILED_BOUNDED_BOX_COMPONENTS
+                },
+            }
+            assert parity['query_contract'] == {
+                'count': 50,
+                'unique': True,
+                'inclusive_range': [0, 299],
+                'set_exact_across_all_three_comparisons': True,
+            }
+            assert parity['rank_inversion_policy'] == {
+                'maximum_reference_score_gap': 7e-6,
+                'larger_gap_inversion_forbidden': True,
+            }
+            assert parity['required_comparisons'] == [
+                'eager_reference_a_vs_eager_reference_b',
+                'eager_reference_a_vs_compiled',
+                'eager_reference_b_vs_compiled',
+            ]
+            assert parity['threshold_basis']['fixed_calibration_screen'] == (
+                module.COMPILED_BOUNDED_CALIBRATION_SCREEN
+            )
+            assert parity['threshold_basis'][
+                'dynamic_candidate_calibration_forbidden'
+            ] is True
             assert plan['promotion_contract'][
                 'official_full_metric_parity_required_before_promotion'
             ] is True
@@ -1486,26 +1511,37 @@ def _test_raw_fingerprint(values):
 
 def _bounded_parity_fixture(*, box_dtype=torch.float32):
     eager_records, compiled_records, eager_payloads, compiled_payloads = {}, {}, {}, {}
+    query_indices = torch.arange(50) * 5
+    scores = torch.linspace(0.8, 0.3, 50)
+    scores[:2] = torch.tensor([0.900000, 0.899996])
     for batch_index in range(2):
         key = str(batch_index)
         record = {
             "sample_count": 1,
-            "detections_per_sample": [2],
+            "detections_per_sample": [50],
             "finite_schema": {"sealed": True},
             "stream": {"current_stream": 7, "default_stream": 7},
         }
         eager_records[key], compiled_records[key] = record, dict(record)
         eager_sample = {
-            "bboxes_3d": torch.arange(1, 23, dtype=box_dtype).reshape(2, 11)
+            "bboxes_3d": torch.arange(500, dtype=box_dtype).reshape(50, 10) / 10
             + batch_index,
-            "scores_3d": torch.tensor([0.8, 0.7]),
-            "cls_scores": torch.tensor([0.9, 0.75]),
-            "labels_3d": torch.tensor([1, 4]),
-            "query_indices": torch.tensor([8, 3]),
-            "instance_ids": torch.tensor([80, 30]),
+            "scores_3d": scores.clone(),
+            "cls_scores": scores.clone() + 0.02,
+            "labels_3d": torch.arange(50) % 6,
+            "query_indices": query_indices.clone(),
+            "instance_ids": query_indices.clone() + 1000,
         }
         compiled_sample = {name: value.clone() for name, value in eager_sample.items()}
-        compiled_sample["bboxes_3d"].add_(1.0e-6)
+        compiled_sample["bboxes_3d"].add_(1.0e-3)
+        for field in tool.COMPILED_BOUNDED_SCORE_FIELDS:
+            compiled_sample[field].add_(tool.COMPILED_BOUNDED_SCORE_MAX_ABS[field] / 4)
+        near_tie_swap = torch.arange(50)
+        near_tie_swap[:2] = torch.tensor([1, 0])
+        compiled_sample = {
+            name: value[near_tie_swap].clone()
+            for name, value in compiled_sample.items()
+        }
         eager_payloads[key], compiled_payloads[key] = (eager_sample,), (
             compiled_sample,
         )
@@ -1530,52 +1566,100 @@ def test_compiled_bounded_parity_is_explicit_and_records_error_distribution() ->
     assert set(parity) == {"0", "1"}
     for record in parity.values():
         assert record["passed"] is True
-        assert set(record["raw_exact_fields"]) == set(
-            tool.COMPILED_BOUNDED_RAW_EXACT_FIELDS
+        assert record["query_alignment"]["query_set_exact"] is True
+        assert set(record["exact_fields_after_alignment"]) == set(
+            tool.COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS
         )
-        error = record["aggregate_box_error"]
+        assert record["rank_displacement"]["changed_query_count"] == 2
+        assert record["rank_displacement"]["max"] == 1.0
+        error = record["bounded_float_fields"]["bboxes_3d"]
         assert set(error["absolute_error"]) == {
             "count",
             "max",
             "mean",
             "p99_nearest_rank",
         }
-        assert error["absolute_error"]["count"] == 22
-        assert error["absolute_error"]["max"] <= 1e-5
-        assert error["relative_error"]["max"] <= 1e-5
+        assert error["absolute_error"]["count"] == 500
+        assert error["absolute_error"]["max"] <= 0.003
+        assert record["rank_displacement"]["inversion_count"] == 1
+        assert (
+            record["rank_displacement"]["maximum_inversion_score_gap"]
+            <= tool.COMPILED_BOUNDED_NUMERICAL_TIE_MAX_GAP
+        )
+        for field in tool.COMPILED_BOUNDED_SCORE_FIELDS:
+            assert (
+                record["bounded_float_fields"][field]["absolute_error"]["max"]
+                <= tool.COMPILED_BOUNDED_SCORE_MAX_ABS[field]
+            )
         assert record["promotion_status"] == "PENDING_OFFICIAL_FULL_METRIC_PARITY"
 
 
-@pytest.mark.parametrize("field", tool.COMPILED_BOUNDED_RAW_EXACT_FIELDS)
-def test_compiled_bounded_parity_rejects_any_score_or_ranking_bit_change(field) -> None:
+@pytest.mark.parametrize("field", tool.COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS)
+def test_compiled_bounded_parity_rejects_query_aligned_association_change(
+    field,
+) -> None:
     fixture = _bounded_parity_fixture()
     compiled_payload = fixture[4]
-    tensor = compiled_payload["1"][0][field]
-    if tensor.is_floating_point():
-        tensor[0] = torch.nextafter(tensor[0], torch.tensor(float("inf")))
-    else:
-        tensor[0].add_(1)
+    compiled_payload["1"][0][field][0].add_(1)
 
-    with pytest.raises(tool.ProtocolError, match=f"raw-exact field {field}"):
+    with pytest.raises(tool.ProtocolError, match=f"exact field {field}"):
         tool._require_all_batch_compiled_bounded_parity(
             fixture[0], torch, *fixture[1:], batch_count=2
         )
 
 
-def test_compiled_bounded_parity_rejects_absolute_or_relative_box_excess() -> None:
-    absolute = _bounded_parity_fixture(box_dtype=torch.float64)
-    absolute[4]["0"][0]["bboxes_3d"][0, 0].add_(2.0e-5)
-    with pytest.raises(tool.ProtocolError, match="exceeded box tolerance"):
+def test_compiled_bounded_parity_rejects_query_set_or_uniqueness_change() -> None:
+    changed = _bounded_parity_fixture()
+    changed[4]["0"][0]["query_indices"][0].add_(1)
+    with pytest.raises(tool.ProtocolError, match="changed the query set"):
         tool._require_all_batch_compiled_bounded_parity(
-            absolute[0], torch, *absolute[1:], batch_count=2
+            changed[0], torch, *changed[1:], batch_count=2
         )
 
-    relative = _bounded_parity_fixture(box_dtype=torch.float64)
-    relative[3]["0"][0]["bboxes_3d"][0, 0] = 1.0e-8
-    relative[4]["0"][0]["bboxes_3d"][0, 0] = 1.01e-8
-    with pytest.raises(tool.ProtocolError, match="exceeded box tolerance"):
+    duplicate = _bounded_parity_fixture()
+    duplicate[4]["0"][0]["query_indices"][0] = duplicate[4]["0"][0]["query_indices"][1]
+    with pytest.raises(tool.ProtocolError, match="must be unique"):
         tool._require_all_batch_compiled_bounded_parity(
-            relative[0], torch, *relative[1:], batch_count=2
+            duplicate[0], torch, *duplicate[1:], batch_count=2
+        )
+
+    out_of_range = _bounded_parity_fixture()
+    out_of_range[4]["0"][0]["query_indices"][0] = 300
+    with pytest.raises(tool.ProtocolError, match=r"must be in \[0, 299\]"):
+        tool._require_all_batch_compiled_bounded_parity(
+            out_of_range[0], torch, *out_of_range[1:], batch_count=2
+        )
+
+
+def test_compiled_bounded_parity_rejects_non_tie_rank_inversion() -> None:
+    fixture = _bounded_parity_fixture()
+    candidate = fixture[4]["0"][0]
+    wide_swap = torch.arange(50)
+    wide_swap[[10, 20]] = wide_swap[[20, 10]]
+    for field, value in candidate.items():
+        candidate[field] = value[wide_swap].clone()
+    with pytest.raises(tool.ProtocolError, match="non-tied score gap"):
+        tool._require_all_batch_compiled_bounded_parity(
+            fixture[0], torch, *fixture[1:], batch_count=2
+        )
+
+
+@pytest.mark.parametrize("field", tool.COMPILED_BOUNDED_SCORE_FIELDS)
+def test_compiled_bounded_parity_rejects_score_absolute_excess(field) -> None:
+    fixture = _bounded_parity_fixture()
+    fixture[4]["0"][0][field][0].add_(1.0e-4)
+    with pytest.raises(tool.ProtocolError, match=f"exceeded {field}"):
+        tool._require_all_batch_compiled_bounded_parity(
+            fixture[0], torch, *fixture[1:], batch_count=2
+        )
+
+
+def test_compiled_bounded_parity_rejects_component_box_absolute_excess() -> None:
+    fixture = _bounded_parity_fixture(box_dtype=torch.float64)
+    fixture[4]["0"][0]["bboxes_3d"][0, 6].add_(0.01)
+    with pytest.raises(tool.ProtocolError, match="exceeded decoded-box"):
+        tool._require_all_batch_compiled_bounded_parity(
+            fixture[0], torch, *fixture[1:], batch_count=2
         )
 
 
@@ -1594,7 +1678,7 @@ def test_parity_payload_is_an_owned_detached_cpu_copy() -> None:
             self.tensor = tensor
 
     source_fields = {
-        "bboxes_3d": Boxes(torch.randn(2, 11, requires_grad=True)),
+        "bboxes_3d": Boxes(torch.randn(2, 10, requires_grad=True)),
         "scores_3d": torch.rand(2, requires_grad=True),
         "cls_scores": torch.rand(2, requires_grad=True),
         "labels_3d": torch.tensor([1, 2], dtype=torch.long),
