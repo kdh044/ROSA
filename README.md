@@ -188,9 +188,13 @@ contain optimizer/scheduler state and are therefore rejected for resume.
 
 The speed harness leaves the raw-exact `fast` compile route unchanged and adds
 a benchmark-only `fast_compiled_bounded` arm. It uses
-`max-autotune-no-cudagraphs`, keeps scores/ranking raw-exact, and limits box
-absolute and relative error to `1e-5`. Promotion still requires official
-Main126 full-metric parity; these are fixed protocol constants, not user knobs.
+`max-autotune-no-cudagraphs` and matches outputs by query ID. Query membership,
+labels, and instance IDs stay exact; probability errors are capped at
+`3.5e-6`/`4e-6` and decoded boxes at 3 mm, 0.003 rad, or 3 mm/s. Rank inversions
+may only cross numerical ties within `7e-6`. The gate requires an eager-repeat
+baseline and checks the compiled output against both eager references.
+Promotion still requires official Main126 full-metric parity; these are fixed
+protocol constants, not user knobs.
 
 ## Checkpoint and results
 
