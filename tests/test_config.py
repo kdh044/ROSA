@@ -87,6 +87,25 @@ def test_v2_b0_removes_only_the_rosa_sidecar_contract():
     assert not resolved.experiment_contract.rosa_sidecar
 
 
+def test_corrected_c0_uses_raw_uniform_data_and_the_official_residual():
+    resolved = Config.fromfile(
+        ROOT
+        / "configs"
+        / "rosa_r18_main126_v5_c0_sparse4d_raw_uniform_30e.py"
+    )
+
+    assert resolved.model.head.type == "ROSAOfficialResidualNativeBaselineHead"
+    assert resolved.model.head.rosa_cfg is None
+    assert resolved.train_dataloader.dataset.type != "CBGSDataset"
+    assert resolved.train_dataloader.sampler.type == "DefaultSampler"
+    assert resolved.train_cfg.max_epochs == 30
+    assert resolved.param_scheduler[1].T_max == 30
+    assert resolved.param_scheduler[1].end == 30
+    assert resolved.sealed_resume_contract is None
+    assert not resolved.experiment_contract.rosa_sidecar
+    assert resolved.experiment_contract.raw_steps_per_epoch == 1_103
+
+
 def test_fast_profile_only_changes_the_compute_budget():
     balanced = ROSAConfig.from_mapping({"profile": "balanced"})
     fast = ROSAConfig.from_mapping({"profile": "fast"})
