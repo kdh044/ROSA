@@ -3,7 +3,9 @@ import math
 import torch
 
 from rosa.ops import (
+    bitwise_equal,
     exact_zero_detached_base_add,
+    exact_zero_detached_base_yaw_rotation,
     orthonormal_bev_radial_basis,
     wrapped_angle_difference,
 )
@@ -42,6 +44,49 @@ def test_exact_zero_update_preserves_value_but_keeps_residual_gradient():
     assert torch.equal(output, base)
     output.sum().backward()
     assert base.grad is None
+    torch.testing.assert_close(delta.grad, torch.ones_like(delta))
+
+
+def test_mixed_precision_zero_add_preserves_fp32_base_and_bf16_gradient():
+    base = torch.tensor((1.0, -0.0, 3.5), dtype=torch.float32, requires_grad=True)
+    delta = torch.zeros(3, dtype=torch.bfloat16, requires_grad=True)
+
+    output = exact_zero_detached_base_add(base, delta)
+
+    assert output.dtype is torch.float32
+    assert bitwise_equal(output, base.detach())
+    output.sum().backward()
+    assert base.grad is None
+    assert delta.grad is not None
+    assert delta.grad.dtype is torch.bfloat16
+    torch.testing.assert_close(delta.grad, torch.ones_like(delta))
+
+
+def test_mixed_precision_nonzero_add_uses_base_dtype_without_losing_gradient():
+    base = torch.tensor((1.0, -2.0), dtype=torch.float32, requires_grad=True)
+    delta = torch.tensor((0.5, -0.25), dtype=torch.bfloat16, requires_grad=True)
+
+    output = exact_zero_detached_base_add(base, delta)
+
+    assert output.dtype is torch.float32
+    torch.testing.assert_close(output, torch.tensor((1.5, -2.25)))
+    output.sum().backward()
+    assert base.grad is None
+    torch.testing.assert_close(delta.grad, torch.ones_like(delta))
+
+
+def test_mixed_precision_zero_yaw_preserves_fp32_base_and_bf16_gradient():
+    base = torch.tensor(((0.0, 1.0),), dtype=torch.float32, requires_grad=True)
+    delta = torch.zeros(1, 1, dtype=torch.bfloat16, requires_grad=True)
+
+    output = exact_zero_detached_base_yaw_rotation(base, delta)
+
+    assert output.dtype is torch.float32
+    assert bitwise_equal(output, base.detach())
+    output[..., 0].sum().backward()
+    assert base.grad is None
+    assert delta.grad is not None
+    assert delta.grad.dtype is torch.bfloat16
     torch.testing.assert_close(delta.grad, torch.ones_like(delta))
 
 

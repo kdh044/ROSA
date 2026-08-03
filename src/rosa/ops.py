@@ -50,7 +50,22 @@ class _ExactZeroDetachedBaseAdd(torch.autograd.Function):
 
 
 def exact_zero_detached_base_add(base: Tensor, delta: Tensor) -> Tensor:
-    """Return ``base + delta`` with gradient assigned only to ``delta``."""
+    """Return ``base + delta`` with gradient assigned only to ``delta``.
+
+    Detector anchors intentionally remain FP32 under autocast while learned
+    sidecar residuals may be FP16/BF16.  Promote the residual to the
+    detector-owned base dtype before entering the strict custom autograd
+    boundary.  Autograd carries the gradient back through this cast to the
+    original residual dtype, and an exactly-zero residual still returns the
+    base value bit-for-bit.
+    """
+
+    if base.device != delta.device:
+        raise ValueError("base and delta must share a device")
+    if base.dtype != delta.dtype:
+        if not base.is_floating_point() or not delta.is_floating_point():
+            raise TypeError("mixed-dtype residual addition requires floating tensors")
+        delta = delta.to(dtype=base.dtype)
 
     return _ExactZeroDetachedBaseAdd.apply(base, delta)
 
@@ -90,7 +105,19 @@ class _ExactZeroDetachedBaseYawRotation(torch.autograd.Function):
 
 
 def exact_zero_detached_base_yaw_rotation(base: Tensor, delta_yaw: Tensor) -> Tensor:
-    """Rotate an encoded yaw while detaching the detector-owned base."""
+    """Rotate an encoded yaw while detaching the detector-owned base.
+
+    As with :func:`exact_zero_detached_base_add`, preserve the anchor dtype
+    under autocast and let the differentiable cast return gradients to the
+    lower-precision yaw residual.
+    """
+
+    if base.device != delta_yaw.device:
+        raise ValueError("base and delta_yaw must share a device")
+    if base.dtype != delta_yaw.dtype:
+        if not base.is_floating_point() or not delta_yaw.is_floating_point():
+            raise TypeError("mixed-dtype yaw rotation requires floating tensors")
+        delta_yaw = delta_yaw.to(dtype=base.dtype)
 
     return _ExactZeroDetachedBaseYawRotation.apply(base, delta_yaw)
 
