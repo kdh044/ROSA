@@ -10,6 +10,7 @@ from ..attention import masked_softmax
 from ..ops import wrapped_angle_difference
 from .fisheye3dod.constants import OFFICIAL_AP_DISTANCES
 from .sparse4d_scores import (
+    ddp_mean,
     ddp_mean_mask_count,
     jointscore_quality_focal_loss,
     task_box_loss,
@@ -110,6 +111,29 @@ def _radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
 def _selected_mean(value: Tensor, mask: Tensor) -> Tensor:
     count = ddp_mean_mask_count(mask, value.dtype).clamp_min(1)
     return (value * mask.to(dtype=value.dtype)).sum() / count
+
+
+def _selected_diagnostic_mean(value: Tensor, mask: Tensor) -> Tensor:
+    """Return a true global mean while keeping one DDP collective.
+
+    Training losses intentionally divide each rank's numerator by the mean
+    matched count because DDP later averages gradients.  Logged diagnostics
+    have no gradient averaging, so their numerator and denominator must both
+    be reduced explicitly.
+    """
+
+    totals = torch.stack(
+        (
+            (value * mask.to(dtype=value.dtype)).sum(),
+            mask.sum().to(dtype=value.dtype),
+        )
+    )
+    totals = ddp_mean(totals)
+    return torch.where(
+        totals[1] > 0,
+        totals[0] / totals[1],
+        torch.zeros_like(totals[0]),
+    )
 
 
 def _yaw_selected_mean(
@@ -707,17 +731,19 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         "cl_radial_gate_mean": record["radial_gate"].detach().mean(),
         "cl_radial_abs_mean": record["radial_safe"].detach().abs().mean(),
         "cl_tangent_abs_mean": (record["tangent_delta"].detach().abs().mean()),
-        "cl_yaw_baseline_error_mean": _selected_mean(
+        "cl_yaw_baseline_error_mean": _selected_diagnostic_mean(
             baseline_yaw_error, matched
         ).detach(),
-        "cl_yaw_final_error_mean": _selected_mean(final_yaw_error, matched).detach(),
-        "cl_yaw_improvement_rate": _selected_mean(
+        "cl_yaw_final_error_mean": _selected_diagnostic_mean(
+            final_yaw_error, matched
+        ).detach(),
+        "cl_yaw_improvement_rate": _selected_diagnostic_mean(
             yaw_improved.to(final_reg.dtype), matched
         ).detach(),
         "cl_yaw_raw_abs_mean": iteration_yaw_raw.detach().abs().mean(),
         "cl_yaw_delta_abs_mean": iteration_yaw_delta.detach().abs().mean(),
         "cl_yaw_gate_mean": iteration_yaw_gate.detach().mean(),
-        "cl_yaw_saturation_rate": _selected_mean(
+        "cl_yaw_saturation_rate": _selected_diagnostic_mean(
             yaw_saturated.to(final_reg.dtype),
             yaw_diagnostic_mask,
         ).detach(),
@@ -731,16 +757,16 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
     if cfg.center_target_mode == "fixed_base":
         losses.update(
             {
-                "cl_center_baseline_error_mean": _selected_mean(
+                "cl_center_baseline_error_mean": _selected_diagnostic_mean(
                     initial_distance, matched
                 ).detach(),
-                "cl_center_final_error_mean": _selected_mean(
+                "cl_center_final_error_mean": _selected_diagnostic_mean(
                     final_center_error, matched
                 ).detach(),
-                "cl_center_improvement_rate": _selected_mean(
+                "cl_center_improvement_rate": _selected_diagnostic_mean(
                     center_improved.to(final_reg.dtype), matched
                 ).detach(),
-                "cl_center_harm_rate": _selected_mean(
+                "cl_center_harm_rate": _selected_diagnostic_mean(
                     center_harmed.to(final_reg.dtype), matched
                 ).detach(),
                 "cl_center_gate_supervised_count": center_gate_supervised_count,

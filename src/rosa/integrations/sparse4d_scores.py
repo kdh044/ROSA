@@ -640,6 +640,7 @@ __all__ = [
     "JointScoreLoss",
     "compose_native_identity_rank",
     "compose_quality_rank",
+    "ddp_mean",
     "ddp_mean_mask_count",
     "decode_frozen_jointscore_rank",
     "jointscore_quality_focal_loss",

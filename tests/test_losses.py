@@ -8,6 +8,7 @@ from rosa import ROSAConfig
 from rosa.integrations.sparse4d_losses import (
     _candidate_target_distribution,
     _fixed_base_center_targets,
+    _selected_diagnostic_mean,
     _selected_mean,
     _yaw_selected_mean,
     evaluator_aligned_centerness_target,
@@ -457,6 +458,54 @@ def test_disabled_yaw_class_weighting_is_exactly_the_original_reduction():
     disabled = _yaw_selected_mean(per_query, selected, None)
 
     assert torch.equal(disabled, original)
+
+
+def test_diagnostic_mean_reduces_both_ddp_numerator_and_count(monkeypatch):
+    value = torch.tensor((1.0, 3.0, 99.0))
+    mask = torch.tensor((True, True, False))
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def add_remote_rank(totals, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        # The other rank contributes one selected value of 5.
+        totals.add_(totals.new_tensor((5.0, 1.0)))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", add_remote_rank)
+
+    actual = _selected_diagnostic_mean(value, mask)
+
+    torch.testing.assert_close(actual, torch.tensor(3.0))
+
+
+def test_diagnostic_mean_handles_less_than_one_sample_per_rank(monkeypatch):
+    value = torch.tensor((99.0,))
+    mask = torch.tensor((False,))
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+
+    def add_one_remote_sample(totals, op):
+        assert op == torch.distributed.ReduceOp.SUM
+        totals.add_(totals.new_tensor((5.0, 1.0)))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", add_one_remote_sample)
+
+    actual = _selected_diagnostic_mean(value, mask)
+
+    torch.testing.assert_close(actual, torch.tensor(5.0))
+
+
+def test_diagnostic_mean_returns_zero_without_selected_samples():
+    actual = _selected_diagnostic_mean(
+        torch.tensor((1.0, 2.0)),
+        torch.tensor((False, False)),
+    )
+
+    assert torch.equal(actual, torch.zeros_like(actual))
 
 
 def test_yaw_class_weighting_changes_only_the_three_compact_yaw_losses():
