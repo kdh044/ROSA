@@ -8,7 +8,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -577,6 +577,74 @@ def test_allocator_stabilization_requires_documented_cublas_cleanup() -> None:
         tool._stabilize_cuda_allocator(fake_torch, "cuda:0")
 
 
+def test_inductor_cleanup_releases_only_new_compile_task_modules(
+    monkeypatch,
+) -> None:
+    prefix = tool.INDUCTOR_COMPILE_TASK_MODULE_PREFIX
+    baseline_name = prefix + "same_hash_test_module"
+    created_name = baseline_name
+    baseline_module = ModuleType(baseline_name)
+    alternate_baseline_module = ModuleType(baseline_name)
+    created_module = ModuleType(created_name)
+
+    class FakePyCodeCache:
+        modules = [baseline_module, alternate_baseline_module]
+        modules_no_attr = {"/baseline.py": baseline_module}
+
+    codecache_module = ModuleType("torch._inductor.codecache")
+    codecache_module.PyCodeCache = FakePyCodeCache
+    monkeypatch.setitem(sys.modules, "torch._inductor.codecache", codecache_module)
+    monkeypatch.setitem(sys.modules, baseline_name, baseline_module)
+    baseline_snapshot = tool._inductor_compile_task_module_snapshot()
+    FakePyCodeCache.modules.extend((created_module, created_module))
+    FakePyCodeCache.modules_no_attr["/created.py"] = created_module
+    monkeypatch.setitem(sys.modules, created_name, created_module)
+    observed_snapshot = tool._inductor_compile_task_module_snapshot()
+
+    record = tool._release_new_inductor_compile_modules(
+        baseline_snapshot,
+        observed_snapshot,
+    )
+
+    assert sys.modules[baseline_name] is baseline_module
+    assert FakePyCodeCache.modules == [baseline_module, alternate_baseline_module]
+    assert FakePyCodeCache.modules_no_attr == {"/baseline.py": baseline_module}
+    assert record["created_count"] == 1
+    assert record["removed_module_names"] == [created_name]
+    assert record["tracked_list_references_removed"] == 2
+    assert record["tracked_dict_entries_removed"] == 1
+    assert record["sys_module_entries_removed"] == 1
+    assert record["baseline_sys_module_entries_restored"] == 1
+    assert record["passed"] is True
+
+
+def test_inductor_module_snapshot_rejects_malformed_registry(monkeypatch) -> None:
+    class FakePyCodeCache:
+        modules = [object()]
+        modules_no_attr = {}
+
+    codecache_module = ModuleType("torch._inductor.codecache")
+    codecache_module.PyCodeCache = FakePyCodeCache
+    monkeypatch.setitem(sys.modules, "torch._inductor.codecache", codecache_module)
+
+    with pytest.raises(tool.ProtocolError, match="registry is malformed"):
+        tool._inductor_compile_task_module_snapshot()
+
+
+def test_inductor_cleanup_rejects_missing_baseline_sys_entry(monkeypatch) -> None:
+    entry = (tool.INDUCTOR_COMPILE_TASK_MODULE_PREFIX + "baseline", 1)
+    baseline = tool._InductorCompileTaskSnapshot(frozenset(), frozenset({entry}))
+    observed = tool._InductorCompileTaskSnapshot(frozenset(), frozenset())
+    monkeypatch.setattr(
+        tool,
+        "_inductor_compile_task_module_snapshot",
+        lambda: observed,
+    )
+
+    with pytest.raises(tool.ProtocolError, match="pre-existing sys.modules entry"):
+        tool._release_new_inductor_compile_modules(baseline, observed)
+
+
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:
     class FakeCuda:
         @staticmethod
@@ -848,6 +916,34 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         "_reset_compiler_cache",
         lambda torch: (reset_calls.append(torch), lifecycle.append("reset")),
     )
+    empty_snapshot = tool._InductorCompileTaskSnapshot(frozenset(), frozenset())
+    created_snapshot = tool._InductorCompileTaskSnapshot(
+        frozenset({1}),
+        frozenset({(tool.INDUCTOR_COMPILE_TASK_MODULE_PREFIX + "candidate", 1)}),
+    )
+    module_snapshots = iter(
+        (
+            empty_snapshot,
+            created_snapshot,
+        )
+    )
+    monkeypatch.setattr(
+        tool,
+        "_inductor_compile_task_module_snapshot",
+        lambda: next(module_snapshots),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_release_new_inductor_compile_modules",
+        lambda baseline, observed: (
+            lifecycle.append("release"),
+            {
+                "baseline_count": len(baseline.cache_ids),
+                "created_count": len(observed.cache_ids - baseline.cache_ids),
+                "passed": True,
+            },
+        )[1],
+    )
 
     configs = {native_arm: object(), candidate: object()}
     fake_torch = SimpleNamespace(cuda=Cuda())
@@ -880,7 +976,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         "gc",
     ]
     if expected_compiles:
-        expected_lifecycle.append("reset")
+        expected_lifecycle.extend(("reset", "release", "gc"))
     expected_lifecycle.append("stabilize")
     assert lifecycle == expected_lifecycle
     assert set(contracts) == set(loads) == {native_arm, candidate}
@@ -892,7 +988,11 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         },
         {
             "phase": "compiled_arm_only",
-            "steps": ["torch._dynamo.reset"],
+            "steps": [
+                "torch._dynamo.reset",
+                "release newly created torch._inductor compile-task modules",
+                "gc.collect",
+            ],
         },
         {
             "phase": "allocator_stabilization",
@@ -921,13 +1021,111 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     )
     invocation = memory[candidate]["compile_invocation_attestation"]
     if candidate in tool.COMPILED_ARMS:
+        assert memory[candidate]["compiler_cache_cleanup_attestation"] == {
+            "baseline_count": 0,
+            "created_count": 1,
+            "passed": True,
+        }
         assert invocation["passed"] is True
         assert (
             invocation["observed_kwargs"]
             == tool.candidate_compile_contract(candidate)["kwargs"]
         )
     else:
+        assert memory[candidate]["compiler_cache_cleanup_attestation"] is None
         assert invocation is None
+
+
+def test_memory_cleanup_runs_when_compilation_raises(monkeypatch) -> None:
+    events = []
+
+    class Model:
+        head = SimpleNamespace(rosa_refiner=SimpleNamespace(_compiled_call_impl=None))
+
+    def build_models(verifier, configs, state_dict, arms, device):
+        del verifier, configs, state_dict, device
+        arm = tuple(arms)[0]
+        return {arm: Model()}, {arm: {}}, {arm: {}}
+
+    class Verifier:
+        @staticmethod
+        def _memory_probe(model, source, device):
+            del model, source, device
+            return {
+                "peak_allocated_bytes": 1,
+                "peak_reserved_bytes": 1,
+                "peak_allocated_increment_bytes": 1,
+                "peak_reserved_increment_bytes": 1,
+            }
+
+    class Cuda:
+        current_stream = staticmethod(lambda device: SimpleNamespace(cuda_stream=7))
+        default_stream = staticmethod(lambda device: SimpleNamespace(cuda_stream=7))
+
+    empty = tool._InductorCompileTaskSnapshot(frozenset(), frozenset())
+    partial = tool._InductorCompileTaskSnapshot(
+        frozenset({1}),
+        frozenset({(tool.INDUCTOR_COMPILE_TASK_MODULE_PREFIX + "partial", 1)}),
+    )
+    snapshots = iter((empty, partial))
+
+    def compile_raises(*args):
+        del args
+        events.append("compile")
+        raise RuntimeError("compile failed")
+
+    monkeypatch.setattr(tool, "_build_models", build_models)
+    monkeypatch.setattr(
+        tool,
+        "_preflight_outputs",
+        lambda verifier, torch, models, source, device: {arm: {} for arm in models},
+    )
+    monkeypatch.setattr(
+        tool,
+        "_stabilize_cuda_allocator",
+        lambda torch, device: {"allocated_bytes": 0, "reserved_bytes": 0},
+    )
+    monkeypatch.setattr(
+        tool,
+        "_inductor_compile_task_module_snapshot",
+        lambda: (events.append("snapshot"), next(snapshots))[1],
+    )
+    monkeypatch.setattr(tool, "_compile_candidate_refiner", compile_raises)
+    monkeypatch.setattr(
+        tool,
+        "_reset_compiler_cache",
+        lambda torch: events.append("reset"),
+    )
+    monkeypatch.setattr(
+        tool,
+        "_release_new_inductor_compile_modules",
+        lambda baseline, observed: events.append("release") or {"passed": True},
+    )
+    monkeypatch.setattr(tool.gc, "collect", lambda: events.append("gc"))
+
+    configs = {tool.NATIVE_ARM: object(), tool.FAST_COMPILED_BOUNDED_ARM: object()}
+    with pytest.raises(RuntimeError, match="compile failed"):
+        tool._measure_isolated_memory(
+            Verifier,
+            SimpleNamespace(cuda=Cuda()),
+            object(),
+            configs,
+            {},
+            [object()],
+            "cuda:0",
+            tool.FAST_COMPILED_BOUNDED_ARM,
+        )
+
+    assert events == [
+        "gc",
+        "snapshot",
+        "compile",
+        "snapshot",
+        "gc",
+        "reset",
+        "release",
+        "gc",
+    ]
 
 
 def test_fast_timing_rejects_compiler_counter_changes() -> None:

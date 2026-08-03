@@ -37,8 +37,8 @@ import subprocess
 import sys
 import time
 import traceback
-from types import SimpleNamespace
-from typing import Any
+from types import ModuleType, SimpleNamespace
+from typing import Any, NamedTuple
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
@@ -89,6 +89,7 @@ COMPILED_BOUNDED_RAW_EXACT_FIELDS = (
     *COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS,
     *COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS,
 )
+INDUCTOR_COMPILE_TASK_MODULE_PREFIX = "torch._inductor.runtime.compile_tasks."
 WARMUP_ITERATIONS_PER_ARM = 60
 MEASURED_ITERATIONS_PER_ARM = 300
 CAPTURE_BATCHES = 2
@@ -1944,6 +1945,168 @@ def _reset_compiler_cache(torch) -> None:
     reset()
 
 
+class _InductorCompileTaskSnapshot(NamedTuple):
+    cache_ids: frozenset[int]
+    sys_entries: frozenset[tuple[str, int]]
+
+
+def _inductor_module_name(module, *, expected_name: str | None = None) -> str:
+    name = getattr(module, "__name__", None)
+    if (
+        not isinstance(module, ModuleType)
+        or not isinstance(name, str)
+        or not name.startswith(INDUCTOR_COMPILE_TASK_MODULE_PREFIX)
+        or (expected_name is not None and name != expected_name)
+    ):
+        raise ProtocolError("Torch Inductor compile-task module registry is malformed")
+    return name
+
+
+def _inductor_code_cache_registries():
+    codecache_module = sys.modules.get("torch._inductor.codecache")
+    if codecache_module is None:
+        return None
+    if not isinstance(codecache_module, ModuleType):
+        raise ProtocolError("Torch Inductor code-cache module registry is malformed")
+    py_code_cache = getattr(codecache_module, "PyCodeCache", None)
+    tracked_modules = getattr(py_code_cache, "modules", None)
+    tracked_no_attr = getattr(py_code_cache, "modules_no_attr", None)
+    if not isinstance(tracked_modules, list) or not isinstance(tracked_no_attr, dict):
+        raise ProtocolError("Torch does not expose the expected Inductor code cache")
+    return tracked_modules, tracked_no_attr
+
+
+def _inductor_compile_task_module_snapshot() -> _InductorCompileTaskSnapshot:
+    registries = _inductor_code_cache_registries()
+    if registries is None:
+        cache_ids = set()
+    else:
+        tracked_modules, tracked_no_attr = registries
+        cache_ids = {id(module) for module in tracked_modules}
+        for module in (*tracked_modules, *tracked_no_attr.values()):
+            _inductor_module_name(module)
+        if any(id(module) not in cache_ids for module in tracked_no_attr.values()):
+            raise ProtocolError("Torch Inductor code-cache registries disagree")
+
+    sys_entries = set()
+    for name, module in tuple(sys.modules.items()):
+        if name.startswith(INDUCTOR_COMPILE_TASK_MODULE_PREFIX):
+            _inductor_module_name(module, expected_name=name)
+            sys_entries.add((name, id(module)))
+    return _InductorCompileTaskSnapshot(
+        cache_ids=frozenset(cache_ids),
+        sys_entries=frozenset(sys_entries),
+    )
+
+
+def _release_new_inductor_compile_modules(
+    baseline: _InductorCompileTaskSnapshot,
+    observed: _InductorCompileTaskSnapshot,
+) -> dict[str, Any]:
+    if not isinstance(baseline, _InductorCompileTaskSnapshot) or not isinstance(
+        observed, _InductorCompileTaskSnapshot
+    ):
+        raise TypeError("Inductor cleanup requires validated snapshots")
+    if not baseline.cache_ids.issubset(observed.cache_ids):
+        raise ProtocolError("Torch Inductor removed a pre-existing compile-task module")
+    if _inductor_compile_task_module_snapshot() != observed:
+        raise ProtocolError(
+            "Torch Inductor compile-task modules changed during isolated cleanup"
+        )
+    created_ids = observed.cache_ids - baseline.cache_ids
+    created_sys_entries = observed.sys_entries - baseline.sys_entries
+    if not created_ids and not created_sys_entries:
+        if observed != baseline:
+            raise ProtocolError(
+                "Torch Inductor removed a pre-existing sys.modules entry"
+            )
+        return {
+            "prefix": INDUCTOR_COMPILE_TASK_MODULE_PREFIX,
+            "baseline_count": len(baseline.cache_ids),
+            "created_count": 0,
+            "removed_module_names": [],
+            "tracked_list_references_removed": 0,
+            "tracked_dict_entries_removed": 0,
+            "sys_module_entries_removed": 0,
+            "baseline_sys_module_entries_restored": 0,
+            "passed": True,
+        }
+
+    registries = _inductor_code_cache_registries()
+    if created_ids and registries is None:
+        raise ProtocolError("Torch does not expose the expected Inductor code cache")
+    tracked_modules, tracked_no_attr = registries or ([], {})
+
+    baseline_by_id = {}
+    created_by_id = {}
+    for module in tracked_modules:
+        name = _inductor_module_name(module)
+        if id(module) in baseline.cache_ids:
+            baseline_by_id[id(module)] = module
+        elif id(module) in created_ids:
+            created_by_id[id(module)] = module
+        else:
+            raise ProtocolError("Torch Inductor code cache contains an unknown module")
+    if set(created_by_id) != set(created_ids):
+        raise ProtocolError("Torch Inductor created-module registry is incomplete")
+
+    removed_list_references = sum(
+        id(module) in created_ids for module in tracked_modules
+    )
+    kept_modules = [
+        module for module in tracked_modules if id(module) not in created_ids
+    ]
+    tracked_modules[:] = kept_modules
+
+    created_paths = [
+        path for path, module in tracked_no_attr.items() if id(module) in created_ids
+    ]
+    for path in created_paths:
+        del tracked_no_attr[path]
+
+    created_names = {_inductor_module_name(module) for module in created_by_id.values()}
+    removed_sys_entries = 0
+    for name, module_id in sorted(created_sys_entries):
+        module = sys.modules.get(name)
+        if module is None or id(module) != module_id:
+            raise ProtocolError(
+                "Torch Inductor sys.modules entry changed before release"
+            )
+        removed = sys.modules.pop(name)
+        created_names.add(name)
+        removed_sys_entries += 1
+        del removed
+
+    restored_sys_entries = 0
+    for name, module_id in sorted(baseline.sys_entries):
+        current = sys.modules.get(name)
+        if current is not None and id(current) == module_id:
+            continue
+        if current is not None:
+            raise ProtocolError(
+                "Torch Inductor baseline sys.modules entry was replaced"
+            )
+        previous = baseline_by_id.get(module_id)
+        if previous is None or _inductor_module_name(previous) != name:
+            raise ProtocolError("Torch Inductor baseline module cannot be restored")
+        sys.modules[name] = previous
+        restored_sys_entries += 1
+
+    if _inductor_compile_task_module_snapshot() != baseline:
+        raise ProtocolError("Torch Inductor compile-task module release was incomplete")
+    return {
+        "prefix": INDUCTOR_COMPILE_TASK_MODULE_PREFIX,
+        "baseline_count": len(baseline.cache_ids),
+        "created_count": len(created_ids),
+        "removed_module_names": sorted(created_names),
+        "tracked_list_references_removed": removed_list_references,
+        "tracked_dict_entries_removed": len(created_paths),
+        "sys_module_entries_removed": removed_sys_entries,
+        "baseline_sys_module_entries_restored": restored_sys_entries,
+        "passed": True,
+    }
+
+
 def _attest_candidate_compile_state(
     model,
     candidate_arm: str,
@@ -2056,7 +2219,11 @@ def _measure_isolated_memory(
                 },
                 {
                     "phase": "compiled_arm_only",
-                    "steps": ["torch._dynamo.reset"],
+                    "steps": [
+                        "torch._dynamo.reset",
+                        "release newly created torch._inductor compile-task modules",
+                        "gc.collect",
+                    ],
                 },
                 {
                     "phase": "allocator_stabilization",
@@ -2081,6 +2248,8 @@ def _measure_isolated_memory(
         )
         models: dict[str, Any] = {}
         compiler_cache_created = False
+        compiler_module_baseline = None
+        compiler_cleanup_attestation = None
         compile_state_attestations: list[dict[str, Any]] = []
         try:
             models, built_contracts, built_load_contracts = _build_models(
@@ -2100,6 +2269,8 @@ def _measure_isolated_memory(
                     )
                 )
             if arm in COMPILED_ARMS:
+                compiler_module_baseline = _inductor_compile_task_module_snapshot()
+                compiler_cache_created = True
                 compile_invocation_attestation = _compile_candidate_refiner(
                     run_tool,
                     models[arm],
@@ -2107,7 +2278,6 @@ def _measure_isolated_memory(
                     arm,
                 )
                 compiled = bool(compile_invocation_attestation["compiled"])
-                compiler_cache_created = True
             if arm in CANDIDATE_ARMS:
                 compile_state_attestations.append(
                     _attest_candidate_compile_state(
@@ -2160,17 +2330,30 @@ def _measure_isolated_memory(
             )
             memory[arm] = record
         finally:
+            compiler_module_observed = (
+                _inductor_compile_task_module_snapshot()
+                if compiler_cache_created
+                else None
+            )
             models.clear()
             # Module.compile can form Python cycles around the optimized call.
             # Collect those objects before resetting global Dynamo/CUDA-graph
             # caches; reversing this order leaves a small live graph allocation.
             gc.collect()
             if compiler_cache_created:
+                if compiler_module_baseline is None or compiler_module_observed is None:
+                    raise ProtocolError("compiled module cleanup snapshot is missing")
                 _reset_compiler_cache(torch)
+                compiler_cleanup_attestation = _release_new_inductor_compile_modules(
+                    compiler_module_baseline,
+                    compiler_module_observed,
+                )
+                gc.collect()
             after_cleanup = _stabilize_cuda_allocator(torch, device)
         _require_allocator_floor(
             allocator_floor, after_cleanup, label=f"after {arm} memory cleanup"
         )
+        memory[arm]["compiler_cache_cleanup_attestation"] = compiler_cleanup_attestation
         memory[arm]["allocator_after_cleanup"] = after_cleanup
 
     return memory, contracts, load_contracts
