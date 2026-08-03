@@ -7,6 +7,32 @@ from torch import Tensor
 import torch.nn.functional as F
 
 
+def orthonormal_bev_radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
+    """Return a deterministic orthonormal radial/tangent frame in BEV.
+
+    The radial direction is undefined exactly at the ego origin.  Falling
+    back to the positive x-axis keeps center refinement trainable there and
+    avoids the all-zero "basis" returned by ``F.normalize`` for a zero
+    vector.  Non-finite detector boxes use the same fail-safe frame rather
+    than propagating NaNs through candidate construction and diagnostics.
+    """
+
+    if center_xy.ndim < 1 or center_xy.shape[-1] != 2:
+        raise ValueError("BEV centers must end in an XY pair")
+    if not center_xy.is_floating_point():
+        raise TypeError("BEV centers must be floating point")
+
+    finite = torch.isfinite(center_xy).all(dim=-1, keepdim=True)
+    safe_center = torch.where(finite, center_xy, torch.zeros_like(center_xy))
+    norm = torch.linalg.vector_norm(safe_center, dim=-1, keepdim=True)
+    radial = F.normalize(safe_center, dim=-1, eps=1e-6)
+    fallback = torch.zeros_like(radial)
+    fallback[..., 0] = 1.0
+    radial = torch.where(finite & norm.gt(1e-6), radial, fallback)
+    tangent = torch.stack((-radial[..., 1], radial[..., 0]), dim=-1)
+    return radial, tangent
+
+
 class _ExactZeroDetachedBaseAdd(torch.autograd.Function):
     """Add a residual while keeping an exact-zero update bit-identical."""
 
@@ -120,6 +146,7 @@ __all__ = [
     "bitwise_equal",
     "exact_zero_detached_base_add",
     "exact_zero_detached_base_yaw_rotation",
+    "orthonormal_bev_radial_basis",
     "wrap_angle",
     "wrapped_angle_difference",
     "yaw_vector_to_angle",

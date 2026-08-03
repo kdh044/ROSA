@@ -1375,6 +1375,35 @@ def test_fixed_base_center_uses_one_orthonormal_frame(monkeypatch):
     assert torch.equal(output.final_anchor[..., 6:8], anchor[..., 6:8])
 
 
+def test_fixed_base_center_keeps_a_complete_frame_at_ego_origin(monkeypatch):
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "center_target_mode": "fixed_base",
+            "force_radial_gate_one": True,
+            "mask_unsupported_updates": False,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(config)
+    anchor[..., :2] = 0.0
+    tangent_delta = -0.5
+    with torch.no_grad():
+        stage.shared_tangent_head[-1].bias.fill_(
+            torch.atanh(torch.tensor(tangent_delta / config.max_tangent_delta_m))
+        )
+
+    def fixed_proposal(*_args, **_kwargs):
+        return anchor.new_ones(anchor.shape[:2])
+
+    monkeypatch.setattr(stage, "_posterior_radial_proposal", fixed_proposal)
+    output = stage(anchor, query, fpn, metas, generator)
+
+    expected_xy = anchor.new_tensor((1.0, tangent_delta)).expand_as(anchor[..., :2])
+    torch.testing.assert_close(output.final_anchor[..., :2], expected_xy)
+
+
 def test_fixed_base_gate_feedback_contains_the_applied_proposal(monkeypatch):
     config = ROSAConfig.from_mapping(
         {

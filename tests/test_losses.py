@@ -382,6 +382,24 @@ def test_fixed_base_center_targets_exactly_reconstruct_xy():
     torch.testing.assert_close(log_range_target.exp(), torch.tensor([[1.25]]))
 
 
+def test_fixed_base_center_targets_remain_complete_at_ego_origin():
+    step_base = torch.zeros(1, 1, 10)
+    target_xy = torch.tensor([[[1.25, -0.75]]])
+
+    radial_target, tangent_target, _ = _fixed_base_center_targets(
+        step_base,
+        target_xy,
+        min_range=0.5,
+        max_range=68.0,
+    )
+    reconstructed = step_base[..., :2] + torch.stack(
+        (radial_target, tangent_target),
+        dim=-1,
+    )
+
+    torch.testing.assert_close(reconstructed, target_xy, atol=0, rtol=0)
+
+
 def test_fixed_base_center_targets_reconstruct_a_rotated_frame():
     step_base = torch.zeros(1, 1, 10)
     step_base[..., :2] = torch.tensor((3.0, 4.0))

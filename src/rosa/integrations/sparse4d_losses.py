@@ -7,7 +7,7 @@ from torch import Tensor
 import torch.nn.functional as F
 
 from ..attention import masked_softmax
-from ..ops import wrapped_angle_difference
+from ..ops import orthonormal_bev_radial_basis, wrapped_angle_difference
 from .fisheye3dod.constants import OFFICIAL_AP_DISTANCES
 from .sparse4d_scores import (
     ddp_mean,
@@ -104,9 +104,7 @@ def evaluator_aligned_quality_target(
 
 
 def _radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
-    radial = F.normalize(center_xy, dim=-1, eps=1e-6)
-    tangent = torch.stack((-radial[..., 1], radial[..., 0]), dim=-1)
-    return radial, tangent
+    return orthonormal_bev_radial_basis(center_xy)
 
 
 def _selected_mean(value: Tensor, mask: Tensor) -> Tensor:
