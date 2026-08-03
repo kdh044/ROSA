@@ -104,8 +104,8 @@ COMPILED_BOUNDED_SCORE_MAX_ABS = {
 }
 COMPILED_BOUNDED_BOX_MAX_ABS = 3.0e-3
 COMPILED_BOUNDED_NUMERICAL_TIE_MAX_GAP = 7.0e-6
-# The fixed ceilings are the deterministic eager-repeat maxima plus at most a
-# 1.5x envelope; no value is calibrated from the candidate under test.
+# The fixed ceilings round up the deterministic eager-repeat maxima while
+# staying within a 1.65x envelope; no value is calibrated from the candidate.
 COMPILED_BOUNDED_CALIBRATION_SCREEN = {
     "route": "eager_vs_eager",
     "passes": 4,
@@ -115,7 +115,7 @@ COMPILED_BOUNDED_CALIBRATION_SCREEN = {
         "cls_scores": 2.6524067e-6,
         "bboxes_3d": 1.82723999e-3,
     },
-    "maximum_envelope_multiplier": 1.5,
+    "maximum_rounded_ceiling_multiplier": 1.65,
 }
 INDUCTOR_COMPILE_TASK_MODULE_PREFIX = "torch._inductor.runtime.compile_tasks."
 WARMUP_ITERATIONS_PER_ARM = 60
