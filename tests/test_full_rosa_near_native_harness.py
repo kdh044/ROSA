@@ -195,7 +195,7 @@ with tempfile.TemporaryDirectory() as raw_temp:
                 'bboxes_3d': 0.003,
             }
             assert parity['query_contract'] == {
-                'maximum_count': 50,
+                'maximum_count': 300,
                 'count_matches_decoder_output': True,
                 'unique': True,
                 'inclusive_range': [0, 299],
@@ -1521,7 +1521,9 @@ def _test_raw_fingerprint(values):
 
 def _bounded_parity_fixture(*, box_dtype=torch.float32, count=50):
     eager_records, compiled_records, eager_payloads, compiled_payloads = {}, {}, {}, {}
-    query_indices = torch.arange(count) * 5
+    # A prefix of this permutation stays unique and inside the real decoder's
+    # 300-query domain, including the full 300-output production case.
+    query_indices = (torch.arange(count) * 299) % 300
     scores = torch.linspace(0.8, 0.3, count)
     if count >= 2:
         scores[:2] = torch.tensor([0.900000, 0.899996])
@@ -1621,7 +1623,7 @@ def test_compiled_parity_calibration_artifact_is_hash_bound(
         tool.compiled_parity_calibration_contract(tool.FAST_COMPILED_BOUNDED_ARM)
 
 
-@pytest.mark.parametrize("count", [0, 7])
+@pytest.mark.parametrize("count", [0, 7, 300])
 def test_compiled_bounded_parity_accepts_variable_decoder_count(count) -> None:
     fixture = _bounded_parity_fixture(count=count)
     parity = tool._require_all_batch_compiled_bounded_parity(
@@ -1643,6 +1645,14 @@ def test_compiled_bounded_parity_rejects_invalid_decoder_count() -> None:
             fixture[0], torch, *fixture[1:], batch_count=2
         )
 
+    over_limit = _bounded_parity_fixture()
+    for records in over_limit[1:3]:
+        records["0"]["detections_per_sample"] = [301]
+    with pytest.raises(tool.ProtocolError, match=r"must be in \[0, 300\]"):
+        tool._require_all_batch_compiled_bounded_parity(
+            over_limit[0], torch, *over_limit[1:], batch_count=2
+        )
+
 
 @pytest.mark.parametrize("field", tool.COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS)
 def test_compiled_bounded_parity_rejects_query_aligned_association_change(
@@ -1660,7 +1670,7 @@ def test_compiled_bounded_parity_rejects_query_aligned_association_change(
 
 def test_compiled_bounded_parity_rejects_query_set_or_uniqueness_change() -> None:
     changed = _bounded_parity_fixture()
-    changed[4]["0"][0]["query_indices"][0].add_(1)
+    changed[4]["0"][0]["query_indices"][2] = 1
     with pytest.raises(tool.ProtocolError, match="changed the query set"):
         tool._require_all_batch_compiled_bounded_parity(
             changed[0], torch, *changed[1:], batch_count=2
