@@ -58,6 +58,8 @@ from .sparse4d_runtime import (
     validate_native_call,
 )
 from .sparse4d_scores import (
+    _can_reuse_native_identity_rank_selection,
+    _compose_native_identity_rank_and_selection,
     compose_native_identity_rank,
     compose_quality_rank,
     decode_frozen_jointscore_rank,
@@ -68,6 +70,13 @@ _NATIVE_FINAL = 5
 _ROSA_OUTPUT = 6
 _RELEASED_MHA_FORWARD = torch.nn.MultiheadAttention.forward
 _RELEASED_LINEAR_FORWARD = torch.nn.Linear.forward
+_RELEASED_NATIVE_IDENTITY_RANK = compose_native_identity_rank
+_RELEASED_NATIVE_IDENTITY_RANK_SELECTION_GUARD = (
+    _can_reuse_native_identity_rank_selection
+)
+_RELEASED_NATIVE_IDENTITY_RANK_AND_SELECTION = (
+    _compose_native_identity_rank_and_selection
+)
 _HOST_CONTROL_DEFAULTS = {
     "max_temporal_gnn_interactions": 0,
     "cache_decoder_index": _NATIVE_FINAL,
@@ -645,12 +654,36 @@ class ROSARefinementHead(Sparse4DHead):
             raise RuntimeError("captured query and D5 proposal axes disagree")
         query = native_query[:, :num_free]
         refine_count = min(int(self.rosa_cfg.refine_topk), num_free)
+        precomputed_native_rank = None
+        reuse_native_rank_selection = bool(
+            native_identity_rank
+            and refine_count < num_free
+            and compose_native_identity_rank is _RELEASED_NATIVE_IDENTITY_RANK
+            and _can_reuse_native_identity_rank_selection
+            is _RELEASED_NATIVE_IDENTITY_RANK_SELECTION_GUARD
+            and _compose_native_identity_rank_and_selection
+            is _RELEASED_NATIVE_IDENTITY_RANK_AND_SELECTION
+            and _can_reuse_native_identity_rank_selection(
+                baseline_cls,
+                baseline_quality,
+                centerness_index=CNS,
+            )
+        )
         if refine_count < num_free:
             with torch.no_grad():
-                selection_score = (
-                    baseline_cls.detach().sigmoid().amax(dim=-1)
-                    * baseline_quality[..., CNS].detach().sigmoid()
-                )
+                if reuse_native_rank_selection:
+                    precomputed_native_rank, selection_score = (
+                        _compose_native_identity_rank_and_selection(
+                            baseline_cls,
+                            baseline_quality,
+                            centerness_index=CNS,
+                        )
+                    )
+                else:
+                    selection_score = (
+                        baseline_cls.detach().sigmoid().amax(dim=-1)
+                        * baseline_quality[..., CNS].detach().sigmoid()
+                    )
                 selected_indices = selection_score.topk(
                     refine_count, dim=1, sorted=False
                 ).indices
@@ -733,10 +766,14 @@ class ROSARefinementHead(Sparse4DHead):
                     result.candidate_supported.any(dim=2),
                 )
         if native_identity_rank:
-            rank = compose_native_identity_rank(
-                baseline_cls,
-                baseline_quality,
-                centerness_index=CNS,
+            rank = (
+                precomputed_native_rank
+                if precomputed_native_rank is not None
+                else compose_native_identity_rank(
+                    baseline_cls,
+                    baseline_quality,
+                    centerness_index=CNS,
+                )
             )
         else:
             rank = compose_quality_rank(

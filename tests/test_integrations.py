@@ -8,8 +8,12 @@ import textwrap
 
 import pytest
 import torch
+from torch.overrides import TorchFunctionMode
+from torch.utils._python_dispatch import TorchDispatchMode
 
 from rosa import ROSAConfig
+import rosa.integrations.sparse4d_scores as sparse4d_scores_module
+import rosa.rfl as rfl_module
 from rosa.integrations.sparse4d_runtime import (
     NativeRefineCall,
     SingleCallCapture,
@@ -19,6 +23,8 @@ from rosa.integrations.sparse4d_runtime import (
     validate_native_call,
 )
 from rosa.integrations.sparse4d_scores import (
+    _can_reuse_native_identity_rank_selection,
+    _compose_native_identity_rank_and_selection,
     _pack_frozen_decode_fields,
     compose_native_identity_rank,
     compose_quality_rank,
@@ -361,6 +367,7 @@ def test_minimal_refiner_return_is_sealed_behind_released_inference_abi():
         pytest.skip("optional Sparse4D detector host is not available")
     code = textwrap.dedent(
         """
+        import sys
         import types
 
         import torch
@@ -481,13 +488,13 @@ def test_minimal_refiner_return_is_sealed_behind_released_inference_abi():
         }
 
 
-        def config(profile):
+        def config(profile, refine_topk=queries):
             return ROSAConfig.from_mapping(
                 {
                     "profile": profile,
                     "embed_dims": dims,
                     "hidden_dims": 8,
-                    "refine_topk": queries,
+                    "refine_topk": refine_topk,
                 }
             )
 
@@ -772,6 +779,80 @@ def test_minimal_refiner_return_is_sealed_behind_released_inference_abi():
             eager_output["prediction"][-1],
             compiled_output["prediction"][-1],
         )
+
+        # The exact top-k path shares native sigmoid results and still emits
+        # the same three frozen-rank fields.
+        selection_head = make_head(config("fast", refine_topk=1))
+        shared_code = (
+            integration._compose_native_identity_rank_and_selection.__code__
+        )
+        shared_calls = 0
+
+
+        def count_shared(frame, event, _argument):
+            global shared_calls
+            if event == "call" and frame.f_code is shared_code:
+                shared_calls += 1
+
+
+        previous_profile = sys.getprofile()
+        sys.setprofile(count_shared)
+        try:
+            selection_output, selection_cls, selection_quality = run(
+                selection_head
+            )
+        finally:
+            sys.setprofile(previous_profile)
+        assert shared_calls == 1
+        assert_native_identity(
+            selection_head,
+            selection_output,
+            selection_cls,
+            selection_quality,
+        )
+
+        released_compose = integration.compose_native_identity_rank
+        compose_calls = []
+
+
+        def observed_compose(*args, **kwargs):
+            compose_calls.append(True)
+            return released_compose(*args, **kwargs)
+
+
+        integration.compose_native_identity_rank = observed_compose
+        fallback_head = make_head(config("fast", refine_topk=1))
+        fallback_output, fallback_cls, fallback_quality = run(fallback_head)
+        assert compose_calls == [True]
+        assert_native_identity(
+            fallback_head,
+            fallback_output,
+            fallback_cls,
+            fallback_quality,
+        )
+        integration.compose_native_identity_rank = released_compose
+
+        released_shared = (
+            integration._compose_native_identity_rank_and_selection
+        )
+
+
+        def must_not_run(*_args, **_kwargs):
+            raise AssertionError("overridden shared rank helper executed")
+
+
+        integration._compose_native_identity_rank_and_selection = must_not_run
+        private_fallback_head = make_head(config("fast", refine_topk=1))
+        private_output, private_cls, private_quality = run(
+            private_fallback_head
+        )
+        assert_native_identity(
+            private_fallback_head,
+            private_output,
+            private_cls,
+            private_quality,
+        )
+        integration._compose_native_identity_rank_and_selection = released_shared
         """
     )
     environment = os.environ.copy()
@@ -1163,6 +1244,203 @@ def test_native_identity_rank_is_raw_exact_to_zero_quality_residual(
         identity["emitted_joint_score"],
         full["emitted_joint_score"],
     )
+
+
+@pytest.mark.parametrize(
+    ("classification_dtype", "quality_dtype"),
+    (
+        (torch.float16, torch.float16),
+        (torch.bfloat16, torch.bfloat16),
+        (torch.float32, torch.float32),
+        (torch.float64, torch.float64),
+        (torch.float16, torch.float32),
+        (torch.float32, torch.float64),
+    ),
+)
+def test_shared_native_rank_selection_is_raw_exact_for_special_values_and_ties(
+    classification_dtype,
+    quality_dtype,
+):
+    generator = torch.Generator().manual_seed(7_101_080)
+    classification = torch.randn(
+        2,
+        7,
+        6,
+        generator=generator,
+        dtype=classification_dtype,
+    )
+    quality = torch.randn(
+        2,
+        7,
+        2,
+        generator=generator,
+        dtype=quality_dtype,
+    )
+    bit_patterns = {
+        torch.float16: (
+            torch.uint16,
+            (0x0000, 0x8000, 0x7C00, 0xFC00, 0x7E01, 0x7FFF),
+        ),
+        torch.bfloat16: (
+            torch.uint16,
+            (0x0000, 0x8000, 0x7F80, 0xFF80, 0x7FC1, 0x7FFF),
+        ),
+        torch.float32: (
+            torch.uint32,
+            (
+                0x00000000,
+                0x80000000,
+                0x7F800000,
+                0xFF800000,
+                0x7FC00001,
+                0x7FFFFFFF,
+            ),
+        ),
+        torch.float64: (
+            torch.uint64,
+            (
+                0x0000000000000000,
+                0x8000000000000000,
+                0x7FF0000000000000,
+                0xFFF0000000000000,
+                0x7FF8000000000001,
+                0x7FFFFFFFFFFFFFFF,
+            ),
+        ),
+    }
+
+    for value in (classification, quality):
+        integer_dtype, patterns = bit_patterns[value.dtype]
+        value.view(integer_dtype).reshape(-1)[: len(patterns)].copy_(
+            torch.tensor(patterns, dtype=integer_dtype)
+        )
+    if classification_dtype is torch.float16:
+        tie = (-11.9765625, -11.96875)
+    elif classification_dtype is torch.bfloat16:
+        tie = (-1.90625, -1.8984375)
+    else:
+        tie = (1.0, 1.0)
+    classification[1, 0].fill_(-20.0)
+    classification[1, 0, :2] = classification.new_tensor(tie)
+    classification_before = classification.clone()
+    quality_before = quality.clone()
+
+    expected_selection = (
+        classification.detach().sigmoid().amax(dim=-1)
+        * quality[..., 0].detach().sigmoid()
+    )
+    expected_rank = compose_native_identity_rank(
+        classification,
+        quality,
+        centerness_index=0,
+    )
+    expected_indices = expected_selection.topk(3, dim=1, sorted=False).indices
+    actual_rank, actual_selection = _compose_native_identity_rank_and_selection(
+        classification,
+        quality,
+        centerness_index=0,
+    )
+    actual_indices = actual_selection.topk(3, dim=1, sorted=False).indices
+
+    assert _raw_equal(actual_selection, expected_selection)
+    assert actual_selection.stride() == expected_selection.stride()
+    assert torch.equal(actual_indices, expected_indices)
+    for name in expected_rank:
+        assert actual_rank[name].dtype == expected_rank[name].dtype, name
+        assert actual_rank[name].shape == expected_rank[name].shape, name
+        assert actual_rank[name].stride() == expected_rank[name].stride(), name
+        assert _raw_equal(actual_rank[name], expected_rank[name]), name
+    assert _raw_equal(classification, classification_before)
+    assert _raw_equal(quality, quality_before)
+    assert int(actual_rank["frozen_label"][1, 0]) == 0
+
+
+def test_shared_native_rank_selection_guard_is_plain_eager_only():
+    classification = torch.randn(2, 7, 6)
+    quality = torch.randn(2, 7, 2)
+
+    assert not _can_reuse_native_identity_rank_selection(
+        classification,
+        quality,
+        centerness_index=0,
+    )
+    with torch.no_grad():
+        assert _can_reuse_native_identity_rank_selection(
+            classification,
+            quality,
+            centerness_index=0,
+        )
+        assert not _can_reuse_native_identity_rank_selection(
+            classification.transpose(1, 2),
+            quality,
+            centerness_index=0,
+        )
+        assert not _can_reuse_native_identity_rank_selection(
+            classification,
+            quality,
+            centerness_index=2,
+        )
+
+    class FunctionMode(TorchFunctionMode):
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            del types
+            return func(*args, **(kwargs or {}))
+
+    class DispatchMode(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            del types
+            return func(*args, **(kwargs or {}))
+
+    with torch.no_grad(), FunctionMode():
+        assert not _can_reuse_native_identity_rank_selection(
+            classification,
+            quality,
+            centerness_index=0,
+        )
+    with torch.no_grad(), DispatchMode():
+        assert not _can_reuse_native_identity_rank_selection(
+            classification,
+            quality,
+            centerness_index=0,
+        )
+
+
+@pytest.mark.parametrize(
+    ("owner", "name"),
+    (
+        (sparse4d_scores_module, "compose_native_identity_rank"),
+        (
+            sparse4d_scores_module,
+            "_compose_native_identity_rank_and_selection",
+        ),
+        (sparse4d_scores_module, "_probability_dtype"),
+        (rfl_module, "_plain_eager_no_grad_execution"),
+        (torch, "gather"),
+        (torch.Tensor, "detach"),
+        (torch.Tensor, "sigmoid"),
+        (torch.Tensor, "amax"),
+        (torch.Tensor, "argmax"),
+        (torch.Tensor, "max"),
+        (torch.Tensor, "squeeze"),
+        (torch.Tensor, "to"),
+        (torch.Tensor, "__mul__"),
+        (torch.Tensor, "__getitem__"),
+    ),
+)
+def test_shared_native_rank_selection_guard_rejects_primitive_override(
+    monkeypatch,
+    owner,
+    name,
+):
+    classification = torch.randn(2, 7, 6)
+    quality = torch.randn(2, 7, 2)
+    monkeypatch.setattr(owner, name, lambda *_args, **_kwargs: None)
+    with torch.no_grad():
+        assert not _can_reuse_native_identity_rank_selection(
+            classification,
+            quality,
+            centerness_index=0,
+        )
 
 
 class _IdentityBoxDecoder:

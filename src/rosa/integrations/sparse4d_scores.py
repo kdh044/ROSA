@@ -10,6 +10,8 @@ import torch
 from torch import Tensor
 import torch.nn.functional as F
 
+from .. import rfl as _rfl
+
 
 def _pack_frozen_decode_fields(
     decoded_boxes: Tensor,
@@ -214,6 +216,92 @@ def compose_native_identity_rank(
         "native_selected_probability": selected_probability.detach(),
         "emitted_joint_score": emitted,
     }
+
+
+def _compose_native_identity_rank_and_selection(
+    baseline_classification: Tensor,
+    baseline_quality: Tensor,
+    *,
+    centerness_index: int,
+) -> tuple[dict[str, Tensor], Tensor]:
+    """Build exact native rank fields and the pre-refinement selection score.
+
+    The released selection uses ``amax`` while identity ranking uses
+    ``argmax`` followed by ``gather``. Those reductions differ in NaN bit
+    patterns, so retain both values while sharing their sigmoid inputs.
+    """
+
+    if (
+        baseline_classification.ndim != 3
+        or baseline_quality.shape[:2] != baseline_classification.shape[:2]
+    ):
+        raise ValueError("native identity-rank tensors are misaligned")
+    native_probability = baseline_classification.detach().sigmoid()
+    selection_probability = native_probability.amax(dim=-1)
+    selected_probability, frozen_label = native_probability.max(dim=-1)
+    centerness_probability = (
+        baseline_quality[..., int(centerness_index)].detach().sigmoid()
+    )
+    selection_score = selection_probability * centerness_probability
+    low_precision_product = selected_probability * centerness_probability
+    emitted = low_precision_product.to(
+        dtype=_probability_dtype(baseline_classification.dtype)
+    ).detach()
+    return (
+        {
+            "frozen_label": frozen_label,
+            "native_selected_probability": selected_probability.detach(),
+            "emitted_joint_score": emitted,
+        },
+        selection_score,
+    )
+
+
+def _can_reuse_native_identity_rank_selection(
+    baseline_classification: Tensor,
+    baseline_quality: Tensor,
+    *,
+    centerness_index: int,
+) -> bool:
+    """Seal shared native-rank computation to plain eager inference."""
+
+    tensors = (baseline_classification, baseline_quality)
+    return bool(
+        compose_native_identity_rank is _RELEASED_COMPOSE_NATIVE_IDENTITY_RANK
+        and _compose_native_identity_rank_and_selection
+        is _RELEASED_COMPOSE_NATIVE_IDENTITY_RANK_AND_SELECTION
+        and _probability_dtype is _RELEASED_PROBABILITY_DTYPE
+        and _rfl._plain_eager_no_grad_execution is _RELEASED_PLAIN_EAGER_NO_GRAD
+        and _rfl._plain_eager_no_grad_execution()
+        and torch.gather is _RELEASED_TORCH_GATHER
+        and torch.Tensor.detach is _RELEASED_TENSOR_DETACH
+        and torch.Tensor.sigmoid is _RELEASED_TENSOR_SIGMOID
+        and torch.Tensor.amax is _RELEASED_TENSOR_AMAX
+        and torch.Tensor.argmax is _RELEASED_TENSOR_ARGMAX
+        and torch.Tensor.max is _RELEASED_TENSOR_MAX
+        and torch.Tensor.squeeze is _RELEASED_TENSOR_SQUEEZE
+        and torch.Tensor.to is _RELEASED_TENSOR_TO
+        and torch.Tensor.__mul__ is _RELEASED_TENSOR_MULTIPLY
+        and torch.Tensor.__getitem__ is _RELEASED_TENSOR_GETITEM
+        and type(centerness_index) is int
+        and type(baseline_classification) is torch.Tensor
+        and type(baseline_quality) is torch.Tensor
+        and baseline_classification.ndim == 3
+        and baseline_quality.ndim == 3
+        and baseline_quality.shape[:2] == baseline_classification.shape[:2]
+        and 0 <= centerness_index < baseline_quality.shape[-1]
+        and all(
+            value.dtype in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
+            and value.device == baseline_classification.device
+            and value.device.type in ("cpu", "cuda")
+            and value.layout == torch.strided
+            and not value.is_quantized
+            and not value.requires_grad
+            and value.is_contiguous()
+            and all(name is None for name in value.names)
+            for value in tensors
+        )
+    )
 
 
 def ddp_mean(value: Tensor) -> Tensor:
@@ -481,6 +569,24 @@ def decode_frozen_jointscore_rank(
             raise RuntimeError("frozen-label decoder dropped a query")
         output.append(item)
     return output
+
+
+_RELEASED_COMPOSE_NATIVE_IDENTITY_RANK = compose_native_identity_rank
+_RELEASED_COMPOSE_NATIVE_IDENTITY_RANK_AND_SELECTION = (
+    _compose_native_identity_rank_and_selection
+)
+_RELEASED_PROBABILITY_DTYPE = _probability_dtype
+_RELEASED_PLAIN_EAGER_NO_GRAD = _rfl._plain_eager_no_grad_execution
+_RELEASED_TORCH_GATHER = torch.gather
+_RELEASED_TENSOR_DETACH = torch.Tensor.detach
+_RELEASED_TENSOR_SIGMOID = torch.Tensor.sigmoid
+_RELEASED_TENSOR_AMAX = torch.Tensor.amax
+_RELEASED_TENSOR_ARGMAX = torch.Tensor.argmax
+_RELEASED_TENSOR_MAX = torch.Tensor.max
+_RELEASED_TENSOR_SQUEEZE = torch.Tensor.squeeze
+_RELEASED_TENSOR_TO = torch.Tensor.to
+_RELEASED_TENSOR_MULTIPLY = torch.Tensor.__mul__
+_RELEASED_TENSOR_GETITEM = torch.Tensor.__getitem__
 
 
 __all__ = [
