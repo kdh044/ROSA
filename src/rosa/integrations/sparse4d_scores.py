@@ -335,6 +335,21 @@ def ddp_mean_mask_count(mask: Tensor, dtype: torch.dtype) -> Tensor:
     return ddp_mean(mask.sum().to(dtype=dtype))
 
 
+def nonzero_count_denominator(count: Tensor) -> Tensor:
+    """Preserve positive fractional DDP counts and guard only an empty set.
+
+    ``ddp_mean_mask_count`` returns the number of selected items divided by the
+    world size.  That value can legitimately be between zero and one.  DDP
+    averages parameter gradients afterwards, so clamping a positive fraction
+    to one attenuates the global gradient a second time.  Only an exactly empty
+    global count needs the unit fallback.
+    """
+
+    if count.numel() != 1 or not count.is_floating_point():
+        raise ValueError("loss count must be one floating scalar")
+    return torch.where(count.gt(0), count, torch.ones_like(count))
+
+
 @dataclass
 class JointScoreLoss:
     loss: Tensor
@@ -388,10 +403,10 @@ def jointscore_quality_focal_loss(
     ) * F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     positive_mean = (
         per_query * positive.to(per_query.dtype)
-    ).sum() / positive_count.clamp_min(1)
+    ).sum() / nonzero_count_denominator(positive_count)
     negative_mean = (
         per_query * negative.to(per_query.dtype)
-    ).sum() / negative_count.clamp_min(1)
+    ).sum() / nonzero_count_denominator(negative_count)
     positive_active = bool(positive_count.detach().gt(0).item())
     negative_active = bool(negative_count.detach().gt(0).item())
     if positive_active and negative_active:
@@ -420,7 +435,9 @@ def task_box_loss(
 ) -> Tensor:
     """Apply Sparse4D's native box loss to one state slice."""
 
-    average = ddp_mean_mask_count(selected, final_reg.dtype).clamp_min(1)
+    average = nonzero_count_denominator(
+        ddp_mean_mask_count(selected, final_reg.dtype)
+    )
     mask = selected.reshape(-1)
     flat_reg = final_reg.flatten(end_dim=1)[mask]
     if flat_reg.shape[0] == 0:
@@ -644,6 +661,7 @@ __all__ = [
     "ddp_mean_mask_count",
     "decode_frozen_jointscore_rank",
     "jointscore_quality_focal_loss",
+    "nonzero_count_denominator",
     "stable_joint_probability",
     "stable_native_joint_logit",
     "task_box_loss",

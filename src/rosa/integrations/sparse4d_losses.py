@@ -13,6 +13,7 @@ from .sparse4d_scores import (
     ddp_mean,
     ddp_mean_mask_count,
     jointscore_quality_focal_loss,
+    nonzero_count_denominator,
     task_box_loss,
 )
 
@@ -109,7 +110,7 @@ def _radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
 
 
 def _selected_mean(value: Tensor, mask: Tensor) -> Tensor:
-    count = ddp_mean_mask_count(mask, value.dtype).clamp_min(1)
+    count = nonzero_count_denominator(ddp_mean_mask_count(mask, value.dtype))
     return (value * mask.to(dtype=value.dtype)).sum() / count
 
 
@@ -147,7 +148,7 @@ def _yaw_selected_mean(
         return _selected_mean(value, mask)
     if class_weight.shape != mask.shape:
         raise ValueError("yaw class weights must align with the query mask")
-    count = ddp_mean_mask_count(mask, value.dtype).clamp_min(1)
+    count = nonzero_count_denominator(ddp_mean_mask_count(mask, value.dtype))
     return (
         value * class_weight.to(dtype=value.dtype) * mask.to(dtype=value.dtype)
     ).sum() / count
@@ -772,7 +773,7 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
                 "cl_center_gate_supervised_count": center_gate_supervised_count,
                 "cl_center_gate_positive_rate": (
                     center_gate_positive_count
-                    / center_gate_supervised_count.clamp_min(1.0)
+                    / nonzero_count_denominator(center_gate_supervised_count)
                 ),
             }
         )

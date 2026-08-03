@@ -16,6 +16,7 @@ from rosa.integrations.sparse4d_losses import (
 from rosa.integrations.sparse4d_scores import (
     compose_quality_rank,
     jointscore_quality_focal_loss,
+    nonzero_count_denominator,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -175,3 +176,66 @@ def test_quality_loss_cannot_train_native_scores_or_unsupported_delta():
     assert delta.grad is not None
     assert delta.grad[0, 0, 0] != 0
     assert delta.grad[0, 1, 0] == 0
+
+
+def test_nonzero_count_denominator_preserves_fractional_ddp_mean():
+    assert torch.equal(
+        nonzero_count_denominator(torch.tensor(0.0)),
+        torch.tensor(1.0),
+    )
+    assert torch.equal(
+        nonzero_count_denominator(torch.tensor(0.5)),
+        torch.tensor(0.5),
+    )
+    assert torch.equal(
+        nonzero_count_denominator(torch.tensor(2.0)),
+        torch.tensor(2.0),
+    )
+    with pytest.raises(ValueError, match="one floating scalar"):
+        nonzero_count_denominator(torch.tensor((1, 2)))
+
+
+def test_quality_gradient_keeps_a_single_global_positive_in_world_two(monkeypatch):
+    reference_logit = torch.tensor(0.25, requires_grad=True)
+    reference_probability = reference_logit.sigmoid()
+    reference_loss = (1.0 - reference_probability).abs().pow(
+        2.0
+    ) * torch.nn.functional.binary_cross_entropy_with_logits(
+        reference_logit,
+        torch.ones_like(reference_logit),
+    )
+    reference_loss.backward()
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda value, op: None,
+    )
+
+    distributed_logit = torch.tensor([[0.25]], requires_grad=True)
+    loss = jointscore_quality_focal_loss(
+        distributed_logit,
+        distributed_logit,
+        torch.full_like(distributed_logit, 0.5),
+        torch.ones_like(distributed_logit),
+        torch.ones_like(distributed_logit, dtype=torch.bool),
+        gamma=2.0,
+    ).loss
+    loss.backward()
+
+    torch.testing.assert_close(
+        distributed_logit.grad.squeeze() / 2,
+        reference_logit.grad,
+    )
+
+
+def test_fractional_gate_counts_report_the_true_positive_rate():
+    supervised = torch.tensor(0.5)
+    positive = torch.tensor(0.5)
+
+    rate = positive / nonzero_count_denominator(supervised)
+
+    assert torch.equal(rate, torch.tensor(1.0))

@@ -15,7 +15,7 @@ from rosa.integrations.sparse4d_losses import (
     evaluator_aligned_quality_target,
     rosa_losses,
 )
-from rosa.integrations.sparse4d_scores import compose_quality_rank
+from rosa.integrations.sparse4d_scores import compose_quality_rank, task_box_loss
 from rosa.refiner import ROSARefiner
 
 
@@ -458,6 +458,48 @@ def test_disabled_yaw_class_weighting_is_exactly_the_original_reduction():
     disabled = _yaw_selected_mean(per_query, selected, None)
 
     assert torch.equal(disabled, original)
+
+
+def test_sparse_loss_gradients_keep_a_single_global_item_in_world_two(monkeypatch):
+    """A positive DDP-mean count of 0.5 must not be clamped to one."""
+
+    monkeypatch.setattr(torch.distributed, "is_available", lambda: True)
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 2)
+    monkeypatch.setattr(
+        torch.distributed,
+        "all_reduce",
+        lambda value, op: None,
+    )
+
+    selected = torch.tensor((True,))
+
+    selected_value = torch.tensor((1.0,), requires_grad=True)
+    _selected_mean(selected_value, selected).backward()
+    torch.testing.assert_close(
+        selected_value.grad / 2,
+        torch.ones_like(selected_value),
+    )
+
+    yaw_value = torch.tensor((1.0,), requires_grad=True)
+    _yaw_selected_mean(yaw_value, selected, torch.tensor((2.0,))).backward()
+    torch.testing.assert_close(yaw_value.grad / 2, torch.full_like(yaw_value, 2.0))
+
+    class _AbsoluteBoxLoss:
+        @staticmethod
+        def loss_box(prediction, target, *, weight, avg_factor):
+            return ((prediction - target).abs() * weight).sum() / avg_factor
+
+    box_value = torch.tensor([[[1.0]]], requires_grad=True)
+    task_box_loss(
+        _AbsoluteBoxLoss(),
+        box_value,
+        torch.zeros_like(box_value),
+        torch.ones_like(box_value),
+        selected.reshape(1, 1),
+        slice(0, 1),
+    ).backward()
+    torch.testing.assert_close(box_value.grad / 2, torch.ones_like(box_value))
 
 
 def test_diagnostic_mean_reduces_both_ddp_numerator_and_count(monkeypatch):
