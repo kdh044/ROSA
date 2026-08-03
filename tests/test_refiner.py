@@ -1346,6 +1346,66 @@ def test_partial_candidate_support_has_an_exact_zero_initial_prior(fixed_metric)
     assert torch.equal(proposal, torch.zeros_like(proposal))
 
 
+def test_fixed_base_center_uses_one_orthonormal_frame(monkeypatch):
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "center_target_mode": "fixed_base",
+            "force_radial_gate_one": True,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(config)
+    tangent_delta = 0.5
+    with torch.no_grad():
+        stage.shared_tangent_head[-1].bias.fill_(
+            torch.atanh(torch.tensor(tangent_delta / config.max_tangent_delta_m))
+        )
+
+    def fixed_proposal(*_args, **_kwargs):
+        return anchor.new_ones(anchor.shape[:2])
+
+    monkeypatch.setattr(stage, "_posterior_radial_proposal", fixed_proposal)
+    output = stage(anchor, query, fpn, metas, generator)
+
+    expected_xy = anchor[..., :2] + torch.tensor((1.0, tangent_delta))
+    torch.testing.assert_close(output.final_anchor[..., :2], expected_xy)
+    assert torch.equal(output.final_anchor[..., 6:8], anchor[..., 6:8])
+
+
+def test_fixed_base_gate_feedback_contains_the_applied_proposal(monkeypatch):
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "center_target_mode": "fixed_base",
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(config)
+    expected = anchor.new_full(anchor.shape[:2], 0.375)
+
+    def fixed_proposal(*_args, **_kwargs):
+        return expected
+
+    feedback = []
+
+    def capture_feedback(_module, args):
+        feedback.append(args[0].detach())
+
+    monkeypatch.setattr(stage, "_posterior_radial_proposal", fixed_proposal)
+    handle = stage.center_gate_head.register_forward_pre_hook(capture_feedback)
+    try:
+        stage(anchor, query, fpn, metas, generator)
+    finally:
+        handle.remove()
+
+    assert len(feedback) == 1
+    proposal_slot = feedback[0][..., 2 * config.embed_dims]
+    torch.testing.assert_close(proposal_slot, expected)
+
+
 def test_corrected_geometry_normalizes_yaw_without_changing_native_box():
     cfg = ROSAConfig.from_mapping(
         {

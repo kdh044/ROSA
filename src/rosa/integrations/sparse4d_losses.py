@@ -198,6 +198,30 @@ def _sequential_center_targets(
     return radial_target, tangent_target, log_range_target
 
 
+def _fixed_base_center_targets(
+    step_base: Tensor,
+    target_xy: Tensor,
+    *,
+    min_range: float,
+    max_range: float,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Project XY supervision onto one fixed orthonormal BEV frame."""
+
+    radial, tangent = _radial_basis(step_base[..., :2])
+    error_xy = target_xy - step_base[..., :2]
+    radial_target = (error_xy * radial).sum(dim=-1)
+    tangent_target = (error_xy * tangent).sum(dim=-1)
+    base_range = torch.linalg.vector_norm(step_base[..., :2], dim=-1).clamp_min(
+        min_range
+    )
+    target_radial_coordinate = (base_range + radial_target).clamp(
+        min=min_range,
+        max=max_range,
+    )
+    log_range_target = torch.log(target_radial_coordinate / base_range)
+    return radial_target, tangent_target, log_range_target
+
+
 def _candidate_target_distribution(
     offsets: Tensor,
     radial_target: Tensor,
@@ -302,6 +326,8 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
     radial_offset_loss = zero
     center_gate_loss = zero
     tangent_loss = zero
+    center_gate_supervised_count = zero.detach()
+    center_gate_positive_count = zero.detach()
     for step in range(num_steps):
         weight = step_weights[step]
         step_base = step_bases[:, :, step]
@@ -394,7 +420,18 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             yaw_loss = yaw_loss + weight * yaw_step_loss
 
         with torch.no_grad():
-            if cfg.center_target_mode == "sequential":
+            if cfg.center_target_mode == "fixed_base":
+                (
+                    radial_target,
+                    tangent_target,
+                    log_range_target,
+                ) = _fixed_base_center_targets(
+                    step_base,
+                    safe_target[..., :2],
+                    min_range=cfg.min_candidate_range_m,
+                    max_range=cfg.max_candidate_range_m,
+                )
+            elif cfg.center_target_mode == "sequential":
                 (
                     radial_target,
                     tangent_target,
@@ -480,41 +517,83 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             candidate_loss = candidate_loss + weight * _selected_mean(
                 per_query, candidate_mask
             )
-            radial_offset_loss = (
-                radial_offset_loss
-                + weight
-                * _selected_mean(
-                    F.smooth_l1_loss(
-                        record["iteration_radial_safe"][:, :, step],
-                        radial_target,
-                        reduction="none",
-                        beta=0.1,
-                    ),
-                    center_aux_mask,
-                )
+            radial_offset_loss = radial_offset_loss + weight * _selected_mean(
+                F.smooth_l1_loss(
+                    record["iteration_radial_safe"][:, :, step],
+                    radial_target,
+                    reduction="none",
+                    beta=0.1,
+                ),
+                center_aux_mask,
             )
             if cfg.center_update_mode == "posterior_gate":
-                proposal = record["iteration_radial_proposal"][
-                    :, :, step
-                ]
-                gate_target = (
-                    (radial_target - proposal.detach()).abs()
-                    + cfg.center_gate_margin_m
-                    < radial_target.abs()
-                ).to(proposal.dtype)
+                proposal = record["iteration_radial_proposal"][:, :, step]
+                detached_proposal = proposal.detach()
+                if cfg.center_target_mode == "fixed_base":
+                    radial, tangent = _radial_basis(step_base[..., :2])
+                    tangent_anchor_xy = (
+                        step_base[..., :2]
+                        + tangent
+                        * record["iteration_tangent_delta"][:, :, step].detach()[
+                            ..., None
+                        ]
+                    )
+                    before_error = torch.linalg.vector_norm(
+                        safe_target[..., :2] - tangent_anchor_xy,
+                        dim=-1,
+                    )
+                    proposed_xy = (
+                        tangent_anchor_xy + radial * detached_proposal[..., None]
+                    )
+                    after_error = torch.linalg.vector_norm(
+                        safe_target[..., :2] - proposed_xy,
+                        dim=-1,
+                    )
+                    gate_target = (
+                        after_error + cfg.center_gate_margin_m < before_error
+                    ).to(proposal.dtype)
+                    # A zero-initialized posterior produces exactly zero
+                    # proposals.  Supervising those as rejects closes the gate
+                    # before its proposal branch has learned anything.
+                    proposal_is_informative = detached_proposal.abs().ge(
+                        cfg.center_gate_margin_m
+                    )
+                else:
+                    gate_target = (
+                        (radial_target - detached_proposal).abs()
+                        + cfg.center_gate_margin_m
+                        < radial_target.abs()
+                    ).to(proposal.dtype)
+                    proposal_is_informative = torch.ones_like(
+                        gate_target, dtype=torch.bool
+                    )
                 gate_bce = F.binary_cross_entropy_with_logits(
                     record["iteration_radial_gate_logit"][:, :, step],
                     gate_target,
                     reduction="none",
                 )
-                center_gate_loss = (
-                    center_gate_loss
-                    + weight
-                    * _selected_mean(
-                        gate_bce,
-                        center_aux_mask & supported.any(dim=-1),
-                    )
+                gate_supervision_mask = (
+                    center_aux_mask & supported.any(dim=-1) & proposal_is_informative
                 )
+                center_gate_loss = center_gate_loss + weight * _selected_mean(
+                    gate_bce,
+                    gate_supervision_mask,
+                )
+                with torch.no_grad():
+                    center_gate_supervised_count = (
+                        center_gate_supervised_count
+                        + ddp_mean_mask_count(
+                            gate_supervision_mask,
+                            proposal.dtype,
+                        )
+                    )
+                    center_gate_positive_count = (
+                        center_gate_positive_count
+                        + ddp_mean_mask_count(
+                            gate_supervision_mask & gate_target.bool(),
+                            proposal.dtype,
+                        )
+                    )
         if tangent_aux_active:
             tangent_loss = tangent_loss + weight * _selected_mean(
                 F.smooth_l1_loss(
@@ -588,6 +667,12 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
             safe_target[..., _YAW],
         ).abs()
         yaw_improved = final_yaw_error.lt(baseline_yaw_error)
+        final_center_error = torch.linalg.vector_norm(
+            final_reg[..., :2] - safe_target[..., :2],
+            dim=-1,
+        )
+        center_improved = final_center_error.lt(initial_distance)
+        center_harmed = final_center_error.gt(initial_distance)
         iteration_yaw_raw = record.get("iteration_yaw_raw_delta")
         iteration_yaw_gate = record.get("iteration_yaw_gate")
         iteration_yaw_delta = record.get("iteration_yaw_delta")
@@ -644,6 +729,22 @@ def rosa_losses(head, record: dict, data: dict) -> dict:
         "cl_radial_gate_mean": record["radial_gate"].detach().mean(),
         "cl_radial_abs_mean": record["radial_safe"].detach().abs().mean(),
         "cl_tangent_abs_mean": (record["tangent_delta"].detach().abs().mean()),
+        "cl_center_baseline_error_mean": _selected_mean(
+            initial_distance, matched
+        ).detach(),
+        "cl_center_final_error_mean": _selected_mean(
+            final_center_error, matched
+        ).detach(),
+        "cl_center_improvement_rate": _selected_mean(
+            center_improved.to(final_reg.dtype), matched
+        ).detach(),
+        "cl_center_harm_rate": _selected_mean(
+            center_harmed.to(final_reg.dtype), matched
+        ).detach(),
+        "cl_center_gate_supervised_count": center_gate_supervised_count,
+        "cl_center_gate_positive_rate": (
+            center_gate_positive_count / center_gate_supervised_count.clamp_min(1.0)
+        ),
         "cl_yaw_baseline_error_mean": _selected_mean(
             baseline_yaw_error, matched
         ).detach(),

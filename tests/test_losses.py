@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from rosa import ROSAConfig
 from rosa.integrations.sparse4d_losses import (
     _candidate_target_distribution,
+    _fixed_base_center_targets,
     _selected_mean,
     _yaw_selected_mean,
     evaluator_aligned_centerness_target,
@@ -353,6 +354,59 @@ def test_candidate_target_stays_normalized_when_best_hypothesis_is_hidden():
     )
     assert distribution[0, 0, 2] == 0
     assert distribution[0, 0, 1] > distribution[0, 0, 0]
+
+
+def test_fixed_base_center_targets_exactly_reconstruct_xy():
+    step_base = torch.zeros(1, 1, 10)
+    step_base[..., :2] = torch.tensor((4.0, 0.0))
+    target_xy = torch.tensor([[[5.0, 0.75]]])
+
+    radial_target, tangent_target, log_range_target = _fixed_base_center_targets(
+        step_base,
+        target_xy,
+        min_range=0.5,
+        max_range=68.0,
+    )
+    radial = torch.tensor([[[1.0, 0.0]]])
+    tangent = torch.tensor([[[0.0, 1.0]]])
+    reconstructed = (
+        step_base[..., :2]
+        + radial * radial_target[..., None]
+        + tangent * tangent_target[..., None]
+    )
+
+    torch.testing.assert_close(reconstructed, target_xy, atol=1e-6, rtol=0)
+    torch.testing.assert_close(radial_target, torch.tensor([[1.0]]))
+    torch.testing.assert_close(tangent_target, torch.tensor([[0.75]]))
+    torch.testing.assert_close(log_range_target.exp(), torch.tensor([[1.25]]))
+
+
+def test_fixed_base_zero_posterior_does_not_train_gate_closed():
+    config = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+            "center_target_mode": "fixed_base",
+        }
+    )
+    refiner, losses, _ = _full_loss(config)
+    gate_loss = losses["loss_cl_center_gate_6"]
+
+    assert torch.equal(gate_loss, torch.zeros_like(gate_loss))
+    assert losses["cl_center_gate_supervised_count"] == 0
+    assert losses["cl_center_gate_positive_rate"] == 0
+    for name in (
+        "cl_center_baseline_error_mean",
+        "cl_center_final_error_mean",
+        "cl_center_improvement_rate",
+        "cl_center_harm_rate",
+    ):
+        assert torch.isfinite(losses[name])
+    gate_loss.backward()
+    gradient = refiner.center_gate_head[-1].bias.grad
+    assert gradient is not None
+    assert torch.count_nonzero(gradient) == 0
 
 
 def test_yaw_class_weighting_keeps_the_matched_count_denominator():

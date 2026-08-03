@@ -890,7 +890,7 @@ class ROSARefiner(nn.Module):
         tangent_base = (
             current if config.architecture_profile == "legacy" else geometry_base
         )
-        _, tangent = _radial_basis(tangent_base[..., :2])
+        radial, tangent = _radial_basis(tangent_base[..., :2])
         tangent_raw = self.shared_tangent_head(shared).squeeze(-1)
         tangent_delta = (
             tangent_raw.tanh() * config.max_tangent_delta_m
@@ -907,16 +907,24 @@ class ROSARefiner(nn.Module):
             shape_anchor,
             tangent * tangent_delta[..., None],
         )
-        radial, _ = _radial_basis(tangent_anchor[..., :2])
+
+        # Corrected center refinement uses one orthonormal frame for both
+        # components.  Recomputing the radial axis after the tangent update
+        # makes the two axes non-orthogonal and leaves a deterministic XY
+        # residual even when both scalar targets are exact.  The historical
+        # sequential frame remains available for old checkpoint reproduction.
+        fixed_base_center = config.center_target_mode == "fixed_base"
+        if not fixed_base_center:
+            radial, _ = _radial_basis(tangent_anchor[..., :2])
 
         distribution = self.range_distribution_head(shared)
         distribution_mean = distribution[..., 0]
         distribution_std = (
             config.min_log_range_std + F.softplus(distribution[..., 1])
         ).clamp(max=config.max_log_range_std)
+        range_anchor = tangent_base if fixed_base_center else tangent_anchor
         current_range = torch.linalg.vector_norm(
-            tangent_anchor[..., :2],
-            dim=-1,
+            range_anchor[..., :2], dim=-1
         ).clamp_min(config.min_candidate_range_m)
         offsets = self._candidate_offsets(
             current_range,
@@ -948,8 +956,27 @@ class ROSARefiner(nn.Module):
                 distribution_mean,
             )
 
+        if config.center_update_mode == "legacy_candidate_gate":
+            radial_proposal = candidates.radial_delta
+        else:
+            radial_proposal = self._posterior_radial_proposal(
+                candidates,
+                current_range,
+                distribution_mean,
+                distribution_std,
+                sigma_points,
+                fixed_metric=(step == 0 and config.fixed_metric_radial_hypotheses),
+                step=step,
+            )
+
+        # The corrected gate observes the same proposal that it controls and
+        # that the loss supervises.  Keep the historical scalar for explicit
+        # sequential-mode checkpoint reproduction.
+        gate_proposal_feature = (
+            radial_proposal if fixed_base_center else candidates.radial_delta
+        )
         scalar_feedback = [
-            candidates.radial_delta,
+            gate_proposal_feature,
             candidates.entropy,
             candidates.margin,
             distribution_std,
@@ -981,19 +1008,9 @@ class ROSARefiner(nn.Module):
             reliability_context = _observation_reliability_context(observation)
         radial_supported = observation.supported & candidates.supported.any(dim=2)
         if config.center_update_mode == "legacy_candidate_gate":
-            radial_proposal = candidates.radial_delta
             radial_gate_logit = self.center_gate_head(feedback).squeeze(-1)
             radial_gate = (2.0 * torch.sigmoid(radial_gate_logit) - 1.0).clamp(0.0, 1.0)
         else:
-            radial_proposal = self._posterior_radial_proposal(
-                candidates,
-                current_range,
-                distribution_mean,
-                distribution_std,
-                sigma_points,
-                fixed_metric=(step == 0 and config.fixed_metric_radial_hypotheses),
-                step=step,
-            )
             radial_gate_logit = self.center_gate_head(feedback).squeeze(-1)
             radial_gate = torch.sigmoid(radial_gate_logit)
 
@@ -1027,25 +1044,11 @@ class ROSARefiner(nn.Module):
         if not legacy_yaw and yaw_enabled:
             yaw_raw_delta = raw_shape[..., 3:4].tanh() * yaw_limit
             yaw_gate_logit = torch.zeros_like(yaw_raw_delta)
-            if config.yaw_gate_mode == "none":
-                yaw_gate = torch.ones_like(yaw_raw_delta)
-            elif config.yaw_gate_mode == "support":
-                yaw_gate = observation.supported[..., None].to(yaw_raw_delta.dtype)
-            else:
-                anisotropy_gap = reliability_context[..., 3:4]
-                camera_count = reliability_context[..., 1:2] * config.num_cameras
-                overlap_gate = torch.sigmoid(
-                    (config.yaw_anisotropy_threshold - anisotropy_gap)
-                    / config.yaw_anisotropy_temperature
-                )
-                yaw_gate = torch.where(
-                    camera_count >= 2,
-                    overlap_gate,
-                    torch.ones_like(overlap_gate),
-                )
-                yaw_gate = yaw_gate * observation.supported[..., None].to(
-                    yaw_gate.dtype
-                )
+            yaw_gate = _yaw_reliability_gate(
+                reliability_context,
+                observation.supported,
+                config,
+            )
             if config.mask_unsupported_updates:
                 support = observation.supported[..., None]
                 yaw_raw_delta = torch.where(

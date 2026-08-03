@@ -216,6 +216,7 @@ class ROSAConfig:
         if self.center_target_mode not in (
             "legacy_base",
             "sequential",
+            "fixed_base",
         ):
             raise ValueError("invalid center target mode")
         if self.center_supervision_mode not in (

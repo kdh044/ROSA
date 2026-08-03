@@ -106,6 +106,32 @@ def test_fast_cp16_has_a_schedule_matched_c32_control() -> None:
     )
 
 
+def test_fixed_base_v4_changes_only_the_center_frame_contract() -> None:
+    sequential = _config("rosa_r18_main126_v3_fast_cp16_official_residual.py")
+    fixed_base = _config(
+        "rosa_r18_main126_v4_fast_cp16_fixed_base_official_residual.py"
+    )
+
+    sequential_pair = copy.deepcopy(sequential.to_dict())
+    fixed_pair = copy.deepcopy(fixed_base.to_dict())
+    for value in (sequential_pair, fixed_pair):
+        value.pop("work_dir")
+        value.pop("experiment_contract")
+        value.pop("sealed_resume_contract")
+    assert sequential_pair["model"]["head"]["rosa_cfg"] == {"profile": "fast"}
+    fixed_pair["model"]["head"]["rosa_cfg"] = {"profile": "fast"}
+    assert fixed_pair == sequential_pair
+
+    assert fixed_base.model.head.rosa_cfg == {
+        "profile": "fast",
+        "center_target_mode": "fixed_base",
+    }
+    assert fixed_base.train_cfg.max_epochs == 30
+    assert fixed_base.experiment_contract.refined_queries == 50
+    assert fixed_base.experiment_contract.refinement_steps == 1
+    assert fixed_base.experiment_contract.learned_refiner_parameters == 87_935
+
+
 def test_combined_head_preserves_c32_native_state_and_residual_math() -> None:
     host = _detector_host()
     if not host.is_dir():

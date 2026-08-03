@@ -48,6 +48,13 @@ def test_balanced_profile_applies_one_auditable_preset():
     assert config.yaw_class_loss_weights is None
 
 
+def test_fixed_base_center_frame_is_an_explicit_corrected_ablation():
+    config = ROSAConfig.from_mapping(
+        {"profile": "fast", "center_target_mode": "fixed_base"}
+    )
+    assert config.center_target_mode == "fixed_base"
+
+
 def test_v2_native_sampling_and_refiner_share_gravity_center_z_contract():
     resolved = Config.fromfile(ROOT / "configs" / "rosa_r18_main126_v2.py")
     head = resolved.model.head
