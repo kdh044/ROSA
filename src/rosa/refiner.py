@@ -372,6 +372,13 @@ class ROSARefiner(nn.Module):
             if (config.architecture_profile == "legacy" or config.enable_quality_score)
             else None
         )
+        # ``nn.Module.compile`` replaces the complete module call boundary.
+        # The latency profile needs a narrower contract: only the one-step
+        # anchor calculation may be compiled, while detector scores, ranking,
+        # decoding, public validation, and hooks remain ordinary eager code.
+        # Keep the callable outside the state dict so checkpoints retain the
+        # exact same learned topology.
+        self._compiled_fast_anchor_impl = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
@@ -1072,6 +1079,88 @@ class ROSARefiner(nn.Module):
             observation=observation,
         )
 
+    def _fast_anchor_core(
+        self,
+        base: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metadata: dict,
+        keypoint_generator: KeypointGenerator,
+    ) -> Tensor:
+        """Return the fast profile's refined anchor through one pure boundary."""
+
+        sigma_points = base.new_tensor(_COMPACT_SIGMA_POINTS)
+        return self._refine_once(
+            base,
+            query,
+            fpn,
+            metadata,
+            keypoint_generator,
+            0,
+            sigma_points,
+            False,
+        ).anchor
+
+    def compile_fast_anchor(
+        self,
+        *,
+        mode: str = "max-autotune-no-cudagraphs",
+        fullgraph: bool = True,
+    ) -> None:
+        """Compile only the sealed one-step, anchor-only inference graph.
+
+        This deliberately does not call :meth:`nn.Module.compile`.  In the
+        Sparse4D integration, class/quality scores and their ranking are
+        computed outside this module and must remain on the original eager
+        path.  The method is an explicit deployment action performed only
+        after checkpoint loading; training never enables it implicitly.
+        """
+
+        if (
+            self.cfg.architecture_profile != "compact"
+            or self.cfg.num_refinement_steps != 1
+            or self.cfg.enable_quality_score
+            or self.quality_head is not None
+        ):
+            raise RuntimeError(
+                "fast-anchor compilation requires one-step compact inference "
+                "without a quality head"
+            )
+        if self.training:
+            raise RuntimeError("fast-anchor compilation requires eval mode")
+        if self._compiled_fast_anchor_impl is not None:
+            return
+        self._compiled_fast_anchor_impl = torch.compile(
+            self._fast_anchor_core,
+            mode=mode,
+            fullgraph=fullgraph,
+        )
+
+    def _compiled_fast_anchor_is_usable(
+        self,
+        keypoint_generator: KeypointGenerator,
+    ) -> bool:
+        """Keep dynamic PyTorch hook semantics outside the compiled core."""
+
+        if self._compiled_fast_anchor_impl is None:
+            return False
+        modules = tuple(self.modules())
+        if isinstance(keypoint_generator, nn.Module):
+            modules = (*modules, *tuple(keypoint_generator.modules()))
+        return not bool(
+            any(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+                for module in modules
+            )
+            or torch.nn.modules.module._global_forward_pre_hooks
+            or torch.nn.modules.module._global_forward_hooks
+            or torch.nn.modules.module._global_backward_pre_hooks
+            or torch.nn.modules.module._global_backward_hooks
+        )
+
     def forward(
         self,
         baseline_anchor: Tensor,
@@ -1104,6 +1193,19 @@ class ROSARefiner(nn.Module):
             )
         base = baseline_anchor.detach()
         query_sidecar = query.detach()
+        if return_final_anchor_only and self.cfg.num_refinement_steps == 1:
+            anchor_impl = (
+                self._compiled_fast_anchor_impl
+                if self._compiled_fast_anchor_is_usable(keypoint_generator)
+                else self._fast_anchor_core
+            )
+            return anchor_impl(
+                base,
+                query_sidecar,
+                fpn,
+                metas,
+                keypoint_generator,
+            )
         sigma_points = base.new_tensor(
             _LEGACY_SIGMA_POINTS
             if self.cfg.architecture_profile == "legacy"

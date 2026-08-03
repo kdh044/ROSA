@@ -1071,6 +1071,118 @@ def test_fast_final_anchor_only_is_one_full_compiled_graph():
     assert _raw_equal(actual_full, actual_minimal)
 
 
+def test_fast_anchor_compiler_keeps_public_boundary_eager(monkeypatch):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    state_before = {
+        name: value.detach().clone() for name, value in stage.state_dict().items()
+    }
+    calls = []
+
+    def fake_compile(function, **kwargs):
+        calls.append((function, kwargs))
+
+        def compiled(*args, **inner_kwargs):
+            calls.append("compiled")
+            return function(*args, **inner_kwargs)
+
+        return compiled
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    stage.compile_fast_anchor()
+
+    with torch.no_grad():
+        actual = stage(
+            anchor,
+            query,
+            fpn,
+            metas,
+            generator,
+            materialize_diagnostics=False,
+            return_final_anchor_only=True,
+        )
+
+    assert calls[0][0].__self__ is stage
+    assert calls[0][0].__func__ is ROSARefiner._fast_anchor_core
+    assert calls[0][1] == {
+        "mode": "max-autotune-no-cudagraphs",
+        "fullgraph": True,
+    }
+    assert calls[1] == "compiled"
+    assert set(stage.state_dict()) == set(state_before)
+    assert all(
+        _raw_equal(value, state_before[name])
+        for name, value in stage.state_dict().items()
+    )
+    assert actual.shape == anchor.shape
+
+
+def test_fast_anchor_compiler_falls_back_for_dynamic_hooks(monkeypatch):
+    cfg = ROSAConfig.from_mapping(
+        {
+            "profile": "fast",
+            "embed_dims": 16,
+            "hidden_dims": 8,
+        }
+    )
+    stage, anchor, query, fpn, metas, generator = _fixture(cfg)
+    stage.eval()
+    monkeypatch.setattr(
+        torch,
+        "compile",
+        lambda *_args, **_kwargs: (
+            lambda *_inner_args, **_inner_kwargs: (_ for _ in ()).throw(
+                AssertionError("compiled core bypassed hook fallback")
+            )
+        ),
+    )
+    stage.compile_fast_anchor()
+    observed = []
+    handle = stage.rosa.rfl.register_forward_hook(
+        lambda _module, _args, output: observed.append(output.shape)
+    )
+    try:
+        with torch.no_grad():
+            output = stage(
+                anchor,
+                query,
+                fpn,
+                metas,
+                generator,
+                materialize_diagnostics=False,
+                return_final_anchor_only=True,
+            )
+    finally:
+        handle.remove()
+
+    assert output.shape == anchor.shape
+    assert observed
+
+
+def test_fast_anchor_compiler_rejects_non_deployment_profiles():
+    fast = ROSAConfig.from_mapping(
+        {"profile": "fast", "embed_dims": 16, "hidden_dims": 8}
+    )
+    training_stage, *_ = _fixture(fast)
+    with pytest.raises(RuntimeError, match="eval mode"):
+        training_stage.compile_fast_anchor()
+
+    balanced = ROSAConfig.from_mapping(
+        {"profile": "balanced", "embed_dims": 16, "hidden_dims": 8}
+    )
+    balanced_stage, *_ = _fixture(balanced)
+    balanced_stage.eval()
+    with pytest.raises(RuntimeError, match="one-step compact"):
+        balanced_stage.compile_fast_anchor()
+
+
 def test_lean_inference_hook_keeps_full_observation_abi():
     cfg = ROSAConfig.from_mapping(
         {
