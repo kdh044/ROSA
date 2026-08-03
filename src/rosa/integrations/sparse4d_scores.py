@@ -350,6 +350,54 @@ def nonzero_count_denominator(count: Tensor) -> Tensor:
     return torch.where(count.gt(0), count, torch.ones_like(count))
 
 
+def _scatter_selected_scalar_like(
+    reference: Tensor,
+    selected_indices: Tensor,
+    selected_values: Tensor,
+) -> Tensor:
+    """Scatter selected scalar values using the reference dtype and device.
+
+    Native Sparse4D logits remain FP32 in parts of the mixed-precision path,
+    while the ROSA residual head can emit BF16/FP16 values.  ``scatter`` does
+    not promote its source, so make the ownership rule explicit: the dense
+    carrier follows the native reference and the differentiable cast returns
+    gradients to the sidecar value in its original dtype.
+    """
+
+    if reference.ndim < 3:
+        raise ValueError("reference must have batch, query, and channel axes")
+    if (
+        selected_indices.ndim != 2
+        or selected_indices.shape[0] != reference.shape[0]
+    ):
+        raise ValueError("selected indices must have shape [batch, selected]")
+    if selected_indices.dtype is not torch.long:
+        raise TypeError("selected indices must be int64")
+    expected_values = selected_indices.shape + (1,)
+    if selected_values.shape != expected_values:
+        raise ValueError(
+            f"selected scalar values must have shape {expected_values}, "
+            f"got {tuple(selected_values.shape)}"
+        )
+    if (
+        selected_indices.device != reference.device
+        or selected_values.device != reference.device
+    ):
+        raise ValueError("scatter inputs must share a device")
+    if (
+        not reference.is_floating_point()
+        or not selected_values.is_floating_point()
+    ):
+        raise TypeError("selected scalar scatter requires floating values")
+
+    source = selected_values.to(dtype=reference.dtype)
+    return torch.zeros_like(reference[..., :1]).scatter(
+        1,
+        selected_indices[..., None],
+        source,
+    )
+
+
 @dataclass
 class JointScoreLoss:
     loss: Tensor

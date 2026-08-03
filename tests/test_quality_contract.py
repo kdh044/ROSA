@@ -14,6 +14,7 @@ from rosa.integrations.sparse4d_losses import (
     validate_centerness_target_mode,
 )
 from rosa.integrations.sparse4d_scores import (
+    _scatter_selected_scalar_like,
     compose_quality_rank,
     jointscore_quality_focal_loss,
     nonzero_count_denominator,
@@ -239,3 +240,25 @@ def test_fractional_gate_counts_report_the_true_positive_rate():
     rate = positive / nonzero_count_denominator(supervised)
 
     assert torch.equal(rate, torch.tensor(1.0))
+
+
+def test_selected_quality_scatter_preserves_native_dtype_and_amp_gradient():
+    reference = torch.zeros(2, 4, 6, dtype=torch.float32)
+    indices = torch.tensor(((0, 3), (2, 1)), dtype=torch.long)
+    selected = torch.tensor(
+        (((0.5,), (-0.25,)), ((1.0,), (0.125,))),
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    dense = _scatter_selected_scalar_like(reference, indices, selected)
+
+    assert dense.dtype is torch.float32
+    expected = torch.tensor(
+        (((0.5,), (0.0,), (0.0,), (-0.25,)), ((0.0,), (0.125,), (1.0,), (0.0,)))
+    )
+    torch.testing.assert_close(dense, expected)
+    dense.sum().backward()
+    assert selected.grad is not None
+    assert selected.grad.dtype is torch.bfloat16
+    torch.testing.assert_close(selected.grad, torch.ones_like(selected))

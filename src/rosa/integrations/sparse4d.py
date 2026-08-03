@@ -61,6 +61,7 @@ from .sparse4d_runtime import (
 from .sparse4d_scores import (
     _can_reuse_native_identity_rank_selection,
     _compose_native_identity_rank_and_selection,
+    _scatter_selected_scalar_like,
     compose_native_identity_rank,
     compose_quality_rank,
     decode_frozen_jointscore_rank,
@@ -775,9 +776,10 @@ class ROSARefinementHead(Sparse4DHead):
                 1, anchor_index, refined_anchor
             )
             if not native_identity_rank:
-                scalar_index = selected_indices[..., None]
-                quality_delta = torch.zeros_like(baseline_cls[..., :1]).scatter(
-                    1, scalar_index, result.quality_delta
+                quality_delta = _scatter_selected_scalar_like(
+                    baseline_cls,
+                    selected_indices,
+                    result.quality_delta,
                 )
                 supported = torch.zeros(
                     baseline_anchor.shape[:2],
