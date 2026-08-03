@@ -46,12 +46,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 VERIFY_C0_C32_TOOL = ROOT / "tools/verify_c0_c32_near_native.py"
 
-PROTOCOL = "full-rosa-c0-fast-variants-balanced-near-native-v3"
-C32_PROTOCOL = "full-rosa-c32-fast-variants-balanced-near-native-v2"
-PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v3"
-EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v3"
-COMPLETION_SCHEMA = "rosa.full_rosa_near_native_completion.v3"
-FAILURE_SCHEMA = "rosa.full_rosa_near_native_failure.v3"
+PROTOCOL = "full-rosa-c0-fast-variants-balanced-near-native-v4"
+C32_PROTOCOL = "full-rosa-c32-fast-variants-balanced-near-native-v3"
+PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v4"
+EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v4"
+COMPLETION_SCHEMA = "rosa.full_rosa_near_native_completion.v4"
+FAILURE_SCHEMA = "rosa.full_rosa_near_native_failure.v4"
 IDLE_RESERVED_TOKEN = "I_HAVE_VERIFIED_THE_GPU_IS_IDLE_AND_RESERVED"
 CURRENT_STREAM_TOKEN = "I_HAVE_VERIFIED_THE_CURRENT_STREAM_IS_DEFAULT"
 
@@ -84,19 +84,8 @@ COMPILED_BOUNDED_SCORE_FIELDS = (
     "cls_scores",
 )
 COMPILED_BOUNDED_BOX_FIELD = "bboxes_3d"
-COMPILED_BOUNDED_BOX_COMPONENTS = (
-    "x_m",
-    "y_m",
-    "z_m",
-    "width_m",
-    "length_m",
-    "height_m",
-    "yaw_rad",
-    "vx_m_per_s",
-    "vy_m_per_s",
-    "vz_m_per_s",
-)
-COMPILED_BOUNDED_OUTPUT_COUNT = 50
+COMPILED_BOUNDED_BOX_DIM = 10
+COMPILED_BOUNDED_OUTPUT_LIMIT = 50
 COMPILED_BOUNDED_QUERY_COUNT = 300
 COMPILED_BOUNDED_SCORE_MAX_ABS = {
     "scores_3d": 3.5e-6,
@@ -155,6 +144,13 @@ EXPECTED_OFFICIAL_SOURCE_SHA256 = (
 DEFAULT_MAIN126_ANNOTATION = Path(
     "/home/airlab/user/kdh/datasets/Fisheye3DODdataset/"
     "ImageSets-main126/fisheye3dod_infos_val.pkl"
+)
+DEFAULT_COMPILED_BOUNDED_CALIBRATION_ARTIFACT = Path(
+    "/home/airlab/user/kdh/ROSA/results/raw_metrics/benchmarks/diagnostics/"
+    "20260803_native_atomic_repeatability_envelope/measurements.json"
+)
+EXPECTED_COMPILED_BOUNDED_CALIBRATION_SHA256 = (
+    "3fec68c6d72ede2d12de9a13906b54bca56e6a06052f9ea993a3eb318397f6ea"
 )
 EXPECTED_MAIN126_ANNOTATION_SHA256 = (
     "efafe89c6dc34d116f0ce01fa818505a6387248d9a3ca6dcac035418a664da6f"
@@ -491,7 +487,7 @@ def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
     if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
         return {
             "applicable": True,
-            "mode": "query_aligned_fixed_absolute_tolerance_v2",
+            "mode": "query_aligned_fixed_absolute_tolerance_v3",
             "all_output_values_raw_exact": False,
             "alignment_key": COMPILED_BOUNDED_QUERY_FIELD,
             "exact_fields_after_alignment": list(
@@ -503,10 +499,7 @@ def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
             ],
             "absolute_thresholds": {
                 **COMPILED_BOUNDED_SCORE_MAX_ABS,
-                "bboxes_3d_by_component": {
-                    name: COMPILED_BOUNDED_BOX_MAX_ABS
-                    for name in COMPILED_BOUNDED_BOX_COMPONENTS
-                },
+                COMPILED_BOUNDED_BOX_FIELD: COMPILED_BOUNDED_BOX_MAX_ABS,
             },
             "threshold_basis": {
                 "decoded_box": "3 mm, 0.003 rad, or 3 mm/s by component unit",
@@ -516,7 +509,8 @@ def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
                 ),
             },
             "query_contract": {
-                "count": COMPILED_BOUNDED_OUTPUT_COUNT,
+                "maximum_count": COMPILED_BOUNDED_OUTPUT_LIMIT,
+                "count_matches_decoder_output": True,
                 "unique": True,
                 "inclusive_range": [0, COMPILED_BOUNDED_QUERY_COUNT - 1],
                 "set_exact_across_all_three_comparisons": True,
@@ -545,6 +539,31 @@ def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
             "reason": "balanced candidate is eager-only",
         }
     raise ProtocolError("unknown ROSA candidate arm")
+
+
+def compiled_parity_calibration_contract(candidate_arm: str) -> dict[str, Any]:
+    """Verify the eager-only artifact that fixed the bounded ceilings."""
+
+    if candidate_arm not in BOUNDED_PARITY_COMPILED_ARMS:
+        return {
+            "applicable": False,
+            "reason": "candidate does not use calibrated bounded parity",
+        }
+    artifact = _file_contract(
+        DEFAULT_COMPILED_BOUNDED_CALIBRATION_ARTIFACT,
+        "compiled parity calibration artifact",
+    )
+    if artifact["sha256"] != EXPECTED_COMPILED_BOUNDED_CALIBRATION_SHA256:
+        raise ProtocolError("compiled parity calibration artifact hash drifted")
+    return {
+        "applicable": True,
+        "verified_before_accelerator_import": True,
+        "artifact": artifact,
+        "source_revision": "bc282911f44884c27f5e7d1c552d38ed43c477ce",
+        "checkpoint_sha256": (
+            "8a56636d18a77fe9d01190d2a25d897b2225fca382d996cb3a472f5f45e9061e"
+        ),
+    }
 
 
 def candidate_compile_contract(candidate_arm: str) -> dict[str, Any]:
@@ -951,6 +970,7 @@ def prepare_plan(
 
     arms = selected_arms(args.candidate_profile, detector_pair)
     candidate_arm = selected_candidate(args.candidate_profile)
+    calibration_contract = compiled_parity_calibration_contract(candidate_arm)
     schedules = {}
     for phase, iterations in (
         ("warmup", WARMUP_ITERATIONS_PER_ARM),
@@ -1040,6 +1060,7 @@ def prepare_plan(
         "candidate_execution_mode": candidate_execution_mode(candidate_arm),
         "arms": _arms_plan(arms, detector_pair),
         "comparisons": comparisons,
+        "compiled_parity_calibration": calibration_contract,
         "parameters": {
             "capture_batches": CAPTURE_BATCHES,
             "expected_batch_size": EXPECTED_BATCH_SIZE,
@@ -2553,6 +2574,7 @@ def _query_aligned_sample(
     *,
     sample_index: int,
     comparison_label: str,
+    expected_count: int,
 ):
     if not isinstance(reference_sample, Mapping) or not isinstance(
         candidate_sample, Mapping
@@ -2575,10 +2597,19 @@ def _query_aligned_sample(
         for value in (reference_query, candidate_query)
     ):
         raise ProtocolError(f"{comparison_label} query_indices must be integral")
-    if count != COMPILED_BOUNDED_OUTPUT_COUNT:
+    if (
+        type(expected_count) is not int
+        or expected_count < 0
+        or expected_count > COMPILED_BOUNDED_OUTPUT_LIMIT
+    ):
         raise ProtocolError(
-            f"{comparison_label} must contain exactly "
-            f"{COMPILED_BOUNDED_OUTPUT_COUNT} queries per sample"
+            f"{comparison_label} decoder count must be in [0, "
+            f"{COMPILED_BOUNDED_OUTPUT_LIMIT}]"
+        )
+    if count != expected_count:
+        raise ProtocolError(
+            f"{comparison_label} query count does not match the decoder record "
+            f"in sample {sample_index}"
         )
     if any(
         bool((value < 0).any()) or bool((value >= COMPILED_BOUNDED_QUERY_COUNT).any())
@@ -2604,6 +2635,7 @@ def _query_aligned_sample(
         )
 
     aligned = {}
+    raw = {}
     for field in (
         *COMPILED_BOUNDED_EXACT_ASSOCIATION_FIELDS,
         *COMPILED_BOUNDED_SCORE_FIELDS,
@@ -2621,6 +2653,7 @@ def _query_aligned_sample(
             raise ProtocolError(
                 f"{comparison_label} {field} has no value for every query"
             )
+        raw[field] = (reference, candidate)
         aligned[field] = (
             reference[reference_order],
             candidate[candidate_order],
@@ -2653,6 +2686,14 @@ def _query_aligned_sample(
             torch.isfinite(candidate).all()
         ):
             raise ProtocolError(f"{comparison_label} {field} contains NaN/Inf")
+        if field == "scores_3d" and any(
+            value.numel() > 1 and not bool((value[:-1] >= value[1:]).all())
+            for value in raw[field]
+        ):
+            raise ProtocolError(
+                f"{comparison_label} scores_3d must be non-increasing in raw "
+                f"decoder order for sample {sample_index}"
+            )
         score_errors[field] = (candidate.double() - reference.double()).abs()
 
     reference_rank = reference_order[:, None] - reference_order[None, :]
@@ -2669,7 +2710,7 @@ def _query_aligned_sample(
         )
 
     reference_box, candidate_box = aligned[COMPILED_BOUNDED_BOX_FIELD]
-    expected_box_shape = (count, len(COMPILED_BOUNDED_BOX_COMPONENTS))
+    expected_box_shape = (count, COMPILED_BOUNDED_BOX_DIM)
     if (
         tuple(reference_box.shape) != expected_box_shape
         or not reference_box.is_floating_point()
@@ -2758,6 +2799,16 @@ def _require_all_batch_compiled_bounded_parity(
                 f"{comparison_label} payload shape drifted for captured batch "
                 f"{batch_index}"
             )
+        detections_per_sample = eager_record["detections_per_sample"]
+        if (
+            not isinstance(detections_per_sample, Sequence)
+            or isinstance(detections_per_sample, (str, bytes))
+            or len(detections_per_sample) != len(eager_payload)
+        ):
+            raise ProtocolError(
+                f"{comparison_label} decoder counts do not cover captured batch "
+                f"{batch_index}"
+            )
 
         query_sets = []
         rank_displacements = []
@@ -2776,6 +2827,7 @@ def _require_all_batch_compiled_bounded_parity(
                 candidate_sample,
                 sample_index=sample_index,
                 comparison_label=comparison_label,
+                expected_count=detections_per_sample[sample_index],
             )
             query_sets.append(aligned["query_set"])
             rank_displacements.append(aligned["rank_displacement"])
@@ -2825,7 +2877,7 @@ def _require_all_batch_compiled_bounded_parity(
             float(inversion_gaps.max().item()) if inversion_gaps.numel() else 0.0
         )
         parity[key] = {
-            "mode": "query_aligned_fixed_absolute_tolerance_v2",
+            "mode": "query_aligned_fixed_absolute_tolerance_v3",
             "comparison": comparison_label,
             "passed": True,
             "schema_and_stream_exact": True,
@@ -2840,10 +2892,7 @@ def _require_all_batch_compiled_bounded_parity(
             "bounded_float_fields": bounded_field_records,
             "absolute_thresholds": {
                 **COMPILED_BOUNDED_SCORE_MAX_ABS,
-                "bboxes_3d_by_component": {
-                    name: COMPILED_BOUNDED_BOX_MAX_ABS
-                    for name in COMPILED_BOUNDED_BOX_COMPONENTS
-                },
+                COMPILED_BOUNDED_BOX_FIELD: COMPILED_BOUNDED_BOX_MAX_ABS,
                 "p99_definition": "nearest-rank ceil(0.99 * count)",
             },
             "owned_detached_cpu_payloads": True,
@@ -3350,7 +3399,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                     comparison_label="eager_reference_b_vs_compiled",
                 )
                 compiled_parity = {
-                    "mode": "query_aligned_fixed_absolute_tolerance_v2",
+                    "mode": "query_aligned_fixed_absolute_tolerance_v3",
                     "passed": True,
                     "comparisons": {
                         "eager_reference_a_vs_eager_reference_b": (eager_repeat_parity),
@@ -3441,6 +3490,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             "output_preflight": output_preflight,
             "compiled_eager_parity": compiled_parity,
             "compiled_parity_contract": compiled_parity_contract(candidate_arm),
+            "compiled_parity_calibration": prepared_plan["compiled_parity_calibration"],
             "parity_payload_release": parity_payload_release,
             "compiler_warmup_by_batch": compiler_warmup_by_batch,
             "compile_state_attestations": timing_compile_state_attestations,
