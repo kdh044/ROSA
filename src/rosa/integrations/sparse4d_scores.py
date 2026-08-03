@@ -6,7 +6,6 @@ from dataclasses import dataclass
 import math
 from typing import Sequence
 
-from .. import rfl as _decode_rfl
 import torch
 from torch import Tensor
 import torch.nn.functional as F
@@ -60,98 +59,6 @@ def _matches_released_sparse4d_decoder(decoder) -> bool:
     )
 
 
-_RELEASED_DECODE_PLAIN_EAGER_NO_GRAD = _decode_rfl._plain_eager_no_grad_execution
-_RELEASED_DECODE_TORCH_GATHER = torch.gather
-_RELEASED_DECODE_TORCH_ATAN2 = torch.atan2
-_RELEASED_DECODE_TORCH_CAT = torch.cat
-_RELEASED_DECODE_TORCH_STACK = torch.stack
-_RELEASED_DECODE_TENSOR_GETITEM = torch.Tensor.__getitem__
-_RELEASED_DECODE_TENSOR_EXPAND_AS = torch.Tensor.expand_as
-_RELEASED_DECODE_TENSOR_RESHAPE = torch.Tensor.reshape
-_RELEASED_DECODE_TENSOR_EXP = torch.Tensor.exp
-_RELEASED_MATCHES_SPARSE4D_DECODER = _matches_released_sparse4d_decoder
-
-
-def _matches_frozen_decode_box_batch_contract(
-    decoder,
-    box_predictions: Tensor,
-    indices: Tensor,
-) -> bool:
-    """Match one exact released decode-box call except for its CUDA device."""
-
-    if (
-        _decode_rfl._plain_eager_no_grad_execution
-        is not _RELEASED_DECODE_PLAIN_EAGER_NO_GRAD
-        or not _decode_rfl._plain_eager_no_grad_execution()
-        or _matches_released_sparse4d_decoder is not _RELEASED_MATCHES_SPARSE4D_DECODER
-        or not _matches_released_sparse4d_decoder(decoder)
-        or _decode_frozen_box_batch is not _RELEASED_FROZEN_BOX_BATCH
-        or torch.gather is not _RELEASED_DECODE_TORCH_GATHER
-        or torch.atan2 is not _RELEASED_DECODE_TORCH_ATAN2
-        or torch.cat is not _RELEASED_DECODE_TORCH_CAT
-        or torch.stack is not _RELEASED_DECODE_TORCH_STACK
-        or torch.Tensor.__getitem__ is not _RELEASED_DECODE_TENSOR_GETITEM
-        or torch.Tensor.expand_as is not _RELEASED_DECODE_TENSOR_EXPAND_AS
-        or torch.Tensor.reshape is not _RELEASED_DECODE_TENSOR_RESHAPE
-        or torch.Tensor.exp is not _RELEASED_DECODE_TENSOR_EXP
-        or type(box_predictions) is not torch.Tensor
-        or type(indices) is not torch.Tensor
-        or box_predictions.layout != torch.strided
-        or indices.layout != torch.strided
-        or box_predictions.is_quantized
-        or indices.is_quantized
-        or box_predictions.requires_grad
-        or indices.requires_grad
-        or box_predictions.device.type == "meta"
-        or indices.device.type == "meta"
-        or any(name is not None for name in box_predictions.names)
-        or any(name is not None for name in indices.names)
-        or box_predictions.ndim != 3
-        or indices.ndim != 2
-    ):
-        return False
-    return bool(
-        box_predictions.shape == (indices.shape[0], indices.shape[1], 11)
-        and indices.shape[0] > 0
-        and indices.shape[1] == 300
-        and box_predictions.dtype
-        in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-        and indices.dtype == torch.long
-        and indices.device == box_predictions.device
-        and decoder.selection_score_mode == "legacy"
-        and decoder.score_threshold is None
-        and decoder.sorted is True
-        and type(decoder.num_output) is int
-        and decoder.num_output == 300
-        and type(decoder.duplicate_bev_radius) is float
-        and decoder.duplicate_bev_radius == 0.0
-    )
-
-
-_RELEASED_MATCHES_FROZEN_BOX_BATCH = _matches_frozen_decode_box_batch_contract
-
-
-def _can_batch_frozen_decode_box(
-    decoder,
-    box_predictions: Tensor,
-    indices: Tensor,
-) -> bool:
-    """Enable one released decode-box call only on its plain CUDA surface."""
-
-    return bool(
-        _matches_frozen_decode_box_batch_contract is _RELEASED_MATCHES_FROZEN_BOX_BATCH
-        and _matches_frozen_decode_box_batch_contract(
-            decoder,
-            box_predictions,
-            indices,
-        )
-        and box_predictions.device.type == "cuda"
-    )
-
-
-_RELEASED_CAN_BATCH_FROZEN_DECODE_BOX = _can_batch_frozen_decode_box
-
-
 def _decode_frozen_box_batch(
     decoder,
     box_predictions: Tensor,
@@ -167,9 +74,6 @@ def _decode_frozen_box_batch(
     )
     decoded_boxes = decoder.decode_box(selected_boxes.reshape(-1, 11))
     return decoded_boxes.reshape(batch_size, num_query, -1)
-
-
-_RELEASED_FROZEN_BOX_BATCH = _decode_frozen_box_batch
 
 
 def _probability_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -637,8 +541,11 @@ def decode_frozen_jointscore_rank(
     )
     if (
         can_pack
-        and _can_batch_frozen_decode_box is _RELEASED_CAN_BATCH_FROZEN_DECODE_BOX
-        and _can_batch_frozen_decode_box(decoder, box_predictions, indices)
+        and _rfl._plain_eager_no_grad_execution()
+        and _matches_released_sparse4d_decoder(decoder)
+        and box_predictions.shape == (batch_size, num_query, 11)
+        and box_predictions.dtype
+        in (torch.float16, torch.bfloat16, torch.float32, torch.float64)
     ):
         decoded_boxes = _decode_frozen_box_batch(
             decoder,
