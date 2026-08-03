@@ -10,10 +10,14 @@ The separately armed path is intentionally difficult to invoke accidentally.
 It requires two explicit attestations, revalidates every source/checkpoint/DAF
 input, rejects a non-default current stream and concurrent GPU processes, then
 measures the exact same captured batches in one isolated native/compiled-fast,
-native/eager-fast, or native/balanced paired alternating protocol.  The default
-native detector is C0; ``--detector-pair c32`` selects the exact official-
-residual C32 head on both sides of the ROSA-only derivation.  Candidate variants
-are deliberately separate process invocations with separate output directories.
+native/compiled-fast-bounded, native/eager-fast, or native/balanced paired
+alternating protocol.  The bounded arm is a separately labelled benchmark-only
+route: ranking and score fields remain raw-exact while decoded box floats use a
+fixed tight tolerance, and official full-metric parity remains mandatory before
+promotion.  The default native detector is C0; ``--detector-pair c32`` selects
+the exact official-residual C32 head on both sides of the ROSA-only derivation.
+Candidate variants are deliberately separate process invocations with separate
+output directories.
 """
 
 from __future__ import annotations
@@ -40,12 +44,12 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC_ROOT = ROOT / "src"
 VERIFY_C0_C32_TOOL = ROOT / "tools/verify_c0_c32_near_native.py"
 
-PROTOCOL = "full-rosa-c0-fast-variants-balanced-near-native-v2"
-C32_PROTOCOL = "full-rosa-c32-fast-variants-balanced-near-native-v1"
-PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v2"
-EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v2"
-COMPLETION_SCHEMA = "rosa.full_rosa_near_native_completion.v2"
-FAILURE_SCHEMA = "rosa.full_rosa_near_native_failure.v2"
+PROTOCOL = "full-rosa-c0-fast-variants-balanced-near-native-v3"
+C32_PROTOCOL = "full-rosa-c32-fast-variants-balanced-near-native-v2"
+PLAN_SCHEMA = "rosa.full_rosa_near_native_plan.v3"
+EVIDENCE_SCHEMA = "rosa.full_rosa_near_native_evidence.v3"
+COMPLETION_SCHEMA = "rosa.full_rosa_near_native_completion.v3"
+FAILURE_SCHEMA = "rosa.full_rosa_near_native_failure.v3"
 IDLE_RESERVED_TOKEN = "I_HAVE_VERIFIED_THE_GPU_IS_IDLE_AND_RESERVED"
 CURRENT_STREAM_TOKEN = "I_HAVE_VERIFIED_THE_CURRENT_STREAM_IS_DEFAULT"
 
@@ -56,12 +60,35 @@ NATIVE_ARM = "c0_native"
 C32_NATIVE_ARM = "c32_native"
 NATIVE_ARMS = frozenset((NATIVE_ARM, C32_NATIVE_ARM))
 FAST_ARM = "rosa_fast"
+FAST_COMPILED_BOUNDED_ARM = "rosa_fast_compiled_bounded"
 FAST_EAGER_ARM = "rosa_fast_eager"
 BALANCED_ARM = "rosa_balanced"
-FAST_MODEL_ARMS = frozenset((FAST_ARM, FAST_EAGER_ARM))
-COMPILED_ARMS = frozenset((FAST_ARM,))
+FAST_MODEL_ARMS = frozenset((FAST_ARM, FAST_COMPILED_BOUNDED_ARM, FAST_EAGER_ARM))
+COMPILED_ARMS = frozenset((FAST_ARM, FAST_COMPILED_BOUNDED_ARM))
 EAGER_ARMS = frozenset((FAST_EAGER_ARM, BALANCED_ARM))
 CANDIDATE_ARMS = frozenset((*FAST_MODEL_ARMS, BALANCED_ARM))
+RAW_EXACT_COMPILED_ARMS = frozenset((FAST_ARM,))
+BOUNDED_PARITY_COMPILED_ARMS = frozenset((FAST_COMPILED_BOUNDED_ARM,))
+RAW_EXACT_FAST_COMPILE_MODE = "reduce-overhead"
+BOUNDED_FAST_COMPILE_MODE = "max-autotune-no-cudagraphs"
+COMPILED_FAST_FULLGRAPH = False
+COMPILED_BOUNDED_BOX_MAX_ABS = 1.0e-5
+COMPILED_BOUNDED_BOX_MAX_REL = 1.0e-5
+COMPILED_BOUNDED_BOX_RELATIVE_FLOOR = 1.0e-12
+COMPILED_BOUNDED_BOX_FIELDS = ("bboxes_3d",)
+COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS = (
+    "scores_3d",
+    "cls_scores",
+)
+COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS = (
+    "labels_3d",
+    "query_indices",
+    "instance_ids",
+)
+COMPILED_BOUNDED_RAW_EXACT_FIELDS = (
+    *COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS,
+    *COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS,
+)
 WARMUP_ITERATIONS_PER_ARM = 60
 MEASURED_ITERATIONS_PER_ARM = 300
 CAPTURE_BATCHES = 2
@@ -194,11 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument(
         "--candidate-profile",
-        choices=("fast", "fast_eager", "balanced"),
+        choices=("fast", "fast_compiled_bounded", "fast_eager", "balanced"),
         default="fast",
         help=(
             "Run exactly one isolated C0-vs-ROSA candidate protocol; "
-            "fast_eager uses the exact fast model without torch.compile."
+            "fast keeps raw-exact compiled/eager parity, "
+            "fast_compiled_bounded is a benchmark-only fixed-tolerance arm, "
+            "and fast_eager uses the exact fast model without torch.compile."
         ),
     )
     parser.add_argument("--execute", action="store_true")
@@ -371,11 +400,16 @@ def _detector_pair_from_native_arm(native_arm: str) -> str:
 def selected_candidate(profile: str) -> str:
     if profile == "fast":
         return FAST_ARM
+    if profile == "fast_compiled_bounded":
+        return FAST_COMPILED_BOUNDED_ARM
     if profile == "fast_eager":
         return FAST_EAGER_ARM
     if profile == "balanced":
         return BALANCED_ARM
-    raise ProtocolError("candidate profile must be fast, fast_eager, or balanced")
+    raise ProtocolError(
+        "candidate profile must be fast, fast_compiled_bounded, "
+        "fast_eager, or balanced"
+    )
 
 
 def candidate_model_profile(candidate_arm: str) -> str:
@@ -416,6 +450,122 @@ def compiler_guard_contract(candidate_arm: str) -> dict[str, Any]:
     raise ProtocolError("unknown ROSA candidate arm")
 
 
+def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
+    """Return the immutable eager/compiled correctness contract for one arm."""
+
+    if candidate_arm in RAW_EXACT_COMPILED_ARMS:
+        return {
+            "applicable": True,
+            "mode": "raw_exact_all_output_fields",
+            "all_output_values_raw_exact": True,
+        }
+    if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
+        return {
+            "applicable": True,
+            "mode": "raw_exact_ranking_and_scores_bounded_box_floats_v1",
+            "all_output_values_raw_exact": False,
+            "raw_exact_fields": list(COMPILED_BOUNDED_RAW_EXACT_FIELDS),
+            "bounded_box_fields": list(COMPILED_BOUNDED_BOX_FIELDS),
+            "box_thresholds": {
+                "max_abs_inclusive": COMPILED_BOUNDED_BOX_MAX_ABS,
+                "max_rel_inclusive": COMPILED_BOUNDED_BOX_MAX_REL,
+                "relative_denominator": ("max(abs(eager), abs(compiled), 1e-12)"),
+            },
+            "benchmark_only": True,
+            "official_full_metric_parity_required_before_promotion": True,
+        }
+    if candidate_arm == FAST_EAGER_ARM:
+        return {
+            "applicable": False,
+            "reason": "candidate is the uncompiled fast reference path",
+        }
+    if candidate_arm == BALANCED_ARM:
+        return {
+            "applicable": False,
+            "reason": "balanced candidate is eager-only",
+        }
+    raise ProtocolError("unknown ROSA candidate arm")
+
+
+def candidate_compile_contract(candidate_arm: str) -> dict[str, Any]:
+    """Describe the exact compile route without exposing a user setting."""
+
+    if candidate_arm in RAW_EXACT_COMPILED_ARMS:
+        return {
+            "applicable": True,
+            "route": "frozen tools.run._compile_fast_inference",
+            "kwargs": {
+                "mode": RAW_EXACT_FAST_COMPILE_MODE,
+                "fullgraph": COMPILED_FAST_FULLGRAPH,
+            },
+            "benchmark_local_override": False,
+        }
+    if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
+        return {
+            "applicable": True,
+            "route": "benchmark-local head.rosa_refiner.compile",
+            "kwargs": {
+                "mode": BOUNDED_FAST_COMPILE_MODE,
+                "fullgraph": COMPILED_FAST_FULLGRAPH,
+            },
+            "production_fast_route_unchanged": True,
+            "benchmark_local_override": True,
+        }
+    if candidate_arm in EAGER_ARMS:
+        return {
+            "applicable": False,
+            "reason": "candidate is eager-only",
+        }
+    raise ProtocolError("unknown ROSA candidate arm")
+
+
+def _compile_candidate_refiner(run_tool, model, config, candidate_arm: str):
+    """Compile one arm through its frozen production or benchmark-local route."""
+
+    contract = candidate_compile_contract(candidate_arm)
+    if not contract["applicable"]:
+        raise ProtocolError(f"{candidate_arm} is not a compiled candidate")
+    head = getattr(model, "head", None)
+    refiner = getattr(head, "rosa_refiner", None)
+    if refiner is None:
+        raise ProtocolError(f"{candidate_arm} is missing its ROSA refiner")
+    if getattr(refiner, "_compiled_call_impl", None) is not None:
+        raise ProtocolError(
+            f"{candidate_arm} refiner was compiled before its audited compile call"
+        )
+
+    if candidate_arm in RAW_EXACT_COMPILED_ARMS:
+        compiled = bool(
+            run_tool._compile_fast_inference(
+                SimpleNamespace(model=model),
+                config,
+            )
+        )
+        observed_route = "frozen tools.run._compile_fast_inference"
+    elif candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
+        compile_method = getattr(refiner, "compile", None)
+        if not callable(compile_method):
+            raise ProtocolError("bounded candidate refiner has no compile method")
+        kwargs = dict(contract["kwargs"])
+        compile_method(**kwargs)
+        compiled = getattr(refiner, "_compiled_call_impl", None) is not None
+        observed_route = "benchmark-local head.rosa_refiner.compile"
+    else:
+        raise ProtocolError("compiled candidate has no compile route")
+
+    if not compiled:
+        raise ProtocolError(
+            f"{candidate_arm} did not compile its ROSA refiner through the audited route"
+        )
+    return {
+        "arm": candidate_arm,
+        "compiled": True,
+        "passed": True,
+        "observed_route": observed_route,
+        "observed_kwargs": dict(contract["kwargs"]),
+    }
+
+
 def selected_arms(
     profile: str, detector_pair: str = DETECTOR_PAIR_C0
 ) -> tuple[str, str]:
@@ -440,7 +590,8 @@ def build_alternating_schedule(
         raise ProtocolError("phase must be a nonempty string")
     if candidate_arm not in CANDIDATE_ARMS:
         raise ProtocolError(
-            "candidate_arm must be compiled fast, eager fast, or balanced"
+            "candidate_arm must be raw-exact compiled fast, bounded-parity "
+            "compiled fast, eager fast, or balanced"
         )
     native_arm = selected_native_arm(detector_pair)
     if iterations_per_arm % 12:
@@ -565,10 +716,40 @@ def _arms_plan(
             "compile": {
                 "enabled": True,
                 "target": "head.rosa_refiner",
-                "mode": "reduce-overhead",
-                "fullgraph": False,
+                "mode": RAW_EXACT_FAST_COMPILE_MODE,
+                "fullgraph": COMPILED_FAST_FULLGRAPH,
                 "compilation_excluded_from_timing": True,
+                "invocation_contract": candidate_compile_contract(FAST_ARM),
             },
+            "compiled_eager_parity": compiled_parity_contract(FAST_ARM),
+        }
+    if FAST_COMPILED_BOUNDED_ARM in arms:
+        records[FAST_COMPILED_BOUNDED_ARM] = {
+            "profile": "fast_compiled_bounded",
+            "model_profile": "fast",
+            "execution_mode": "compiled",
+            "detector_pair": detector_pair,
+            "head_type": pair["candidate_head_type"],
+            "config_derivation": {
+                "base": native_arm,
+                "only_changes": {
+                    "model.head.type": pair["candidate_head_type"],
+                    "model.head.rosa_cfg": {"profile": "fast"},
+                },
+            },
+            "compile": {
+                "enabled": True,
+                "target": "head.rosa_refiner",
+                "mode": BOUNDED_FAST_COMPILE_MODE,
+                "fullgraph": COMPILED_FAST_FULLGRAPH,
+                "compilation_excluded_from_timing": True,
+                "invocation_contract": candidate_compile_contract(
+                    FAST_COMPILED_BOUNDED_ARM
+                ),
+            },
+            "compiled_eager_parity": compiled_parity_contract(
+                FAST_COMPILED_BOUNDED_ARM
+            ),
         }
     if FAST_EAGER_ARM in arms:
         records[FAST_EAGER_ARM] = {
@@ -735,6 +916,7 @@ def prepare_plan(
             "physical_round_order": list(PHYSICAL_ROUND_ORDER),
             "schedules": schedules,
             "one_candidate_per_process": True,
+            "compiled_eager_parity": compiled_parity_contract(candidate_arm),
         }
     }
 
@@ -848,6 +1030,7 @@ def prepare_plan(
                 "cuBLAS workspaces cleared only between isolated arm builds"
             ),
             "compiler_guard": compiler_guard_contract(candidate_arm),
+            "candidate_compile": candidate_compile_contract(candidate_arm),
         },
         "near_native_gate": {
             "source": "existing C0/C32 full-detector gate",
@@ -862,14 +1045,29 @@ def prepare_plan(
         },
         "output_contract": {
             "sample_count": EXPECTED_BATCH_SIZE,
-            "fields": ["bboxes_3d", "scores_3d", "labels_3d"],
+            "fields": [
+                "bboxes_3d",
+                "scores_3d",
+                "cls_scores",
+                "labels_3d",
+                "query_indices",
+                "instance_ids",
+            ],
             "box_and_score_values_finite": True,
             "labels_integral_and_in_six_class_range": True,
-            "values_may_differ_between_profiles": True,
-            "compiled_fast_must_be_raw_exact_with_eager_fast": True,
-            "fast_eager_is_the_uncompiled_fast_reference_path": True,
-            "candidate_execution_mode": candidate_execution_mode(candidate_arm),
+            "compiled_eager_parity": compiled_parity_contract(candidate_arm),
             "preflight_only_not_in_timed_interval": True,
+            "bounded_payload": "owned detached CPU copies, released before timing",
+        },
+        "promotion_contract": {
+            "official_full_metric_parity_required_before_promotion": (
+                candidate_arm in BOUNDED_PARITY_COMPILED_ARMS
+            ),
+            "bounded_arm_status": (
+                "PENDING_OFFICIAL_FULL_METRIC_PARITY"
+                if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS
+                else "NOT_APPLICABLE"
+            ),
         },
         "guards": {
             "idle_token_required": IDLE_RESERVED_TOKEN,
@@ -1596,7 +1794,60 @@ def _require_current_default_stream(torch, device) -> dict[str, Any]:
     }
 
 
-def _preflight_outputs(verifier, torch, models, source_batch, device):
+def _require_owned_cpu_tensor(torch, value, label: str):
+    if (
+        not isinstance(value, torch.Tensor)
+        or value.layout != torch.strided
+        or value.is_quantized
+        or value.device.type != "cpu"
+        or not value.is_contiguous()
+        or value.requires_grad
+        or value.grad_fn is not None
+        or getattr(value, "_base", None) is not None
+    ):
+        raise ProtocolError(f"{label} is not an owned detached CPU tensor")
+    return value
+
+
+def _capture_detached_cpu_parity_payload(verifier, torch, output):
+    """Copy audited fields without retaining CUDA/CUDAGraph output storage."""
+    if not isinstance(output, Sequence) or isinstance(output, (str, bytes)):
+        raise ProtocolError("parity payload requires a prediction sequence")
+    payload = []
+    field_names = (*COMPILED_BOUNDED_BOX_FIELDS, *COMPILED_BOUNDED_RAW_EXACT_FIELDS)
+    for sample_index, sample in enumerate(output):
+        fields = {}
+        for name in field_names:
+            try:
+                source = verifier._prediction_tensor(sample, name)
+            except Exception as error:
+                raise ProtocolError(
+                    f"parity payload sample {sample_index} lacks {name}"
+                ) from error
+            if not isinstance(source, torch.Tensor) or source.layout != torch.strided:
+                raise ProtocolError(f"parity payload field {name} is not dense")
+            owned = _require_owned_cpu_tensor(
+                torch,
+                source.detach().to(device="cpu", copy=True).contiguous(),
+                f"parity payload field {name}",
+            )
+            if (
+                source.device.type == "cpu"
+                and source.numel()
+                and source.untyped_storage().data_ptr()
+                == owned.untyped_storage().data_ptr()
+            ):
+                raise ProtocolError(
+                    f"parity payload field {name} aliases decoder output storage"
+                )
+            fields[name] = owned
+        payload.append(fields)
+    return tuple(payload)
+
+
+def _preflight_outputs(
+    verifier, torch, models, source_batch, device, *, detached_payloads=None
+):
     records = {}
     source_before = verifier.raw_fingerprint(source_batch)
     with torch.inference_mode():
@@ -1610,10 +1861,48 @@ def _preflight_outputs(verifier, torch, models, source_batch, device):
             record = verifier._validate_detection_output(output)
             record["stream"] = stream
             records[arm] = record
+            if detached_payloads is not None:
+                detached_payloads[arm] = _capture_detached_cpu_parity_payload(
+                    verifier, torch, output
+                )
             del output
     if verifier.raw_fingerprint(source_batch) != source_before:
         raise ProtocolError("output preflight mutated the captured source batch")
     return records
+
+
+def _candidate_preflight_by_batch(
+    verifier,
+    torch,
+    model,
+    sources,
+    device,
+    candidate_arm: str,
+    *,
+    capture_detached_payload: bool,
+):
+    if candidate_arm not in CANDIDATE_ARMS:
+        raise ProtocolError("candidate preflight received an unknown arm")
+    if type(capture_detached_payload) is not bool:
+        raise TypeError("capture_detached_payload must be bool")
+    records = {}
+    payloads = {}
+    for batch_index, source in enumerate(sources):
+        key = str(batch_index)
+        models = {candidate_arm: model}
+        batch_payloads = {} if capture_detached_payload else None
+        batch_records = _preflight_outputs(
+            verifier,
+            torch,
+            models,
+            source,
+            device,
+            detached_payloads=batch_payloads,
+        )
+        if batch_payloads is not None:
+            payloads[key] = batch_payloads[candidate_arm]
+        records[key] = batch_records[candidate_arm]
+    return records, payloads
 
 
 def _cuda_allocator_snapshot(torch, device) -> dict[str, int]:
@@ -1800,6 +2089,7 @@ def _measure_isolated_memory(
             contracts[arm] = built_contracts[arm]
             load_contracts[arm] = built_load_contracts[arm]
             compiled = False
+            compile_invocation_attestation = None
             if arm in CANDIDATE_ARMS:
                 compile_state_attestations.append(
                     _attest_candidate_compile_state(
@@ -1809,17 +2099,15 @@ def _measure_isolated_memory(
                         phase="after isolated memory model build",
                     )
                 )
-            if arm == FAST_ARM:
-                compiled = bool(
-                    run_tool._compile_fast_inference(
-                        SimpleNamespace(model=models[arm]), configs[arm]
-                    )
+            if arm in COMPILED_ARMS:
+                compile_invocation_attestation = _compile_candidate_refiner(
+                    run_tool,
+                    models[arm],
+                    configs[arm],
+                    arm,
                 )
-                compiler_cache_created = compiled
-                if not compiled:
-                    raise ProtocolError(
-                        "isolated fast memory model did not compile its ROSA refiner"
-                    )
+                compiled = bool(compile_invocation_attestation["compiled"])
+                compiler_cache_created = True
             if arm in CANDIDATE_ARMS:
                 compile_state_attestations.append(
                     _attest_candidate_compile_state(
@@ -1860,6 +2148,7 @@ def _measure_isolated_memory(
                 {
                     "allocator_before_build": before_build,
                     "compiled": compiled,
+                    "compile_invocation_attestation": (compile_invocation_attestation),
                     "execution_mode": (
                         candidate_execution_mode(arm)
                         if arm in CANDIDATE_ARMS
@@ -1963,6 +2252,194 @@ def _require_all_batch_compiled_parity(
     return parity
 
 
+def _error_distribution_record(torch, values) -> dict[str, Any]:
+    if values.ndim != 1 or not bool(torch.isfinite(values).all()):
+        raise ProtocolError("box parity errors must be a finite vector")
+    count = int(values.numel())
+    if not count:
+        return {"count": 0, "max": 0.0, "mean": 0.0, "p99_nearest_rank": 0.0}
+    ordered = torch.sort(values).values
+    p99_index = max(0, (99 * count + 99) // 100 - 1)
+    return {
+        "count": count,
+        "max": float(values.max().item()),
+        "mean": float(values.mean().item()),
+        "p99_nearest_rank": float(ordered[p99_index].item()),
+    }
+
+
+def _paired_payload_values(torch, eager_payload, compiled_payload, field: str):
+    eager_values, compiled_values = [], []
+    for sample_index, (eager_sample, compiled_sample) in enumerate(
+        zip(eager_payload, compiled_payload)
+    ):
+        if not isinstance(eager_sample, Mapping) or not isinstance(
+            compiled_sample, Mapping
+        ):
+            raise ProtocolError("bounded parity sample is not a mapping")
+        eager = _require_owned_cpu_tensor(
+            torch, eager_sample.get(field), f"eager {field}[{sample_index}]"
+        )
+        compiled = _require_owned_cpu_tensor(
+            torch, compiled_sample.get(field), f"compiled {field}[{sample_index}]"
+        )
+        if (
+            eager.dtype != compiled.dtype
+            or eager.shape != compiled.shape
+            or eager.stride() != compiled.stride()
+        ):
+            raise ProtocolError(f"compiled bounded arm changed {field} schema")
+        eager_values.append(eager)
+        compiled_values.append(compiled)
+    return eager_values, compiled_values
+
+
+def _require_all_batch_compiled_bounded_parity(
+    verifier,
+    torch,
+    eager_by_batch: Mapping[str, Any],
+    compiled_by_batch: Mapping[str, Any],
+    eager_payload_by_batch: Mapping[str, Any],
+    compiled_payload_by_batch: Mapping[str, Any],
+    *,
+    batch_count: int,
+) -> dict[str, Any]:
+    """Require raw-exact ranking/scores and tightly bounded box floats."""
+
+    expected_keys = {str(index) for index in range(batch_count)}
+    mappings = (
+        eager_by_batch,
+        compiled_by_batch,
+        eager_payload_by_batch,
+        compiled_payload_by_batch,
+    )
+    if any(set(mapping) != expected_keys for mapping in mappings):
+        raise ProtocolError(
+            "bounded eager/compiled parity did not cover every captured batch"
+        )
+
+    parity = {}
+    for batch_index in range(batch_count):
+        key = str(batch_index)
+        eager_record = eager_by_batch[key]
+        compiled_record = compiled_by_batch[key]
+        if not isinstance(eager_record, Mapping) or not isinstance(
+            compiled_record, Mapping
+        ):
+            raise ProtocolError("bounded eager/compiled record is not a mapping")
+        for field in (
+            "sample_count",
+            "detections_per_sample",
+            "finite_schema",
+            "stream",
+        ):
+            if field not in eager_record or field not in compiled_record:
+                raise ProtocolError(
+                    f"bounded eager/compiled record lacks schema field {field}"
+                )
+            if eager_record[field] != compiled_record[field]:
+                raise ProtocolError(
+                    "compiled bounded arm changed output schema/stream field "
+                    f"{field} for captured batch {batch_index}"
+                )
+
+        eager_payload = eager_payload_by_batch[key]
+        compiled_payload = compiled_payload_by_batch[key]
+        if (
+            not isinstance(eager_payload, Sequence)
+            or isinstance(eager_payload, (str, bytes))
+            or not isinstance(compiled_payload, Sequence)
+            or isinstance(compiled_payload, (str, bytes))
+            or len(eager_payload) != len(compiled_payload)
+            or len(eager_payload) != eager_record["sample_count"]
+        ):
+            raise ProtocolError(
+                f"bounded parity payload shape drifted for captured batch {batch_index}"
+            )
+
+        exact_field_records = {}
+        for field in COMPILED_BOUNDED_RAW_EXACT_FIELDS:
+            eager_values, compiled_values = _paired_payload_values(
+                torch, eager_payload, compiled_payload, field
+            )
+            if field in COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS:
+                if any(not value.is_floating_point() for value in eager_values):
+                    raise ProtocolError(f"score field {field} must be floating point")
+                if any(not bool(torch.isfinite(value).all()) for value in eager_values):
+                    raise ProtocolError(f"score field {field} contains NaN or Inf")
+            elif any(
+                value.is_floating_point() or value.is_complex()
+                for value in eager_values
+            ):
+                raise ProtocolError(f"integer field {field} changed type")
+            eager_fingerprint = verifier.raw_fingerprint(eager_values)
+            compiled_fingerprint = verifier.raw_fingerprint(compiled_values)
+            if eager_fingerprint != compiled_fingerprint:
+                raise ProtocolError(
+                    f"compiled bounded arm changed raw-exact field {field} "
+                    f"for captured batch {batch_index}"
+                )
+            exact_field_records[field] = {
+                "raw_exact": True,
+                "fingerprint": eager_fingerprint,
+            }
+
+        field = COMPILED_BOUNDED_BOX_FIELDS[0]
+        eager_values, compiled_values = _paired_payload_values(
+            torch, eager_payload, compiled_payload, field
+        )
+        if any(not value.is_floating_point() for value in eager_values):
+            raise ProtocolError(f"bounded box field {field} must be floating point")
+        eager_flat = torch.cat([value.double().reshape(-1) for value in eager_values])
+        compiled_flat = torch.cat(
+            [value.double().reshape(-1) for value in compiled_values]
+        )
+        if not bool(torch.isfinite(eager_flat).all()) or not bool(
+            torch.isfinite(compiled_flat).all()
+        ):
+            raise ProtocolError("bounded box payload contains NaN or Inf")
+        absolute = (compiled_flat - eager_flat).abs()
+        scale = torch.maximum(eager_flat.abs(), compiled_flat.abs()).clamp_min(
+            COMPILED_BOUNDED_BOX_RELATIVE_FLOOR
+        )
+        absolute_record = _error_distribution_record(torch, absolute)
+        relative_record = _error_distribution_record(torch, absolute / scale)
+        if (
+            absolute_record["max"] > COMPILED_BOUNDED_BOX_MAX_ABS
+            or relative_record["max"] > COMPILED_BOUNDED_BOX_MAX_REL
+        ):
+            raise ProtocolError(
+                "compiled bounded arm exceeded box tolerance for "
+                f"{field} in captured batch {batch_index}: "
+                f"max_abs={absolute_record['max']}, max_rel={relative_record['max']}"
+            )
+        parity[key] = {
+            "mode": "raw_exact_ranking_and_scores_bounded_box_floats_v1",
+            "passed": True,
+            "schema_and_stream_exact": True,
+            "raw_exact_fields": exact_field_records,
+            "bounded_box_fields": {
+                field: {
+                    "absolute_error": absolute_record,
+                    "relative_error": relative_record,
+                }
+            },
+            "aggregate_box_error": {
+                "absolute_error": absolute_record,
+                "relative_error": relative_record,
+            },
+            "thresholds": {
+                "max_abs_inclusive": COMPILED_BOUNDED_BOX_MAX_ABS,
+                "max_rel_inclusive": COMPILED_BOUNDED_BOX_MAX_REL,
+                "relative_denominator_floor": (COMPILED_BOUNDED_BOX_RELATIVE_FLOOR),
+                "p99_definition": "nearest-rank ceil(0.99 * count)",
+            },
+            "owned_detached_cpu_payloads": True,
+            "promotion_status": "PENDING_OFFICIAL_FULL_METRIC_PARITY",
+        }
+    return parity
+
+
 def _run_pair_protocol(
     verifier,
     torch,
@@ -1976,7 +2453,7 @@ def _run_pair_protocol(
     detector_pair = _detector_pair_from_native_arm(native_arm)
     _require_current_default_stream(torch, device)
     compiler_before = (
-        _compiler_counter_snapshot(torch) if candidate_arm == FAST_ARM else None
+        _compiler_counter_snapshot(torch) if candidate_arm in COMPILED_ARMS else None
     )
     result = verifier._run_scope(
         scope=verifier.C0_C32_FULL_DETECTOR_SCOPE,
@@ -2265,23 +2742,29 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
         ]
 
         eager_candidate_preflight = None
+        eager_candidate_payloads = None
         eager_candidate_rng = None
         eager_candidate_state = None
-        if candidate_arm == FAST_ARM:
+        timing_compile_invocation_attestation = None
+        if candidate_arm in COMPILED_ARMS:
             eager_candidate_rng = verifier._capture_rng()
             eager_candidate_state = verifier.raw_fingerprint(
                 models[candidate_arm].state_dict()
             )
-            eager_candidate_preflight = {
-                str(batch_index): _preflight_outputs(
-                    verifier,
-                    torch,
-                    {candidate_arm: models[candidate_arm]},
-                    source,
-                    device,
-                )[candidate_arm]
-                for batch_index, source in enumerate(sources)
-            }
+            (
+                eager_candidate_preflight,
+                eager_candidate_payloads,
+            ) = _candidate_preflight_by_batch(
+                verifier,
+                torch,
+                models[candidate_arm],
+                sources,
+                device,
+                candidate_arm,
+                capture_detached_payload=(
+                    candidate_arm in BOUNDED_PARITY_COMPILED_ARMS
+                ),
+            )
             verifier.require_same_fingerprint(
                 "eager fast preflight RNG",
                 eager_candidate_rng,
@@ -2301,14 +2784,15 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 )
             )
             verifier._restore_rng(eager_candidate_rng)
-            compiled[candidate_arm] = bool(
-                run_tool._compile_fast_inference(
-                    SimpleNamespace(model=models[candidate_arm]),
-                    configs[candidate_arm],
-                )
+            timing_compile_invocation_attestation = _compile_candidate_refiner(
+                run_tool,
+                models[candidate_arm],
+                configs[candidate_arm],
+                candidate_arm,
             )
-            if not compiled[candidate_arm]:
-                raise ProtocolError("fast arm did not compile its ROSA refiner")
+            compiled[candidate_arm] = bool(
+                timing_compile_invocation_attestation["compiled"]
+            )
             timing_compile_state_attestations.append(
                 _attest_candidate_compile_state(
                     models[candidate_arm],
@@ -2350,24 +2834,33 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
         )
 
         compiler_warmup_by_batch = None
+        compiler_warmup_payloads = None
+        parity_payload_release = {
+            "applicable": False,
+            "reason": "candidate does not use bounded compiled parity payloads",
+        }
         if candidate_arm == FAST_EAGER_ARM:
             compiler_warmup_by_batch = {
                 "applicable": False,
                 "reason": "torch.compile is forbidden for fast_eager",
             }
-        if candidate_arm == FAST_ARM:
+        if candidate_arm in COMPILED_ARMS:
             warmup_rng = verifier._capture_rng()
             warmup_state = verifier.raw_fingerprint(models[candidate_arm].state_dict())
-            compiler_warmup_by_batch = {
-                str(batch_index): _preflight_outputs(
-                    verifier,
-                    torch,
-                    {candidate_arm: models[candidate_arm]},
-                    source,
-                    device,
-                )[candidate_arm]
-                for batch_index, source in enumerate(sources)
-            }
+            (
+                compiler_warmup_by_batch,
+                compiler_warmup_payloads,
+            ) = _candidate_preflight_by_batch(
+                verifier,
+                torch,
+                models[candidate_arm],
+                sources,
+                device,
+                candidate_arm,
+                capture_detached_payload=(
+                    candidate_arm in BOUNDED_PARITY_COMPILED_ARMS
+                ),
+            )
             verifier.require_same_fingerprint(
                 "all-batch compiler warmup RNG",
                 warmup_rng,
@@ -2378,11 +2871,46 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                 != warmup_state
             ):
                 raise ProtocolError("all-batch compiler warmup mutated model state")
-            compiled_parity = _require_all_batch_compiled_parity(
-                eager_candidate_preflight,
-                compiler_warmup_by_batch,
-                batch_count=len(sources),
+            if candidate_arm in RAW_EXACT_COMPILED_ARMS:
+                compiled_parity = _require_all_batch_compiled_parity(
+                    eager_candidate_preflight,
+                    compiler_warmup_by_batch,
+                    batch_count=len(sources),
+                )
+            elif candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
+                compiled_parity = _require_all_batch_compiled_bounded_parity(
+                    verifier,
+                    torch,
+                    eager_candidate_preflight,
+                    compiler_warmup_by_batch,
+                    eager_candidate_payloads,
+                    compiler_warmup_payloads,
+                    batch_count=len(sources),
+                )
+                eager_candidate_payloads.clear()
+                compiler_warmup_payloads.clear()
+                eager_candidate_payloads = None
+                compiler_warmup_payloads = None
+                gc.collect()
+                parity_payload_release = {
+                    "applicable": True,
+                    "capture": ("detach().to(device='cpu', copy=True).contiguous()"),
+                    "retained_output_containers": False,
+                    "retained_cuda_or_cudagraph_storage": False,
+                    "payload_mappings_cleared_before_recorded_timing": True,
+                }
+            else:
+                raise ProtocolError("compiled arm has no parity contract")
+            verifier.require_same_fingerprint(
+                "post-parity compiler warmup RNG",
+                warmup_rng,
+                verifier._capture_rng(),
             )
+            if (
+                verifier.raw_fingerprint(models[candidate_arm].state_dict())
+                != warmup_state
+            ):
+                raise ProtocolError("compiled parity processing mutated model state")
         timing_compile_state_attestations.append(
             _attest_candidate_compile_state(
                 models[candidate_arm],
@@ -2430,8 +2958,11 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             "candidate_arm": candidate_arm,
             "output_preflight": output_preflight,
             "compiled_eager_parity": compiled_parity,
+            "compiled_parity_contract": compiled_parity_contract(candidate_arm),
+            "parity_payload_release": parity_payload_release,
             "compiler_warmup_by_batch": compiler_warmup_by_batch,
             "compile_state_attestations": timing_compile_state_attestations,
+            "compile_invocation_attestation": (timing_compile_invocation_attestation),
             "memory": memory,
             "statistics": timings,
             "near_native_gate": near_native_gate,
@@ -2486,10 +3017,12 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             "output_contract": {
                 "finite_and_well_formed": True,
                 "values_allowed_to_differ": True,
+                "compiled_eager_parity": compiled_parity_contract(candidate_arm),
                 "fast_eager_is_the_uncompiled_fast_reference_path": (
                     candidate_arm == FAST_EAGER_ARM
                 ),
             },
+            "promotion_contract": final_plan["promotion_contract"],
             "comparisons": comparison_results,
             "environment": environment,
             "physical_gpu": identity,

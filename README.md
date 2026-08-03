@@ -186,6 +186,12 @@ hard-link epoch 8 as a protected resume milestone, and retain separate best
 `fisheye_bev/mAP` and best `fisheye_bev/NDS` weights. Best-only weights do not
 contain optimizer/scheduler state and are therefore rejected for resume.
 
+The speed harness leaves the raw-exact `fast` compile route unchanged and adds
+a benchmark-only `fast_compiled_bounded` arm. It uses
+`max-autotune-no-cudagraphs`, keeps scores/ranking raw-exact, and limits box
+absolute and relative error to `1e-5`. Promotion still requires official
+Main126 full-metric parity; these are fixed protocol constants, not user knobs.
+
 ## Checkpoint and results
 
 Only the best Full checkpoint is retained locally:

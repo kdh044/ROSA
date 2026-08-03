@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import argparse
 from dataclasses import dataclass
 import importlib.util
 import json
@@ -12,6 +11,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL_PATH = ROOT / "tools/verify_full_rosa_near_native.py"
@@ -108,6 +108,7 @@ with tempfile.TemporaryDirectory() as raw_temp:
 
     for profile, candidate in (
         ('fast', module.FAST_ARM),
+        ('fast_compiled_bounded', module.FAST_COMPILED_BOUNDED_ARM),
         ('fast_eager', module.FAST_EAGER_ARM),
         ('balanced', module.BALANCED_ARM),
     ):
@@ -137,15 +138,20 @@ with tempfile.TemporaryDirectory() as raw_temp:
             'ROSARefinementHead'
         )
         assert plan['candidate_profile'] == profile
-        assert plan['schema'].endswith('.v2')
-        assert plan['protocol'].endswith('-v2')
+        assert plan['schema'].endswith('.v3')
+        assert plan['protocol'].endswith('-v3')
         compiler_guard = plan['measurement']['compiler_guard']
-        if profile == 'fast':
+        if profile in ('fast', 'fast_compiled_bounded'):
             assert compiler_guard['applicable'] is True
             assert 'raw-exact' in compiler_guard['requirement']
         else:
             assert compiler_guard['applicable'] is False
             assert 'reason' in compiler_guard
+        if profile == 'fast':
+            assert plan['measurement']['candidate_compile']['kwargs'] == {
+                'mode': 'reduce-overhead',
+                'fullgraph': False,
+            }
         if profile == 'fast_eager':
             assert plan['candidate_model_profile'] == 'fast'
             assert plan['candidate_execution_mode'] == 'eager'
@@ -154,6 +160,36 @@ with tempfile.TemporaryDirectory() as raw_temp:
             assert plan['arms'][candidate]['config_derivation']['only_changes'][
                 'model.head.rosa_cfg'
             ] == {'profile': 'fast'}
+        if profile == 'fast_compiled_bounded':
+            parity = plan['output_contract']['compiled_eager_parity']
+            compile_contract = plan['measurement']['candidate_compile']
+            assert compile_contract['route'] == (
+                'benchmark-local head.rosa_refiner.compile'
+            )
+            assert compile_contract['kwargs'] == {
+                'mode': 'max-autotune-no-cudagraphs',
+                'fullgraph': False,
+            }
+            assert parity['mode'] == (
+                'raw_exact_ranking_and_scores_bounded_box_floats_v1'
+            )
+            assert parity['box_thresholds'] == {
+                'max_abs_inclusive': 1e-5,
+                'max_rel_inclusive': 1e-5,
+                'relative_denominator': (
+                    'max(abs(eager), abs(compiled), 1e-12)'
+                ),
+            }
+            assert parity['raw_exact_fields'] == [
+                'scores_3d',
+                'cls_scores',
+                'labels_3d',
+                'query_indices',
+                'instance_ids',
+            ]
+            assert plan['promotion_contract'][
+                'official_full_metric_parity_required_before_promotion'
+            ] is True
         assert module.main(argv) == 0
         assert not output.exists()
 
@@ -216,6 +252,7 @@ print('stdlib-only-ok')
     ("candidate", "iterations"),
     (
         (tool.FAST_ARM, 60),
+        (tool.FAST_COMPILED_BOUNDED_ARM, 60),
         (tool.FAST_EAGER_ARM, 300),
         (tool.BALANCED_ARM, 300),
     ),
@@ -255,6 +292,12 @@ def test_pair_schedule_is_balanced_pccp_cppc_and_replays_one_batch(
     ("profile", "candidate", "model_profile", "execution_mode"),
     (
         ("fast", tool.FAST_ARM, "fast", "compiled"),
+        (
+            "fast_compiled_bounded",
+            tool.FAST_COMPILED_BOUNDED_ARM,
+            "fast",
+            "compiled",
+        ),
         ("fast_eager", tool.FAST_EAGER_ARM, "fast", "eager"),
         ("balanced", tool.BALANCED_ARM, "balanced", "eager"),
     ),
@@ -603,6 +646,65 @@ def test_compile_state_attestation_rejects_missing_or_wrong_fast_state() -> None
         )
 
 
+def test_compiled_arms_use_distinct_frozen_compile_routes() -> None:
+    class Refiner:
+        def __init__(self):
+            self._compiled_call_impl = None
+            self.calls = []
+
+        def compile(self, **kwargs):
+            self.calls.append(kwargs)
+            self._compiled_call_impl = object()
+
+    class RunTool:
+        calls = []
+
+        @classmethod
+        def _compile_fast_inference(cls, runner, config):
+            cls.calls.append((runner, config))
+            runner.model.head.rosa_refiner.compile(
+                mode="reduce-overhead", fullgraph=False
+            )
+            return True
+
+    raw_refiner = Refiner()
+    raw_model = SimpleNamespace(head=SimpleNamespace(rosa_refiner=raw_refiner))
+    raw = tool._compile_candidate_refiner(
+        RunTool, raw_model, "raw-config", tool.FAST_ARM
+    )
+    assert len(RunTool.calls) == 1
+    assert raw_refiner.calls == [{"mode": "reduce-overhead", "fullgraph": False}]
+    assert raw["observed_route"] == "frozen tools.run._compile_fast_inference"
+    assert raw["observed_kwargs"] == {
+        "mode": "reduce-overhead",
+        "fullgraph": False,
+    }
+
+    bounded_refiner = Refiner()
+    bounded_model = SimpleNamespace(head=SimpleNamespace(rosa_refiner=bounded_refiner))
+    bounded = tool._compile_candidate_refiner(
+        RunTool,
+        bounded_model,
+        "bounded-config",
+        tool.FAST_COMPILED_BOUNDED_ARM,
+    )
+    assert len(RunTool.calls) == 1
+    assert bounded_refiner.calls == [
+        {"mode": "max-autotune-no-cudagraphs", "fullgraph": False}
+    ]
+    assert bounded["observed_route"] == ("benchmark-local head.rosa_refiner.compile")
+    assert bounded["observed_kwargs"] == {
+        "mode": "max-autotune-no-cudagraphs",
+        "fullgraph": False,
+    }
+    assert (
+        tool.candidate_compile_contract(tool.FAST_COMPILED_BOUNDED_ARM)[
+            "production_fast_route_unchanged"
+        ]
+        is True
+    )
+
+
 def test_armed_execution_rejects_preimported_accelerator_module(monkeypatch) -> None:
     monkeypatch.setitem(sys.modules, "torch", object())
     with pytest.raises(tool.ProtocolError, match="standard-library-only"):
@@ -659,6 +761,7 @@ def test_atomic_publication_removes_new_marker_when_directory_fsync_fails(
     ("candidate", "expected_compiles"),
     (
         (tool.FAST_ARM, 1),
+        (tool.FAST_COMPILED_BOUNDED_ARM, 1),
         (tool.FAST_EAGER_ARM, 0),
         (tool.BALANCED_ARM, 0),
     ),
@@ -668,15 +771,22 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     monkeypatch, candidate, expected_compiles, native_arm
 ) -> None:
     build_calls = []
-    compile_calls = []
+    production_compile_calls = []
+    benchmark_compile_calls = []
     reset_calls = []
     lifecycle = []
 
+    class Refiner:
+        def __init__(self):
+            self._compiled_call_impl = None
+
+        def compile(self, **kwargs):
+            benchmark_compile_calls.append(kwargs)
+            self._compiled_call_impl = object()
+
     class Model:
         def __init__(self):
-            self.head = SimpleNamespace(
-                rosa_refiner=SimpleNamespace(_compiled_call_impl=None)
-            )
+            self.head = SimpleNamespace(rosa_refiner=Refiner())
 
     def build_models(verifier, configs, state_dict, arms, device):
         del verifier, configs, state_dict, device
@@ -713,7 +823,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     class RunTool:
         @staticmethod
         def _compile_fast_inference(model, config):
-            compile_calls.append((model, config))
+            production_compile_calls.append((model, config))
             model.model.head.rosa_refiner._compiled_call_impl = object()
             return True
 
@@ -754,7 +864,12 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     )
 
     assert build_calls == [(native_arm,), (candidate,)]
-    assert len(compile_calls) == expected_compiles
+    assert len(production_compile_calls) == (1 if candidate == tool.FAST_ARM else 0)
+    assert benchmark_compile_calls == (
+        [{"mode": "max-autotune-no-cudagraphs", "fullgraph": False}]
+        if candidate == tool.FAST_COMPILED_BOUNDED_ARM
+        else []
+    )
     assert len(reset_calls) == expected_compiles
     expected_lifecycle = [
         "stabilize",
@@ -801,9 +916,18 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         record["passed"] for record in memory[candidate]["compile_state_attestations"]
     )
     assert all(
-        record["observed_compiled"] is (candidate == tool.FAST_ARM)
+        record["observed_compiled"] is (candidate in tool.COMPILED_ARMS)
         for record in memory[candidate]["compile_state_attestations"][1:]
     )
+    invocation = memory[candidate]["compile_invocation_attestation"]
+    if candidate in tool.COMPILED_ARMS:
+        assert invocation["passed"] is True
+        assert (
+            invocation["observed_kwargs"]
+            == tool.candidate_compile_contract(candidate)["kwargs"]
+        )
+    else:
+        assert invocation is None
 
 
 def test_fast_timing_rejects_compiler_counter_changes() -> None:
@@ -954,7 +1078,14 @@ def _semantic_checkpoint(**source_overrides):
     }
 
 
-@pytest.mark.parametrize("arm", (tool.FAST_ARM, tool.FAST_EAGER_ARM))
+@pytest.mark.parametrize(
+    "arm",
+    (
+        tool.FAST_ARM,
+        tool.FAST_COMPILED_BOUNDED_ARM,
+        tool.FAST_EAGER_ARM,
+    ),
+)
 def test_checkpoint_semantics_allows_only_the_preregistered_fast_budget_delta(
     arm,
 ) -> None:
@@ -1078,7 +1209,14 @@ def test_c32_checkpoint_semantics_rejects_missing_sidecar_state() -> None:
         ),
     ),
 )
-@pytest.mark.parametrize("arm", (tool.FAST_ARM, tool.FAST_EAGER_ARM))
+@pytest.mark.parametrize(
+    "arm",
+    (
+        tool.FAST_ARM,
+        tool.FAST_COMPILED_BOUNDED_ARM,
+        tool.FAST_EAGER_ARM,
+    ),
+)
 def test_checkpoint_semantics_fails_closed_on_missing_or_unrelated_metadata(
     mutation, message, arm
 ) -> None:
@@ -1115,6 +1253,222 @@ def test_compiled_parity_requires_raw_exact_output_for_every_batch() -> None:
             {"0": {}, "1": eager["1"]},
             batch_count=2,
         )
+
+
+def test_original_fast_raw_exact_gate_does_not_accept_bounded_box_delta() -> None:
+    eager = {
+        "0": {"raw_fingerprint": "eager-box-bits"},
+        "1": {"raw_fingerprint": "same"},
+    }
+    compiled = {
+        "0": {"raw_fingerprint": "compiled-box-bits-with-1e-6-delta"},
+        "1": {"raw_fingerprint": "same"},
+    }
+
+    with pytest.raises(tool.ProtocolError, match="not raw-exact"):
+        tool._require_all_batch_compiled_parity(eager, compiled, batch_count=2)
+    assert tool.compiled_parity_contract(tool.FAST_ARM) == {
+        "applicable": True,
+        "mode": "raw_exact_all_output_fields",
+        "all_output_values_raw_exact": True,
+    }
+
+
+def _test_raw_fingerprint(values):
+    return [
+        (
+            str(value.dtype),
+            tuple(value.shape),
+            tuple(value.stride()),
+            bytes(value.contiguous().view(torch.uint8).reshape(-1).tolist()),
+        )
+        for value in values
+    ]
+
+
+def _bounded_parity_fixture(*, box_dtype=torch.float32):
+    eager_records, compiled_records, eager_payloads, compiled_payloads = {}, {}, {}, {}
+    for batch_index in range(2):
+        key = str(batch_index)
+        record = {
+            "sample_count": 1,
+            "detections_per_sample": [2],
+            "finite_schema": {"sealed": True},
+            "stream": {"current_stream": 7, "default_stream": 7},
+        }
+        eager_records[key], compiled_records[key] = record, dict(record)
+        eager_sample = {
+            "bboxes_3d": torch.arange(1, 23, dtype=box_dtype).reshape(2, 11)
+            + batch_index,
+            "scores_3d": torch.tensor([0.8, 0.7]),
+            "cls_scores": torch.tensor([0.9, 0.75]),
+            "labels_3d": torch.tensor([1, 4]),
+            "query_indices": torch.tensor([8, 3]),
+            "instance_ids": torch.tensor([80, 30]),
+        }
+        compiled_sample = {name: value.clone() for name, value in eager_sample.items()}
+        compiled_sample["bboxes_3d"].add_(1.0e-6)
+        eager_payloads[key], compiled_payloads[key] = (eager_sample,), (
+            compiled_sample,
+        )
+    return (
+        SimpleNamespace(raw_fingerprint=_test_raw_fingerprint),
+        eager_records,
+        compiled_records,
+        eager_payloads,
+        compiled_payloads,
+    )
+
+
+def test_compiled_bounded_parity_is_explicit_and_records_error_distribution() -> None:
+    fixture = _bounded_parity_fixture()
+    parity = tool._require_all_batch_compiled_bounded_parity(
+        fixture[0],
+        torch,
+        *fixture[1:],
+        batch_count=2,
+    )
+
+    assert set(parity) == {"0", "1"}
+    for record in parity.values():
+        assert record["passed"] is True
+        assert set(record["raw_exact_fields"]) == set(
+            tool.COMPILED_BOUNDED_RAW_EXACT_FIELDS
+        )
+        error = record["aggregate_box_error"]
+        assert set(error["absolute_error"]) == {
+            "count",
+            "max",
+            "mean",
+            "p99_nearest_rank",
+        }
+        assert error["absolute_error"]["count"] == 22
+        assert error["absolute_error"]["max"] <= 1e-5
+        assert error["relative_error"]["max"] <= 1e-5
+        assert record["promotion_status"] == "PENDING_OFFICIAL_FULL_METRIC_PARITY"
+
+
+@pytest.mark.parametrize("field", tool.COMPILED_BOUNDED_RAW_EXACT_FIELDS)
+def test_compiled_bounded_parity_rejects_any_score_or_ranking_bit_change(field) -> None:
+    fixture = _bounded_parity_fixture()
+    compiled_payload = fixture[4]
+    tensor = compiled_payload["1"][0][field]
+    if tensor.is_floating_point():
+        tensor[0] = torch.nextafter(tensor[0], torch.tensor(float("inf")))
+    else:
+        tensor[0].add_(1)
+
+    with pytest.raises(tool.ProtocolError, match=f"raw-exact field {field}"):
+        tool._require_all_batch_compiled_bounded_parity(
+            fixture[0], torch, *fixture[1:], batch_count=2
+        )
+
+
+def test_compiled_bounded_parity_rejects_absolute_or_relative_box_excess() -> None:
+    absolute = _bounded_parity_fixture(box_dtype=torch.float64)
+    absolute[4]["0"][0]["bboxes_3d"][0, 0].add_(2.0e-5)
+    with pytest.raises(tool.ProtocolError, match="exceeded box tolerance"):
+        tool._require_all_batch_compiled_bounded_parity(
+            absolute[0], torch, *absolute[1:], batch_count=2
+        )
+
+    relative = _bounded_parity_fixture(box_dtype=torch.float64)
+    relative[3]["0"][0]["bboxes_3d"][0, 0] = 1.0e-8
+    relative[4]["0"][0]["bboxes_3d"][0, 0] = 1.01e-8
+    with pytest.raises(tool.ProtocolError, match="exceeded box tolerance"):
+        tool._require_all_batch_compiled_bounded_parity(
+            relative[0], torch, *relative[1:], batch_count=2
+        )
+
+
+def test_compiled_bounded_parity_rejects_schema_or_stream_drift() -> None:
+    fixture = _bounded_parity_fixture()
+    fixture[2]["1"]["stream"] = {"current_stream": 9, "default_stream": 9}
+    with pytest.raises(tool.ProtocolError, match="schema/stream field stream"):
+        tool._require_all_batch_compiled_bounded_parity(
+            fixture[0], torch, *fixture[1:], batch_count=2
+        )
+
+
+def test_parity_payload_is_an_owned_detached_cpu_copy() -> None:
+    class Boxes:
+        def __init__(self, tensor):
+            self.tensor = tensor
+
+    source_fields = {
+        "bboxes_3d": Boxes(torch.randn(2, 11, requires_grad=True)),
+        "scores_3d": torch.rand(2, requires_grad=True),
+        "cls_scores": torch.rand(2, requires_grad=True),
+        "labels_3d": torch.tensor([1, 2], dtype=torch.long),
+        "query_indices": torch.tensor([7, 4], dtype=torch.long),
+        "instance_ids": torch.tensor([70, 40], dtype=torch.long),
+    }
+    predictions = SimpleNamespace(**source_fields)
+    output = [SimpleNamespace(pred_instances_3d=predictions)]
+
+    def prediction_tensor(sample, name):
+        value = getattr(sample.pred_instances_3d, name)
+        return value.tensor if name == "bboxes_3d" else value
+
+    payload = tool._capture_detached_cpu_parity_payload(
+        SimpleNamespace(_prediction_tensor=prediction_tensor), torch, output
+    )
+
+    assert len(payload) == 1
+    for name, copied in payload[0].items():
+        source = source_fields[name]
+        source = source.tensor if name == "bboxes_3d" else source
+        assert copied.device.type == "cpu"
+        assert copied.requires_grad is False
+        assert copied.grad_fn is None
+        assert copied._base is None
+        assert (
+            copied.untyped_storage().data_ptr() != source.untyped_storage().data_ptr()
+        )
+        assert torch.equal(copied, source.detach())
+
+
+def test_actual_frozen_decoder_result_exposes_all_six_parity_fields() -> None:
+    from rosa.integrations.sparse4d_scores import decode_frozen_jointscore_rank
+
+    class IdentityDecoder:
+        selection_score_mode = "legacy"
+        sorted = True
+        num_output = 3
+        score_threshold = None
+
+        @staticmethod
+        def decode_box(boxes):
+            return boxes
+
+    classification = torch.randn(1, 3, 6)
+    boxes = torch.randn(1, 3, 11)
+    labels = torch.tensor([[0, 2, 5]], dtype=torch.long)
+    selected_probability = torch.tensor([[0.8, 0.7, 0.6]])
+    joint_score = torch.tensor([[0.6, 0.8, 0.7]])
+    instance_ids = torch.tensor([[100, 101, 102]], dtype=torch.long)
+    decoded = decode_frozen_jointscore_rank(
+        IdentityDecoder(),
+        [classification],
+        [boxes],
+        labels,
+        selected_probability,
+        joint_score,
+        instance_id=instance_ids,
+        output_idx=0,
+        validate_values=True,
+        pack_host_transfers=False,
+    )
+
+    assert len(decoded) == 1
+    assert set(decoded[0]) >= {
+        "boxes_3d",
+        "scores_3d",
+        "cls_scores",
+        "labels_3d",
+        "query_indices",
+        "instance_ids",
+    }
 
 
 @pytest.mark.parametrize("profile", ("fast", "balanced"))
@@ -1334,7 +1688,9 @@ def test_native_checkpoint_filter_accepts_only_rosa_sidecar_state() -> None:
         )
 
 
-@pytest.mark.parametrize("profile", ("fast", "fast_eager", "balanced"))
+@pytest.mark.parametrize(
+    "profile", ("fast", "fast_compiled_bounded", "fast_eager", "balanced")
+)
 def test_effective_dataset_contract_pins_main126_annotation_and_batch_size(
     tmp_path, profile
 ) -> None:
