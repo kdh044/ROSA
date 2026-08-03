@@ -649,6 +649,54 @@ def test_inductor_cleanup_rejects_missing_baseline_sys_entry(monkeypatch) -> Non
         tool._release_new_inductor_compile_modules(baseline, observed)
 
 
+@pytest.mark.parametrize(
+    ("arm", "attribute"),
+    (
+        (tool.FAST_ARM, "_compiled_call_impl"),
+        (tool.FAST_COMPILED_BOUNDED_ARM, "_compiled_fast_anchor_impl"),
+    ),
+)
+def test_compiled_callable_release_detaches_only_the_audited_attribute(
+    arm, attribute
+) -> None:
+    raw_call = object()
+    bounded_call = object()
+    refiner = SimpleNamespace(
+        _compiled_call_impl=raw_call,
+        _compiled_fast_anchor_impl=bounded_call,
+    )
+    model = SimpleNamespace(head=SimpleNamespace(rosa_refiner=refiner))
+
+    record = tool._release_candidate_compiled_callable(model, arm)
+
+    assert getattr(refiner, attribute) is None
+    other = (
+        "_compiled_fast_anchor_impl"
+        if attribute == "_compiled_call_impl"
+        else "_compiled_call_impl"
+    )
+    assert getattr(refiner, other) is (
+        bounded_call if other == "_compiled_fast_anchor_impl" else raw_call
+    )
+    assert record == {
+        "arm": arm,
+        "attribute": f"head.rosa_refiner.{attribute}",
+        "observed_compiled": True,
+        "detached": True,
+        "passed": True,
+    }
+
+
+def test_compiled_callable_release_is_fail_closed_for_arm_and_state() -> None:
+    model = SimpleNamespace(
+        head=SimpleNamespace(rosa_refiner=SimpleNamespace(_compiled_call_impl=None))
+    )
+    with pytest.raises(tool.ProtocolError, match="no audited compiled callable"):
+        tool._release_candidate_compiled_callable(model, tool.FAST_EAGER_ARM)
+    with pytest.raises(tool.ProtocolError, match="missing compiled state"):
+        tool._release_candidate_compiled_callable(model, tool.FAST_COMPILED_BOUNDED_ARM)
+
+
 def test_current_stream_guard_uses_ids_without_real_torch() -> None:
     class FakeCuda:
         @staticmethod
@@ -1029,6 +1077,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         {
             "phase": "compiled_arm_only",
             "steps": [
+                "detach disposable compiled callable",
                 "torch._dynamo.reset",
                 "release newly created torch._inductor compile-task modules",
                 "gc.collect",
@@ -1066,6 +1115,17 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
             "created_count": 1,
             "passed": True,
         }
+        assert memory[candidate]["compiled_callable_release_attestation"] == {
+            "arm": candidate,
+            "attribute": (
+                "head.rosa_refiner._compiled_fast_anchor_impl"
+                if candidate == tool.FAST_COMPILED_BOUNDED_ARM
+                else "head.rosa_refiner._compiled_call_impl"
+            ),
+            "observed_compiled": True,
+            "detached": True,
+            "passed": True,
+        }
         assert invocation["passed"] is True
         assert (
             invocation["observed_kwargs"]
@@ -1073,6 +1133,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
         )
     else:
         assert memory[candidate]["compiler_cache_cleanup_attestation"] is None
+        assert memory[candidate]["compiled_callable_release_attestation"] is None
         assert invocation is None
 
 
@@ -1114,9 +1175,10 @@ def test_memory_cleanup_runs_when_compilation_raises(monkeypatch) -> None:
     )
     snapshots = iter((empty, partial))
 
-    def compile_raises(*args):
-        del args
+    def compile_raises(run_tool, model, config, arm):
+        del run_tool, config, arm
         events.append("compile")
+        model.head.rosa_refiner._compiled_fast_anchor_impl = object()
         raise RuntimeError("compile failed")
 
     monkeypatch.setattr(tool, "_build_models", build_models)
@@ -1136,6 +1198,17 @@ def test_memory_cleanup_runs_when_compilation_raises(monkeypatch) -> None:
         lambda: (events.append("snapshot"), next(snapshots))[1],
     )
     monkeypatch.setattr(tool, "_compile_candidate_refiner", compile_raises)
+    original_release = tool._release_candidate_compiled_callable
+
+    def release_compiled_callable(model, arm):
+        events.append("detach")
+        return original_release(model, arm)
+
+    monkeypatch.setattr(
+        tool,
+        "_release_candidate_compiled_callable",
+        release_compiled_callable,
+    )
     monkeypatch.setattr(
         tool,
         "_reset_compiler_cache",
@@ -1166,11 +1239,13 @@ def test_memory_cleanup_runs_when_compilation_raises(monkeypatch) -> None:
         "snapshot",
         "compile",
         "snapshot",
+        "detach",
         "gc",
         "reset",
         "release",
         "gc",
     ]
+    assert Model.head.rosa_refiner._compiled_fast_anchor_impl is None
 
 
 def test_fast_timing_rejects_compiler_counter_changes() -> None:

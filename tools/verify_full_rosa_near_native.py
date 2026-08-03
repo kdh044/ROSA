@@ -1966,6 +1966,38 @@ def _reset_compiler_cache(torch) -> None:
     reset()
 
 
+def _release_candidate_compiled_callable(model, candidate_arm: str) -> dict[str, Any]:
+    """Detach a disposable compiled callable before global compiler cleanup."""
+
+    if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
+        state_attribute = "_compiled_fast_anchor_impl"
+    elif candidate_arm in RAW_EXACT_COMPILED_ARMS:
+        state_attribute = "_compiled_call_impl"
+    else:
+        raise ProtocolError(
+            f"{candidate_arm} has no audited compiled callable to release"
+        )
+    head = getattr(model, "head", None)
+    refiner = getattr(head, "rosa_refiner", None)
+    if refiner is None or not hasattr(refiner, state_attribute):
+        raise ProtocolError(
+            f"{candidate_arm} is missing compiled state {state_attribute}"
+        )
+    compiled_call = getattr(refiner, state_attribute)
+    observed_compiled = compiled_call is not None
+    setattr(refiner, state_attribute, None)
+    if getattr(refiner, state_attribute) is not None:
+        raise ProtocolError(f"{candidate_arm} compiled callable could not be detached")
+    del compiled_call
+    return {
+        "arm": candidate_arm,
+        "attribute": f"head.rosa_refiner.{state_attribute}",
+        "observed_compiled": observed_compiled,
+        "detached": observed_compiled,
+        "passed": True,
+    }
+
+
 class _InductorCompileTaskSnapshot(NamedTuple):
     cache_ids: frozenset[int]
     sys_entries: frozenset[tuple[str, int]]
@@ -2246,6 +2278,7 @@ def _measure_isolated_memory(
                 {
                     "phase": "compiled_arm_only",
                     "steps": [
+                        "detach disposable compiled callable",
                         "torch._dynamo.reset",
                         "release newly created torch._inductor compile-task modules",
                         "gc.collect",
@@ -2276,6 +2309,7 @@ def _measure_isolated_memory(
         compiler_cache_created = False
         compiler_module_baseline = None
         compiler_cleanup_attestation = None
+        compiled_callable_release_attestation = None
         compile_state_attestations: list[dict[str, Any]] = []
         try:
             models, built_contracts, built_load_contracts = _build_models(
@@ -2361,10 +2395,14 @@ def _measure_isolated_memory(
                 if compiler_cache_created
                 else None
             )
+            if compiler_cache_created:
+                compiled_callable_release_attestation = (
+                    _release_candidate_compiled_callable(models[arm], arm)
+                )
             models.clear()
-            # Module.compile can form Python cycles around the optimized call.
-            # Collect those objects before resetting global Dynamo/CUDA-graph
-            # caches; reversing this order leaves a small live graph allocation.
+            # torch.compile keeps the original bound method in its returned
+            # callable.  Detach that private edge before releasing the model;
+            # then collect before resetting global Dynamo/CUDA-graph caches.
             gc.collect()
             if compiler_cache_created:
                 if compiler_module_baseline is None or compiler_module_observed is None:
@@ -2380,6 +2418,9 @@ def _measure_isolated_memory(
             allocator_floor, after_cleanup, label=f"after {arm} memory cleanup"
         )
         memory[arm]["compiler_cache_cleanup_attestation"] = compiler_cleanup_attestation
+        memory[arm][
+            "compiled_callable_release_attestation"
+        ] = compiled_callable_release_attestation
         memory[arm]["allocator_after_cleanup"] = after_cleanup
 
     return memory, contracts, load_contracts
