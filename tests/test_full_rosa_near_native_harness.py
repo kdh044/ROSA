@@ -164,12 +164,16 @@ with tempfile.TemporaryDirectory() as raw_temp:
             parity = plan['output_contract']['compiled_eager_parity']
             compile_contract = plan['measurement']['candidate_compile']
             assert compile_contract['route'] == (
-                'benchmark-local head.rosa_refiner.compile'
+                'benchmark-local head.rosa_refiner.compile_fast_anchor'
             )
             assert compile_contract['kwargs'] == {
                 'mode': 'max-autotune-no-cudagraphs',
-                'fullgraph': False,
+                'fullgraph': True,
             }
+            assert compile_contract['compiled_boundary'] == (
+                'one-step anchor-only ROSA core'
+            )
+            assert compile_contract['scores_ranking_and_decode_remain_eager'] is True
             assert parity['mode'] == (
                 'raw_exact_ranking_and_scores_bounded_box_floats_v1'
             )
@@ -714,15 +718,44 @@ def test_compile_state_attestation_rejects_missing_or_wrong_fast_state() -> None
         )
 
 
+def test_bounded_compile_state_attests_only_the_anchor_core() -> None:
+    refiner = SimpleNamespace(
+        _compiled_call_impl=object(),
+        _compiled_fast_anchor_impl=None,
+    )
+    model = SimpleNamespace(head=SimpleNamespace(rosa_refiner=refiner))
+    uncompiled = tool._attest_candidate_compile_state(
+        model,
+        tool.FAST_COMPILED_BOUNDED_ARM,
+        expected_compiled=False,
+        phase="before anchor compilation",
+    )
+    assert uncompiled["attribute"].endswith("._compiled_fast_anchor_impl")
+
+    refiner._compiled_fast_anchor_impl = object()
+    compiled = tool._attest_candidate_compile_state(
+        model,
+        tool.FAST_COMPILED_BOUNDED_ARM,
+        expected_compiled=True,
+        phase="after anchor compilation",
+    )
+    assert compiled["observed_compiled"] is True
+
+
 def test_compiled_arms_use_distinct_frozen_compile_routes() -> None:
     class Refiner:
         def __init__(self):
             self._compiled_call_impl = None
+            self._compiled_fast_anchor_impl = None
             self.calls = []
 
         def compile(self, **kwargs):
             self.calls.append(kwargs)
             self._compiled_call_impl = object()
+
+        def compile_fast_anchor(self, **kwargs):
+            self.calls.append(kwargs)
+            self._compiled_fast_anchor_impl = object()
 
     class RunTool:
         calls = []
@@ -758,12 +791,14 @@ def test_compiled_arms_use_distinct_frozen_compile_routes() -> None:
     )
     assert len(RunTool.calls) == 1
     assert bounded_refiner.calls == [
-        {"mode": "max-autotune-no-cudagraphs", "fullgraph": False}
+        {"mode": "max-autotune-no-cudagraphs", "fullgraph": True}
     ]
-    assert bounded["observed_route"] == ("benchmark-local head.rosa_refiner.compile")
+    assert bounded["observed_route"] == (
+        "benchmark-local head.rosa_refiner.compile_fast_anchor"
+    )
     assert bounded["observed_kwargs"] == {
         "mode": "max-autotune-no-cudagraphs",
-        "fullgraph": False,
+        "fullgraph": True,
     }
     assert (
         tool.candidate_compile_contract(tool.FAST_COMPILED_BOUNDED_ARM)[
@@ -847,10 +882,15 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     class Refiner:
         def __init__(self):
             self._compiled_call_impl = None
+            self._compiled_fast_anchor_impl = None
 
         def compile(self, **kwargs):
             benchmark_compile_calls.append(kwargs)
             self._compiled_call_impl = object()
+
+        def compile_fast_anchor(self, **kwargs):
+            benchmark_compile_calls.append(kwargs)
+            self._compiled_fast_anchor_impl = object()
 
     class Model:
         def __init__(self):
@@ -962,7 +1002,7 @@ def test_memory_measurement_builds_only_one_model_at_a_time(
     assert build_calls == [(native_arm,), (candidate,)]
     assert len(production_compile_calls) == (1 if candidate == tool.FAST_ARM else 0)
     assert benchmark_compile_calls == (
-        [{"mode": "max-autotune-no-cudagraphs", "fullgraph": False}]
+        [{"mode": "max-autotune-no-cudagraphs", "fullgraph": True}]
         if candidate == tool.FAST_COMPILED_BOUNDED_ARM
         else []
     )
@@ -1040,7 +1080,12 @@ def test_memory_cleanup_runs_when_compilation_raises(monkeypatch) -> None:
     events = []
 
     class Model:
-        head = SimpleNamespace(rosa_refiner=SimpleNamespace(_compiled_call_impl=None))
+        head = SimpleNamespace(
+            rosa_refiner=SimpleNamespace(
+                _compiled_call_impl=None,
+                _compiled_fast_anchor_impl=None,
+            )
+        )
 
     def build_models(verifier, configs, state_dict, arms, device):
         del verifier, configs, state_dict, device

@@ -72,6 +72,7 @@ BOUNDED_PARITY_COMPILED_ARMS = frozenset((FAST_COMPILED_BOUNDED_ARM,))
 RAW_EXACT_FAST_COMPILE_MODE = "reduce-overhead"
 BOUNDED_FAST_COMPILE_MODE = "max-autotune-no-cudagraphs"
 COMPILED_FAST_FULLGRAPH = False
+COMPILED_BOUNDED_FAST_FULLGRAPH = True
 COMPILED_BOUNDED_BOX_MAX_ABS = 1.0e-5
 COMPILED_BOUNDED_BOX_MAX_REL = 1.0e-5
 COMPILED_BOUNDED_BOX_RELATIVE_FLOOR = 1.0e-12
@@ -515,11 +516,13 @@ def candidate_compile_contract(candidate_arm: str) -> dict[str, Any]:
     if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
         return {
             "applicable": True,
-            "route": "benchmark-local head.rosa_refiner.compile",
+            "route": "benchmark-local head.rosa_refiner.compile_fast_anchor",
             "kwargs": {
                 "mode": BOUNDED_FAST_COMPILE_MODE,
-                "fullgraph": COMPILED_FAST_FULLGRAPH,
+                "fullgraph": COMPILED_BOUNDED_FAST_FULLGRAPH,
             },
+            "compiled_boundary": "one-step anchor-only ROSA core",
+            "scores_ranking_and_decode_remain_eager": True,
             "production_fast_route_unchanged": True,
             "benchmark_local_override": True,
         }
@@ -541,7 +544,12 @@ def _compile_candidate_refiner(run_tool, model, config, candidate_arm: str):
     refiner = getattr(head, "rosa_refiner", None)
     if refiner is None:
         raise ProtocolError(f"{candidate_arm} is missing its ROSA refiner")
-    if getattr(refiner, "_compiled_call_impl", None) is not None:
+    state_attribute = (
+        "_compiled_fast_anchor_impl"
+        if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS
+        else "_compiled_call_impl"
+    )
+    if getattr(refiner, state_attribute, None) is not None:
         raise ProtocolError(
             f"{candidate_arm} refiner was compiled before its audited compile call"
         )
@@ -555,13 +563,15 @@ def _compile_candidate_refiner(run_tool, model, config, candidate_arm: str):
         )
         observed_route = "frozen tools.run._compile_fast_inference"
     elif candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
-        compile_method = getattr(refiner, "compile", None)
+        compile_method = getattr(refiner, "compile_fast_anchor", None)
         if not callable(compile_method):
-            raise ProtocolError("bounded candidate refiner has no compile method")
+            raise ProtocolError(
+                "bounded candidate refiner has no fast-anchor compile method"
+            )
         kwargs = dict(contract["kwargs"])
         compile_method(**kwargs)
-        compiled = getattr(refiner, "_compiled_call_impl", None) is not None
-        observed_route = "benchmark-local head.rosa_refiner.compile"
+        compiled = getattr(refiner, state_attribute, None) is not None
+        observed_route = "benchmark-local head.rosa_refiner.compile_fast_anchor"
     else:
         raise ProtocolError("compiled candidate has no compile route")
 
@@ -2137,8 +2147,13 @@ def _attest_candidate_compile_state(
     refiner = getattr(head, "rosa_refiner", None)
     if refiner is None:
         raise ProtocolError(f"{candidate_arm} is missing its ROSA refiner")
+    state_attribute = (
+        "_compiled_fast_anchor_impl"
+        if candidate_arm in BOUNDED_PARITY_COMPILED_ARMS
+        else "_compiled_call_impl"
+    )
     missing = object()
-    compiled_call = getattr(refiner, "_compiled_call_impl", missing)
+    compiled_call = getattr(refiner, state_attribute, missing)
     if compiled_call is missing:
         raise ProtocolError(
             f"{candidate_arm} refiner does not expose its compile-state attribute"
@@ -2155,7 +2170,7 @@ def _attest_candidate_compile_state(
         "model_profile": model_profile,
         "execution_mode": execution_mode,
         "phase": phase,
-        "attribute": "head.rosa_refiner._compiled_call_impl",
+        "attribute": f"head.rosa_refiner.{state_attribute}",
         "expected_compiled": expected_compiled,
         "observed_compiled": observed_compiled,
         "passed": True,
