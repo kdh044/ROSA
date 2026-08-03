@@ -1474,35 +1474,35 @@ def test_original_fast_raw_exact_gate_does_not_accept_bounded_box_delta() -> Non
 
 def _test_raw_fingerprint(values):
     return [
-        (
-            str(value.dtype),
-            tuple(value.shape),
-            tuple(value.stride()),
-            bytes(value.contiguous().view(torch.uint8).reshape(-1).tolist()),
-        )
+        {
+            "dtype": str(value.dtype),
+            "shape": list(value.shape),
+            "stride": list(value.stride()),
+            "bytes_hex": bytes(value.contiguous().view(torch.uint8).reshape(-1).tolist()).hex(),
+        }
         for value in values
     ]
 
 
-def _bounded_parity_fixture(*, box_dtype=torch.float32):
+def _bounded_parity_fixture(*, box_dtype=torch.float32, count=2):
     eager_records, compiled_records, eager_payloads, compiled_payloads = {}, {}, {}, {}
     for batch_index in range(2):
         key = str(batch_index)
         record = {
             "sample_count": 1,
-            "detections_per_sample": [2],
+            "detections_per_sample": [count],
             "finite_schema": {"sealed": True},
             "stream": {"current_stream": 7, "default_stream": 7},
         }
         eager_records[key], compiled_records[key] = record, dict(record)
         eager_sample = {
-            "bboxes_3d": torch.arange(1, 23, dtype=box_dtype).reshape(2, 11)
+            "bboxes_3d": torch.arange(1, count * 11 + 1, dtype=box_dtype).reshape(count, 11)
             + batch_index,
-            "scores_3d": torch.tensor([0.8, 0.7]),
-            "cls_scores": torch.tensor([0.9, 0.75]),
-            "labels_3d": torch.tensor([1, 4]),
-            "query_indices": torch.tensor([8, 3]),
-            "instance_ids": torch.tensor([80, 30]),
+            "scores_3d": torch.linspace(0.8, 0.2, count),
+            "cls_scores": torch.linspace(0.9, 0.25, count),
+            "labels_3d": torch.arange(count, dtype=torch.long).remainder(6),
+            "query_indices": torch.arange(count - 1, -1, -1, dtype=torch.long),
+            "instance_ids": torch.arange(100, 100 + count, dtype=torch.long),
         }
         compiled_sample = {name: value.clone() for name, value in eager_sample.items()}
         compiled_sample["bboxes_3d"].add_(1.0e-6)
@@ -1544,6 +1544,54 @@ def test_compiled_bounded_parity_is_explicit_and_records_error_distribution() ->
         assert error["absolute_error"]["max"] <= 1e-5
         assert error["relative_error"]["max"] <= 1e-5
         assert record["promotion_status"] == "PENDING_OFFICIAL_FULL_METRIC_PARITY"
+
+
+def test_compiled_bounded_diagnostic_is_complete_and_atomic_before_failure(tmp_path):
+    fixture = _bounded_parity_fixture(count=60)
+    batch0 = fixture[4]["0"][0]
+    for field, index in (("scores_3d", 3), ("cls_scores", 4)):
+        batch0[field][index] = torch.nextafter(
+            batch0[field][index], torch.tensor(float("inf"))
+        )
+    batch0["labels_3d"][5].add_(1)
+    batch0["query_indices"][[1, 2]] = batch0["query_indices"][[2, 1]]
+    batch0["instance_ids"][7].add_(10)
+    batch0["bboxes_3d"][8, 0].add_(2.0e-5)
+    fixture[4]["1"][0]["query_indices"][[49, 50]] = fixture[4]["1"][0][
+        "query_indices"
+    ][[50, 49]]
+
+    diagnostic = tool._build_all_batch_compiled_bounded_parity_diagnostic(
+        fixture[0], torch, *fixture[1:], batch_count=2
+    )
+    assert diagnostic["passed"] is False
+    assert {item.get("field") for item in diagnostic["violations"]} >= {
+        "scores_3d", "cls_scores", "labels_3d", "query_indices",
+        "instance_ids", "bboxes_3d",
+    }
+    fields = diagnostic["batches"]["0"]["fields"]
+    score = fields["scores_3d"]
+    assert score["raw_mismatch_count"] == score["numeric_mismatch_count"] == 1
+    assert score["first_mismatch"]["flat_index"] == 3
+    assert score["absolute_error"]["max"] > 0
+    assert score["absolute_error"]["mean"] > 0
+    assert score["absolute_error"]["p99_nearest_rank"] > 0
+    assert score["ulp_error"]["max"] == score["ulp_error"]["p99_nearest_rank"] == 1
+    assert fields["labels_3d"]["first_mismatch"]["flat_index"] == 5
+    assert fields["query_indices"]["ranking"]["topk50_order_exact"] is False
+    assert fields["query_indices"]["ranking"]["topk50_set_exact"] is True
+    rank1 = diagnostic["batches"]["1"]["fields"]["query_indices"]["ranking"]
+    assert rank1["topk50_order_exact"] is rank1["topk50_set_exact"] is False
+
+    path = tmp_path / tool.COMPILED_PARITY_DIAGNOSTIC_FILENAME
+    with pytest.raises(tool.ProtocolError, match="raw-exact field scores_3d"):
+        tool._record_and_require_all_batch_compiled_bounded_parity(
+            path, fixture[0], torch, *fixture[1:], batch_count=2
+        )
+    recorded = json.loads(path.read_text(encoding="utf-8"))
+    assert recorded["violation_count"] == diagnostic["violation_count"]
+    assert recorded["batches"]["0"]["fields"]["bboxes_3d"]["tolerance_passed"] is False
+    assert not path.with_name(path.name + ".tmp").exists()
 
 
 @pytest.mark.parametrize("field", tool.COMPILED_BOUNDED_RAW_EXACT_FIELDS)

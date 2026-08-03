@@ -89,6 +89,9 @@ COMPILED_BOUNDED_RAW_EXACT_FIELDS = (
     *COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS,
     *COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS,
 )
+COMPILED_PARITY_DIAGNOSTIC_SCHEMA = "rosa.compiled_parity_diagnostic.v1"
+COMPILED_PARITY_DIAGNOSTIC_FILENAME = "COMPILED_PARITY_DIAGNOSTIC.json"
+COMPILED_PARITY_DIAGNOSTIC_TOPK = 50
 INDUCTOR_COMPILE_TASK_MODULE_PREFIX = "torch._inductor.runtime.compile_tasks."
 WARMUP_ITERATIONS_PER_ARM = 60
 MEASURED_ITERATIONS_PER_ARM = 300
@@ -471,6 +474,14 @@ def compiled_parity_contract(candidate_arm: str) -> dict[str, Any]:
                 "max_abs_inclusive": COMPILED_BOUNDED_BOX_MAX_ABS,
                 "max_rel_inclusive": COMPILED_BOUNDED_BOX_MAX_REL,
                 "relative_denominator": ("max(abs(eager), abs(compiled), 1e-12)"),
+            },
+            "failure_diagnostic": {
+                "schema": COMPILED_PARITY_DIAGNOSTIC_SCHEMA,
+                "filename": COMPILED_PARITY_DIAGNOSTIC_FILENAME,
+                "atomic_before_strict_enforcement": True,
+                "all_fields_collected_before_enforcement": True,
+                "query_rank_prefix": COMPILED_PARITY_DIAGNOSTIC_TOPK,
+                "strict_gate_relaxed": False,
             },
             "benchmark_only": True,
             "official_full_metric_parity_required_before_promotion": True,
@@ -2477,7 +2488,371 @@ def _paired_payload_values(torch, eager_payload, compiled_payload, field: str):
     return eager_values, compiled_values
 
 
-def _require_all_batch_compiled_bounded_parity(
+def _raw_element_equal_mask(torch, eager, compiled):
+    element_bytes = eager.element_size()
+    eager_bytes = eager.contiguous().view(torch.uint8).reshape(-1, element_bytes)
+    compiled_bytes = compiled.contiguous().view(torch.uint8).reshape(-1, element_bytes)
+    return eager_bytes.eq(compiled_bytes).all(dim=1)
+
+
+def _integer_distribution_record(values: Sequence[int]) -> dict[str, Any]:
+    count = len(values)
+    if not count:
+        return {"count": 0, "max": 0, "mean": 0.0, "p99_nearest_rank": 0}
+    ordered = sorted(int(value) for value in values)
+    p99_index = max(0, (99 * count + 99) // 100 - 1)
+    return {
+        "count": count,
+        "max": ordered[-1],
+        "mean": float(sum(ordered) / count),
+        "p99_nearest_rank": ordered[p99_index],
+    }
+
+
+def _floating_ulp_distances(torch, eager, compiled) -> list[int] | None:
+    formats = {
+        torch.float16: (torch.int16, 16),
+        torch.bfloat16: (torch.int16, 16),
+        torch.float32: (torch.int32, 32),
+        torch.float64: (torch.int64, 64),
+    }
+    spec = formats.get(eager.dtype)
+    if spec is None:
+        return None
+    integer_dtype, width = spec
+    eager_words = eager.contiguous().view(integer_dtype).reshape(-1).tolist()
+    compiled_words = compiled.contiguous().view(integer_dtype).reshape(-1).tolist()
+    mask = (1 << width) - 1
+    sign = 1 << (width - 1)
+
+    def ordered_key(word: int) -> int:
+        bits = int(word) & mask
+        return ((~bits) & mask) if bits & sign else bits | sign
+
+    return [
+        abs(ordered_key(left) - ordered_key(right))
+        for left, right in zip(eager_words, compiled_words)
+    ]
+
+
+def _floating_field_diagnostic(torch, eager_values, compiled_values) -> dict[str, Any]:
+    absolute_parts = []
+    relative_parts = []
+    ulp_values = []
+    ulp_applicable = True
+    raw_mismatch_count = 0
+    numeric_mismatch_count = 0
+    first_mismatch = None
+    samples = []
+    for sample_index, (eager, compiled) in enumerate(zip(eager_values, compiled_values)):
+        raw_mismatch = ~_raw_element_equal_mask(torch, eager, compiled)
+        sample_raw_mismatches = int(raw_mismatch.sum().item())
+        eager_double = eager.double().reshape(-1)
+        compiled_double = compiled.double().reshape(-1)
+        absolute = (compiled_double - eager_double).abs()
+        scale = torch.maximum(eager_double.abs(), compiled_double.abs()).clamp_min(
+            COMPILED_BOUNDED_BOX_RELATIVE_FLOOR
+        )
+        numeric_mismatches = int(absolute.ne(0).sum().item())
+        sample_ulps = _floating_ulp_distances(torch, eager, compiled)
+        if sample_ulps is None:
+            ulp_applicable = False
+        else:
+            ulp_values.extend(sample_ulps)
+        if first_mismatch is None and sample_raw_mismatches:
+            flat_index = int(raw_mismatch.nonzero(as_tuple=False)[0].item())
+            first_mismatch = {
+                "sample_index": sample_index,
+                "flat_index": flat_index,
+                "eager": float(eager_double[flat_index].item()),
+                "compiled": float(compiled_double[flat_index].item()),
+                "absolute_error": float(absolute[flat_index].item()),
+                "ulp_error": None if sample_ulps is None else int(sample_ulps[flat_index]),
+            }
+        raw_mismatch_count += sample_raw_mismatches
+        numeric_mismatch_count += numeric_mismatches
+        absolute_parts.append(absolute)
+        relative_parts.append(absolute / scale)
+        samples.append(
+            {
+                "sample_index": sample_index,
+                "element_count": int(eager.numel()),
+                "raw_mismatch_count": sample_raw_mismatches,
+                "numeric_mismatch_count": numeric_mismatches,
+            }
+        )
+    absolute = torch.cat(absolute_parts) if absolute_parts else torch.empty(0)
+    relative = torch.cat(relative_parts) if relative_parts else torch.empty(0)
+    return {
+        "raw_exact": raw_mismatch_count == 0,
+        "raw_mismatch_count": raw_mismatch_count,
+        "numeric_mismatch_count": numeric_mismatch_count,
+        "first_mismatch": first_mismatch,
+        "absolute_error": _error_distribution_record(torch, absolute),
+        "relative_error": _error_distribution_record(torch, relative),
+        "ulp_error": (
+            _integer_distribution_record(ulp_values)
+            if ulp_applicable
+            else {"applicable": False, "reason": "unsupported floating dtype"}
+        ),
+        "samples": samples,
+    }
+
+
+def _integer_field_diagnostic(torch, eager_values, compiled_values) -> dict[str, Any]:
+    mismatch_count = 0
+    first_mismatch = None
+    samples = []
+    for sample_index, (eager, compiled) in enumerate(zip(eager_values, compiled_values)):
+        mismatch = ~_raw_element_equal_mask(torch, eager, compiled)
+        sample_mismatches = int(mismatch.sum().item())
+        if first_mismatch is None and sample_mismatches:
+            flat_index = int(mismatch.nonzero(as_tuple=False)[0].item())
+            first_mismatch = {
+                "sample_index": sample_index,
+                "flat_index": flat_index,
+                "eager": int(eager.reshape(-1)[flat_index].item()),
+                "compiled": int(compiled.reshape(-1)[flat_index].item()),
+            }
+        mismatch_count += sample_mismatches
+        samples.append(
+            {
+                "sample_index": sample_index,
+                "element_count": int(eager.numel()),
+                "mismatch_count": sample_mismatches,
+            }
+        )
+    return {
+        "raw_exact": mismatch_count == 0,
+        "mismatch_count": mismatch_count,
+        "first_mismatch": first_mismatch,
+        "samples": samples,
+    }
+
+
+def _query_rank_diagnostic(eager_values, compiled_values) -> dict[str, Any]:
+    samples = []
+    first_mismatch = None
+    for sample_index, (eager, compiled) in enumerate(zip(eager_values, compiled_values)):
+        eager_flat = eager.reshape(-1)
+        compiled_flat = compiled.reshape(-1)
+        mismatch = eager_flat.ne(compiled_flat)
+        mismatch_count = int(mismatch.sum().item())
+        sample_first = None
+        if mismatch_count:
+            position = int(mismatch.nonzero(as_tuple=False)[0].item())
+            sample_first = {
+                "position": position,
+                "eager_query": int(eager_flat[position].item()),
+                "compiled_query": int(compiled_flat[position].item()),
+            }
+            if first_mismatch is None:
+                first_mismatch = {"sample_index": sample_index, **sample_first}
+        prefix_length = min(
+            COMPILED_PARITY_DIAGNOSTIC_TOPK,
+            int(eager_flat.numel()),
+            int(compiled_flat.numel()),
+        )
+        eager_prefix = [int(value) for value in eager_flat[:prefix_length].tolist()]
+        compiled_prefix = [int(value) for value in compiled_flat[:prefix_length].tolist()]
+        eager_set = set(eager_prefix)
+        compiled_set = set(compiled_prefix)
+        samples.append(
+            {
+                "sample_index": sample_index,
+                "rank_length": int(eager_flat.numel()),
+                "full_order_exact": mismatch_count == 0,
+                "position_mismatch_count": mismatch_count,
+                "first_mismatch": sample_first,
+                "topk50": {
+                    "requested_prefix_length": COMPILED_PARITY_DIAGNOSTIC_TOPK,
+                    "observed_prefix_length": prefix_length,
+                    "order_exact": eager_prefix == compiled_prefix,
+                    "set_exact": eager_set == compiled_set,
+                    "eager_only_queries": sorted(eager_set - compiled_set),
+                    "compiled_only_queries": sorted(compiled_set - eager_set),
+                },
+            }
+        )
+    return {
+        "full_order_exact": all(item["full_order_exact"] for item in samples),
+        "position_mismatch_count": sum(item["position_mismatch_count"] for item in samples),
+        "first_mismatch": first_mismatch,
+        "topk50_order_exact": all(item["topk50"]["order_exact"] for item in samples),
+        "topk50_set_exact": all(item["topk50"]["set_exact"] for item in samples),
+        "samples": samples,
+    }
+
+
+def _parity_violation(code, message, *, batch_index=None, field=None):
+    record = {"code": code, "message": message}
+    if batch_index is not None:
+        record["batch_index"] = batch_index
+    if field is not None:
+        record["field"] = field
+    return record
+
+
+def _build_all_batch_compiled_bounded_parity_diagnostic(
+    verifier,
+    torch,
+    eager_by_batch,
+    compiled_by_batch,
+    eager_payload_by_batch,
+    compiled_payload_by_batch,
+    *,
+    batch_count,
+):
+    expected_keys = {str(index) for index in range(batch_count)}
+    named = {
+        "eager_records": eager_by_batch,
+        "compiled_records": compiled_by_batch,
+        "eager_payloads": eager_payload_by_batch,
+        "compiled_payloads": compiled_payload_by_batch,
+    }
+    observed = {name: set(mapping) for name, mapping in named.items()}
+    coverage_exact = all(keys == expected_keys for keys in observed.values())
+    violations = []
+    if not coverage_exact:
+        violations.append(
+            _parity_violation(
+                "batch_coverage",
+                "bounded eager/compiled parity did not cover every captured batch",
+            )
+        )
+    batches = {}
+    for batch_index in range(batch_count):
+        key = str(batch_index)
+        missing = [name for name, mapping in named.items() if key not in mapping]
+        if missing:
+            batches[key] = {"available": False, "missing_mappings": missing}
+            continue
+        eager_record = eager_by_batch[key]
+        compiled_record = compiled_by_batch[key]
+        if not isinstance(eager_record, Mapping) or not isinstance(compiled_record, Mapping):
+            message = "bounded eager/compiled record is not a mapping"
+            violations.append(_parity_violation("record_schema", message, batch_index=batch_index))
+            batches[key] = {"available": False, "error": message}
+            continue
+        batch = {"available": True, "schema_and_stream": {}, "fields": {}}
+        for field in ("sample_count", "detections_per_sample", "finite_schema", "stream"):
+            present = field in eager_record and field in compiled_record
+            exact = present and eager_record[field] == compiled_record[field]
+            batch["schema_and_stream"][field] = {"present_in_both": present, "exact": exact}
+            if not present:
+                message = f"bounded eager/compiled record lacks schema field {field}"
+                violations.append(_parity_violation("missing_schema_field", message, batch_index=batch_index, field=field))
+            elif not exact:
+                message = f"compiled bounded arm changed output schema/stream field {field} for captured batch {batch_index}"
+                violations.append(_parity_violation("schema_or_stream_mismatch", message, batch_index=batch_index, field=field))
+        eager_payload = eager_payload_by_batch[key]
+        compiled_payload = compiled_payload_by_batch[key]
+        payload_shape_exact = bool(
+            isinstance(eager_payload, Sequence)
+            and not isinstance(eager_payload, (str, bytes))
+            and isinstance(compiled_payload, Sequence)
+            and not isinstance(compiled_payload, (str, bytes))
+            and len(eager_payload) == len(compiled_payload)
+            and len(eager_payload) == eager_record.get("sample_count")
+        )
+        batch["payload_shape_exact"] = payload_shape_exact
+        if not payload_shape_exact:
+            message = f"bounded parity payload shape drifted for captured batch {batch_index}"
+            violations.append(_parity_violation("payload_shape", message, batch_index=batch_index))
+            for field in (*COMPILED_BOUNDED_RAW_EXACT_FIELDS, *COMPILED_BOUNDED_BOX_FIELDS):
+                batch["fields"][field] = {"available": False, "error": message}
+            batches[key] = batch
+            continue
+        for field in COMPILED_BOUNDED_RAW_EXACT_FIELDS:
+            try:
+                eager_values, compiled_values = _paired_payload_values(torch, eager_payload, compiled_payload, field)
+            except ProtocolError as error:
+                message = str(error)
+                batch["fields"][field] = {"available": False, "error": message}
+                violations.append(_parity_violation("field_schema", message, batch_index=batch_index, field=field))
+                continue
+            is_score = field in COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS
+            record = {"available": True, "kind": "raw_exact_float" if is_score else "raw_exact_integer"}
+            if is_score and all(value.is_floating_point() and bool(torch.isfinite(value).all()) for value in (*eager_values, *compiled_values)):
+                record.update(_floating_field_diagnostic(torch, eager_values, compiled_values))
+            elif not is_score and all(not value.is_floating_point() and not value.is_complex() for value in eager_values):
+                record.update(_integer_field_diagnostic(torch, eager_values, compiled_values))
+            else:
+                message = f"score field {field} must be floating point" if is_score else f"integer field {field} changed type"
+                record.update({"strict_passed": False, "error": message})
+                violations.append(_parity_violation("field_type", message, batch_index=batch_index, field=field))
+                batch["fields"][field] = record
+                continue
+            eager_fingerprint = verifier.raw_fingerprint(eager_values)
+            compiled_fingerprint = verifier.raw_fingerprint(compiled_values)
+            raw_exact = eager_fingerprint == compiled_fingerprint
+            record.update(
+                {
+                    "raw_exact": raw_exact,
+                    "strict_passed": raw_exact,
+                    "eager_fingerprint": eager_fingerprint,
+                    "compiled_fingerprint": compiled_fingerprint,
+                }
+            )
+            if not raw_exact:
+                message = f"compiled bounded arm changed raw-exact field {field} for captured batch {batch_index}"
+                violations.append(_parity_violation("raw_exact_field", message, batch_index=batch_index, field=field))
+            if field == "query_indices":
+                record["ranking"] = _query_rank_diagnostic(eager_values, compiled_values)
+            batch["fields"][field] = record
+        field = COMPILED_BOUNDED_BOX_FIELDS[0]
+        try:
+            eager_values, compiled_values = _paired_payload_values(torch, eager_payload, compiled_payload, field)
+            valid = all(value.is_floating_point() and bool(torch.isfinite(value).all()) for value in (*eager_values, *compiled_values))
+        except ProtocolError as error:
+            valid = False
+            message = str(error)
+        if not valid:
+            message = locals().get("message", "bounded box payload contains NaN or Inf")
+            box = {"available": False, "strict_passed": False, "error": message}
+            violations.append(_parity_violation("box_schema", message, batch_index=batch_index, field=field))
+        else:
+            box = {"available": True, "kind": "bounded_float"}
+            box.update(_floating_field_diagnostic(torch, eager_values, compiled_values))
+            tolerance_passed = bool(
+                box["absolute_error"]["max"] <= COMPILED_BOUNDED_BOX_MAX_ABS
+                and box["relative_error"]["max"] <= COMPILED_BOUNDED_BOX_MAX_REL
+            )
+            box["strict_passed"] = tolerance_passed
+            box["tolerance_passed"] = tolerance_passed
+            if not tolerance_passed:
+                message = (
+                    f"compiled bounded arm exceeded box tolerance for {field} in captured batch {batch_index}: "
+                    f"max_abs={box['absolute_error']['max']}, max_rel={box['relative_error']['max']}"
+                )
+                violations.append(_parity_violation("box_tolerance", message, batch_index=batch_index, field=field))
+        batch["fields"][field] = box
+        batches[key] = batch
+    return {
+        "schema": COMPILED_PARITY_DIAGNOSTIC_SCHEMA,
+        "mode": "raw_exact_ranking_and_scores_bounded_box_floats_v1",
+        "batch_count": batch_count,
+        "coverage": {
+            "exact": coverage_exact,
+            "expected_keys": sorted(expected_keys),
+            "observed_keys": {name: sorted(keys) for name, keys in observed.items()},
+        },
+        "diagnostic_contract": {
+            "all_fields_collected_before_enforcement": True,
+            "strict_gate_relaxed": False,
+            "float_fields": [*COMPILED_BOUNDED_RAW_EXACT_SCORE_FIELDS, *COMPILED_BOUNDED_BOX_FIELDS],
+            "integer_fields": list(COMPILED_BOUNDED_RAW_EXACT_INTEGER_FIELDS),
+            "query_rank_prefix": COMPILED_PARITY_DIAGNOSTIC_TOPK,
+            "p99_definition": "nearest-rank ceil(0.99 * count)",
+        },
+        "passed": not violations,
+        "violation_count": len(violations),
+        "violations": violations,
+        "batches": batches,
+    }
+
+
+def _enforce_all_batch_compiled_bounded_parity(
     verifier,
     torch,
     eager_by_batch: Mapping[str, Any],
@@ -2621,6 +2996,35 @@ def _require_all_batch_compiled_bounded_parity(
             "promotion_status": "PENDING_OFFICIAL_FULL_METRIC_PARITY",
         }
     return parity
+
+
+def _require_all_batch_compiled_bounded_parity(
+    verifier, torch, eager_by_batch, compiled_by_batch,
+    eager_payload_by_batch, compiled_payload_by_batch, *, batch_count,
+):
+    _build_all_batch_compiled_bounded_parity_diagnostic(
+        verifier, torch, eager_by_batch, compiled_by_batch,
+        eager_payload_by_batch, compiled_payload_by_batch, batch_count=batch_count,
+    )
+    return _enforce_all_batch_compiled_bounded_parity(
+        verifier, torch, eager_by_batch, compiled_by_batch,
+        eager_payload_by_batch, compiled_payload_by_batch, batch_count=batch_count,
+    )
+
+
+def _record_and_require_all_batch_compiled_bounded_parity(
+    diagnostic_path, verifier, torch, eager_by_batch, compiled_by_batch,
+    eager_payload_by_batch, compiled_payload_by_batch, *, batch_count,
+):
+    diagnostic = _build_all_batch_compiled_bounded_parity_diagnostic(
+        verifier, torch, eager_by_batch, compiled_by_batch,
+        eager_payload_by_batch, compiled_payload_by_batch, batch_count=batch_count,
+    )
+    _atomic_json(diagnostic_path, diagnostic)
+    return _enforce_all_batch_compiled_bounded_parity(
+        verifier, torch, eager_by_batch, compiled_by_batch,
+        eager_payload_by_batch, compiled_payload_by_batch, batch_count=batch_count,
+    )
 
 
 def _run_pair_protocol(
@@ -2990,6 +3394,10 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             verifier, torch, models, sources[0], device
         )
         compiled_parity = None
+        compiled_parity_diagnostic = {
+            "applicable": False,
+            "reason": "candidate does not use bounded compiled parity",
+        }
         if candidate_arm == FAST_EAGER_ARM:
             compiled_parity = {
                 "applicable": False,
@@ -3061,15 +3469,18 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
                     batch_count=len(sources),
                 )
             elif candidate_arm in BOUNDED_PARITY_COMPILED_ARMS:
-                compiled_parity = _require_all_batch_compiled_bounded_parity(
-                    verifier,
-                    torch,
-                    eager_candidate_preflight,
-                    compiler_warmup_by_batch,
-                    eager_candidate_payloads,
-                    compiler_warmup_payloads,
-                    batch_count=len(sources),
+                diagnostic_path = pair_dir / COMPILED_PARITY_DIAGNOSTIC_FILENAME
+                compiled_parity = _record_and_require_all_batch_compiled_bounded_parity(
+                    diagnostic_path, verifier, torch, eager_candidate_preflight,
+                    compiler_warmup_by_batch, eager_candidate_payloads,
+                    compiler_warmup_payloads, batch_count=len(sources),
                 )
+                compiled_parity_diagnostic = {
+                    "applicable": True,
+                    "path": str(diagnostic_path),
+                    "sha256": file_sha256(diagnostic_path),
+                    "written_atomically_before_strict_enforcement": True,
+                }
                 eager_candidate_payloads.clear()
                 compiler_warmup_payloads.clear()
                 eager_candidate_payloads = None
@@ -3142,6 +3553,7 @@ def execute_protocol(args: argparse.Namespace, prepared_plan: Mapping[str, Any])
             "output_preflight": output_preflight,
             "compiled_eager_parity": compiled_parity,
             "compiled_parity_contract": compiled_parity_contract(candidate_arm),
+            "compiled_parity_diagnostic": compiled_parity_diagnostic,
             "parity_payload_release": parity_payload_release,
             "compiler_warmup_by_batch": compiler_warmup_by_batch,
             "compile_state_attestations": timing_compile_state_attestations,
