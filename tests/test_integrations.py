@@ -196,6 +196,21 @@ def test_rosa_query_capture_observes_replacing_hooks_and_cleans_up():
         import torch
         from rosa.integrations import sparse4d as integration
 
+        integration.ROSARefinementHead._validate_native_host_contract()
+        released_hook = integration.Sparse4DHead._pre_refine_query_feature
+        integration.Sparse4DHead._pre_refine_query_feature = (
+            lambda self, **kwargs: kwargs["instance_feature"]
+        )
+        try:
+            try:
+                integration.ROSARefinementHead._validate_native_host_contract()
+            except RuntimeError as error:
+                assert "incompatible Sparse4D detector host" in str(error)
+            else:
+                raise AssertionError("an incompatible detector host was accepted")
+        finally:
+            integration.Sparse4DHead._pre_refine_query_feature = released_hook
+
         class NativeRefine(torch.nn.Module):
             def forward(self, query, anchor, anchor_embed, **kwargs):
                 return anchor, None, None

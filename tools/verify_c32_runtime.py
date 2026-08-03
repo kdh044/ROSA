@@ -127,7 +127,7 @@ DEFAULT_REPRESENTATION_PREREGISTRATION_SHA256 = (
 DEFAULT_DETECTOR_HOST_ROOT = Path(
     os.environ.get(
         "ROSA_DETECTOR_HOST_ROOT",
-        "/home/airlab/user/kdh/dependencies/rosa_detector_host",
+        "/home/airlab/user/kdh/ROSA_host_wt_exacte94_native_eval_p1p2_strict",
     )
 )
 DEFAULT_OFFICIAL_ROOT = Path(

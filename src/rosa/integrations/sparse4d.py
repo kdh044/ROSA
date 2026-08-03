@@ -7,6 +7,7 @@ MMDetection3D or Sparse4D dependency.
 
 from __future__ import annotations
 
+import inspect
 from typing import Mapping
 
 import torch
@@ -360,6 +361,7 @@ class ROSARefinementHead(Sparse4DHead):
         canonical_task_splice_cfg: Mapping | None = None,
         **kwargs,
     ) -> None:
+        self._validate_native_host_contract()
         if rosa_cfg is not None and closed_loop_rosa_cfg is not None:
             raise ValueError("set either rosa_cfg or closed_loop_rosa_cfg, not both")
         # ``canonical_task_splice_cfg`` existed only because the old class
@@ -426,6 +428,27 @@ class ROSARefinementHead(Sparse4DHead):
         self.inference_output_decoder_index = _ROSA_OUTPUT
         self.inference_classification_decoder_index = _ROSA_OUTPUT
         self.inference_quality_decoder_index = _ROSA_OUTPUT
+
+    @staticmethod
+    def _validate_native_host_contract() -> None:
+        """Reject detector hosts that cannot expose the audited D5 query."""
+
+        hook = getattr(Sparse4DHead, "_pre_refine_query_feature", None)
+        expected = tuple(
+            inspect.signature(
+                ROSARefinementHead._pre_refine_query_feature
+            ).parameters
+        )
+        if hook is None:
+            observed = ()
+        else:
+            observed = tuple(inspect.signature(hook).parameters)
+        if observed != expected:
+            raise RuntimeError(
+                "incompatible Sparse4D detector host: expected the paired "
+                "pre-refine task-sidecar contract with parameters "
+                f"{expected}, got {observed}"
+            )
 
     @property
     def canonical_sixth_block(self) -> ROSARefiner:
