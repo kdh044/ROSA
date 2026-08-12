@@ -12,15 +12,19 @@ import torch.nn.functional as F
 class DeterministicBilinearSampler(nn.Module):
     """Sample ``[B,C,D,H,W]`` feature maps at normalized fisheye pixels.
 
-    This explicit four-gather implementation is equivalent to
+    This explicit implementation is equivalent to
     ``grid_sample(..., align_corners=False)`` while retaining deterministic
-    CUDA backward behavior.
+    CUDA backward behavior.  All four bilinear neighbours are fetched by one
+    vectorized gather.  The previous implementation launched four independent
+    gathers and repeated coordinate preparation for every FPN level.
     """
 
-    def forward(self, feature: Tensor, uv: Tensor) -> Tensor:
-        if feature.ndim != 5:
-            raise ValueError("feature must be [B,C,D,H,W]")
-        batch, cameras, channels, height, width = feature.shape
+    @staticmethod
+    def _prepare_coordinates(
+        uv: Tensor,
+        batch: int,
+        cameras: int,
+    ) -> tuple[Tensor, tuple[int, int, int]]:
         if (
             uv.ndim != 6
             or uv.shape[0] != batch
@@ -28,14 +32,29 @@ class DeterministicBilinearSampler(nn.Module):
             or uv.shape[-1] != 2
         ):
             raise ValueError("uv must be [B,N,C,S,P,2]")
-
         queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
+        coordinates = torch.nan_to_num(
+            uv.permute(0, 2, 1, 3, 4, 5),
+            nan=-2.0,
+            posinf=-2.0,
+            neginf=-2.0,
+        ).reshape(batch * cameras, queries * samples * patch, 2)
+        return coordinates, (queries, samples, patch)
+
+    @staticmethod
+    def _sample_prepared(
+        feature: Tensor,
+        coordinates: Tensor,
+        sample_shape: tuple[int, int, int],
+    ) -> Tensor:
+        if feature.ndim != 5:
+            raise ValueError("feature must be [B,C,D,H,W]")
+        batch, cameras, channels, height, width = feature.shape
+        queries, samples, patch = sample_shape
         camera_batches = batch * cameras
         sample_count = queries * samples * patch
-        coordinates = uv.permute(0, 2, 1, 3, 4, 5).reshape(
-            camera_batches, sample_count, 2
-        )
-        coordinates = torch.nan_to_num(coordinates, nan=-2.0, posinf=-2.0, neginf=-2.0)
+        if tuple(coordinates.shape) != (camera_batches, sample_count, 2):
+            raise ValueError("prepared coordinates do not match feature cameras")
         x = coordinates[..., 0] * width - 0.5
         y = coordinates[..., 1] * height - 0.5
         x0, y0 = x.floor().long(), y.floor().long()
@@ -45,24 +64,69 @@ class DeterministicBilinearSampler(nn.Module):
         wx0, wy0 = 1.0 - wx1, 1.0 - wy1
         flattened = feature.reshape(camera_batches, channels, height * width)
 
-        def gather(ix: Tensor, iy: Tensor) -> Tensor:
-            valid = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
-            linear = iy.clamp(0, height - 1) * width + ix.clamp(0, width - 1)
-            values = torch.gather(
-                flattened,
-                2,
-                linear[:, None].expand(-1, channels, -1),
-            )
-            return values * valid[:, None].to(values.dtype)
-
+        # [top-left, top-right, bottom-left, bottom-right].  Fetching this
+        # final neighbour axis in one call removes three gather launches and
+        # their three deterministic indexing-backward/sort pipelines.
+        ix = torch.stack((x0, x1, x0, x1), dim=-1)
+        iy = torch.stack((y0, y0, y1, y1), dim=-1)
+        valid = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+        linear = iy.clamp(0, height - 1) * width + ix.clamp(0, width - 1)
+        gathered = torch.gather(
+            flattened,
+            2,
+            linear.reshape(camera_batches, 1, sample_count * 4).expand(
+                -1, channels, -1
+            ),
+        ).reshape(camera_batches, channels, sample_count, 4)
+        weights = torch.stack(
+            (
+                wx0 * wy0,
+                wx1 * wy0,
+                wx0 * wy1,
+                wx1 * wy1,
+            ),
+            dim=-1,
+        )
+        weights = weights * valid.to(weights.dtype)
+        # Keep the released left-to-right accumulation order.  This is both
+        # numerically closer than a generic reduction and deterministic.
         sampled = (
-            gather(x0, y0) * (wx0 * wy0)[:, None]
-            + gather(x1, y0) * (wx1 * wy0)[:, None]
-            + gather(x0, y1) * (wx0 * wy1)[:, None]
-            + gather(x1, y1) * (wx1 * wy1)[:, None]
+            gathered[..., 0] * weights[:, None, :, 0]
+            + gathered[..., 1] * weights[:, None, :, 1]
+            + gathered[..., 2] * weights[:, None, :, 2]
+            + gathered[..., 3] * weights[:, None, :, 3]
         )
         sampled = sampled.reshape(batch, cameras, channels, queries, samples, patch)
         return sampled.permute(0, 3, 1, 4, 5, 2).contiguous()
+
+    def forward(self, feature: Tensor, uv: Tensor) -> Tensor:
+        if feature.ndim != 5:
+            raise ValueError("feature must be [B,C,D,H,W]")
+        batch, cameras = feature.shape[:2]
+        coordinates, sample_shape = self._prepare_coordinates(uv, batch, cameras)
+        return self._sample_prepared(feature, coordinates, sample_shape)
+
+    def sample_multiscale(
+        self,
+        features: Sequence[Tensor],
+        uv: Tensor,
+    ) -> tuple[Tensor, ...]:
+        """Reuse normalized-coordinate preparation across all FPN levels."""
+
+        if not features:
+            raise ValueError("features must contain at least one FPN level")
+        first = features[0]
+        if first.ndim != 5:
+            raise ValueError("feature must be [B,C,D,H,W]")
+        batch, cameras, channels = first.shape[:3]
+        for feature in features:
+            if feature.ndim != 5 or feature.shape[:3] != (batch, cameras, channels):
+                raise ValueError("all FPN levels must share [B,C,D]")
+        coordinates, sample_shape = self._prepare_coordinates(uv, batch, cameras)
+        return tuple(
+            self._sample_prepared(feature, coordinates, sample_shape)
+            for feature in features
+        )
 
 
 class FusedBilinearSampler(nn.Module):

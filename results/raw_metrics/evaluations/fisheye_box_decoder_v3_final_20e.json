@@ -1,0 +1,61 @@
+{
+  "experiment": "fisheye_box_decoder_v3_corrected_raw_uniform_fresh_e0_to_e20_seed3407",
+  "protocol": {
+    "dataset": "Fisheye3DOD Main126",
+    "sampling": "raw-uniform DefaultSampler",
+    "epochs": 20,
+    "seed": 3407,
+    "global_batch_size": 8,
+    "temporal": false,
+    "free_queries": 300,
+    "decoder_stages": 6
+  },
+  "c0_epoch_20": {
+    "mAP": 0.5644,
+    "NDS": 0.6342,
+    "mATE": 0.4623,
+    "mASE": 0.0858,
+    "mAOE": 0.3402
+  },
+  "v3_epoch_16_best": {
+    "mAP": 0.5950,
+    "NDS": 0.6337,
+    "mATE": 0.4476,
+    "mASE": 0.1231,
+    "mAOE": 0.4122,
+    "class_AP": {
+      "Car": 0.6291,
+      "Van": 0.5987,
+      "Truck": 0.5616,
+      "Bus": 0.5712,
+      "Pedestrian": 0.5751,
+      "Cyclist": 0.6345
+    },
+    "checkpoint_sha256": "a73171acf7729ca16f0584e67a5d9ec66cb8735f35784fd510d9bc9e8d77e235"
+  },
+  "v3_epoch_20": {
+    "mAP": 0.5924,
+    "NDS": 0.6333,
+    "mATE": 0.4497,
+    "mASE": 0.1212,
+    "mAOE": 0.4066,
+    "class_AP": {
+      "Car": 0.6268,
+      "Van": 0.5926,
+      "Truck": 0.5556,
+      "Bus": 0.5728,
+      "Pedestrian": 0.5729,
+      "Cyclist": 0.6339
+    },
+    "checkpoint_sha256": "89ef33237904424f34e42f4bb27f4bd609f55103ec08e758b95ba7ad1e611b55"
+  },
+  "epoch_20_delta_vs_c0": {
+    "mAP": 0.0280,
+    "NDS": -0.0009,
+    "mATE": -0.0126,
+    "mASE": 0.0354,
+    "mAOE": 0.0664
+  },
+  "source_snapshot_sha256": "21fd089bc2270458c36ca20ba3841020242a716c601d357c3cc7a53287f6c782",
+  "interpretation": "V3 improves AP and translation error over matched C0, while scale and orientation errors regress; NDS is effectively tied. Epoch 16 is the best mAP checkpoint."
+}

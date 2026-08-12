@@ -38,6 +38,50 @@ def _raw_equal(left, right):
     )
 
 
+def _four_gather_reference(feature, uv):
+    """Pre-optimization deterministic sampler retained as a test oracle."""
+
+    batch, cameras, channels, height, width = feature.shape
+    queries, samples, patch = uv.shape[1], uv.shape[3], uv.shape[4]
+    camera_batches = batch * cameras
+    sample_count = queries * samples * patch
+    coordinates = torch.nan_to_num(
+        uv.permute(0, 2, 1, 3, 4, 5),
+        nan=-2.0,
+        posinf=-2.0,
+        neginf=-2.0,
+    ).reshape(camera_batches, sample_count, 2)
+    x = coordinates[..., 0] * width - 0.5
+    y = coordinates[..., 1] * height - 0.5
+    x0, y0 = x.floor().long(), y.floor().long()
+    x1, y1 = x0 + 1, y0 + 1
+    wx1 = (x - x0.to(x.dtype)).to(feature.dtype)
+    wy1 = (y - y0.to(y.dtype)).to(feature.dtype)
+    wx0, wy0 = 1.0 - wx1, 1.0 - wy1
+    flattened = feature.reshape(camera_batches, channels, height * width)
+
+    def gather(ix, iy):
+        valid = (ix >= 0) & (ix < width) & (iy >= 0) & (iy < height)
+        linear = iy.clamp(0, height - 1) * width + ix.clamp(0, width - 1)
+        values = torch.gather(
+            flattened,
+            2,
+            linear[:, None].expand(-1, channels, -1),
+        )
+        return values * valid[:, None].to(values.dtype)
+
+    output = (
+        gather(x0, y0) * (wx0 * wy0)[:, None]
+        + gather(x1, y0) * (wx1 * wy0)[:, None]
+        + gather(x0, y1) * (wx0 * wy1)[:, None]
+        + gather(x1, y1) * (wx1 * wy1)[:, None]
+    )
+    output = output.reshape(
+        batch, cameras, channels, queries, samples, patch
+    )
+    return output.permute(0, 3, 1, 4, 5, 2).contiguous()
+
+
 def _prepared_fixture():
     generator = torch.Generator().manual_seed(3407)
     fpn = tuple(
@@ -148,6 +192,37 @@ def test_fused_sampler_matches_the_release_four_gather_sampler():
         release_feature.grad,
         atol=3e-6,
         rtol=3e-6,
+    )
+
+
+def test_one_gather_sampler_matches_four_gather_output_and_gradients():
+    generator = torch.Generator().manual_seed(81_105)
+    reference_feature = torch.randn(
+        2, 3, 5, 7, 9, generator=generator, requires_grad=True
+    )
+    candidate_feature = reference_feature.detach().clone().requires_grad_()
+    reference_uv = (
+        torch.rand(2, 11, 3, 2, 4, 2, generator=generator) * 1.4 - 0.2
+    ).requires_grad_()
+    candidate_uv = reference_uv.detach().clone().requires_grad_()
+
+    expected = _four_gather_reference(reference_feature, reference_uv)
+    actual = DeterministicBilinearSampler()(candidate_feature, candidate_uv)
+    torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-6)
+
+    expected.square().mean().backward()
+    actual.square().mean().backward()
+    torch.testing.assert_close(
+        candidate_feature.grad,
+        reference_feature.grad,
+        atol=2e-7,
+        rtol=2e-6,
+    )
+    torch.testing.assert_close(
+        candidate_uv.grad,
+        reference_uv.grad,
+        atol=2e-6,
+        rtol=2e-6,
     )
 
 

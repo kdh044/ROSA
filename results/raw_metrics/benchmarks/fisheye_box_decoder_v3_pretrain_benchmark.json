@@ -1,0 +1,48 @@
+{
+  "schema": "rosa.fisheye_box_decoder_v3.pretrain_benchmark.v1",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "training": {
+    "batch_size": 4,
+    "warmup": 3,
+    "iterations": 10,
+    "scope": "complete detector forward + loss + backward",
+    "c0": {
+      "latency_ms_mean": 266.4067626953125,
+      "memory_peak_mib": 8692.03271484375,
+      "parameters": 29667109
+    },
+    "v3": {
+      "latency_ms_mean": 349.3413482666016,
+      "memory_peak_mib": 12342.36572265625,
+      "parameters": 18913655
+    },
+    "v3_over_c0_latency": 1.3113081091944379,
+    "v3_over_c0_peak_memory": 1.4199631004124815
+  },
+  "inference": {
+    "batch_size": 1,
+    "warmup": 10,
+    "iterations": 50,
+    "scope": "complete detector tensor output, eager head",
+    "c0": {
+      "latency_ms_mean": 21.899922637939454,
+      "memory_peak_mib": 750.46923828125,
+      "throughput_frames_s": 45.66226175920817
+    },
+    "v3": {
+      "latency_ms_mean": 39.64061958312988,
+      "memory_peak_mib": 722.16259765625,
+      "throughput_frames_s": 25.226649091670016
+    },
+    "v3_over_c0_latency": 1.8100803477020702,
+    "v3_over_c0_peak_memory": 0.9622814111743889
+  },
+  "verification": {
+    "repository_tests_passed": 1037,
+    "repository_tests_failed": 0,
+    "single_gpu_stability_iterations": 200,
+    "single_gpu_final_loss": 25.182,
+    "unused_trainable_parameters": 0,
+    "nonfinite_trainable_gradients": 0
+  }
+}

@@ -1,0 +1,53 @@
+{
+  "arm": "C0-corrected-Sparse4D-raw-uniform-20e",
+  "purpose": "Accuracy baseline for Fisheye-Ray-Decoder-V2-raw-uniform-20e",
+  "source_work_dir": "/home/airlab/user/kdh/ROSA/results/raw_metrics/experiments/c0_raw_uniform_fresh_e0_to_e20_seed3407",
+  "source_log": "20260810_135027/20260810_135027.log",
+  "source_log_record": "Epoch(val) [20][489/489]",
+  "checkpoint": {
+    "file": "epoch_20.pth",
+    "bytes": 373316822,
+    "sha256": "545852b47f1c8763b98a62bc492083aa04e9761b3d4b9e41c8bbfaf95e02a745"
+  },
+  "best_nds_checkpoint": {
+    "file": "best_fisheye_bev_NDS_epoch_20.pth",
+    "bytes": 136061977,
+    "sha256": "e0d9fc696b73833889f812c989fcbf21de6aa542bc1afa3d7c0593d7fe3a3a90"
+  },
+  "protocol": {
+    "epochs": 20,
+    "schedule_horizon_epochs": 20,
+    "seed": 3407,
+    "world_size": 2,
+    "per_device_batch_size": 4,
+    "global_batch_size": 8,
+    "train_sampling": "raw-uniform DefaultSampler",
+    "validation_interval_epochs": 4,
+    "v2_matched_fields": [
+      "dataset and annotations",
+      "camera order and classes",
+      "train and validation dataloaders",
+      "optimizer and paramwise configuration",
+      "warmup and 20-epoch cosine scheduler",
+      "seed and deterministic algorithms",
+      "image backbone and FPN",
+      "data preprocessor",
+      "official evaluator"
+    ]
+  },
+  "metrics": {
+    "mAP": 0.5644,
+    "NDS": 0.6342,
+    "mATE": 0.4623,
+    "mASE": 0.0858,
+    "mAOE": 0.3402,
+    "class_AP": {
+      "Car": 0.6051,
+      "Van": 0.5682,
+      "Truck": 0.5465,
+      "Bus": 0.5753,
+      "Pedestrian": 0.5129,
+      "Cyclist": 0.5786
+    }
+  }
+}

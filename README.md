@@ -37,6 +37,234 @@ For each selected object query, ROSA:
 The released experiment refines the top 100 of 300 detector queries while
 leaving unselected boxes and native detector confidence unchanged.
 
+## Fisheye sparse-ray decoder V2 (research arm)
+
+V2 is not named or presented as Sparse4D. It reuses the released image
+backbone, FPN, 300-query budget, six-decoder schedule, matching, losses, and
+evaluator as experimental infrastructure, but replaces Sparse4D's defining
+box-conditioned 13-keypoint deformable aggregation and Cartesian refinement.
+The corrected Sparse4D C0 remains the architecture baseline.
+Its registered detector type is therefore `FisheyeSparseRayHead`; the host
+`Sparse4DHead` superclass is used only as a matching/loss/decode compatibility
+mixin and its constructor and detection architecture are not instantiated.
+
+Each V2 decoder stage is:
+
+```text
+self-attention
+  -> one native-fisheye observation per query/camera/FPN level
+  -> RFL value lifting + ROSA camera-level joint attention
+  -> FFN
+  -> spherical ray-state refinement
+```
+
+D0 starts from a learned direction and has no range, size, yaw, or box. It
+uses rotation-only projection and predicts a continuous log-range
+distribution plus the first box state. D1--D5 propagate that query and state,
+project the current 3D centre with camera translation, and refine direction on
+the sphere's tangent plane together with log-range, size, relative yaw, and
+velocity. This decoder-to-decoder query propagation is retained. Temporal
+cross-frame propagation was already disabled in the C0/Full experiments and
+remains disabled.
+
+The fisheye-specific intervention is not an OCam-only rule. A generic lens
+backend supplies native projection and a pixel-per-radian Jacobian; the
+released dataset selects its OCam implementation. The Jacobian converts FPN
+cell size to angular footprint, a query tangent frame describes camera
+relation, and one joint softmax selects across all four cameras and four FPN
+levels. There is no BEV conversion, 2D detector, dense depth head, fixed image
+patch, metric range-candidate list, post-D5 sidecar, or duplicate observation.
+
+Training retains C0's five denoising groups. A noisy DN box is reduced to its
+centre direction before D0, so the training query receives no privileged
+range, shape, or yaw. Free and DN queries are isolated by the native attention
+mask and all six native DN losses remain active.
+
+The evaluated V2 head config contains no `InstanceBank`, anchor encoder,
+graph/deformable aggregation, Cartesian refiner, or legacy ROSA sidecar entry.
+It names only the C0 matcher/DN sampler, losses, output decoder, and the anchor
+file used to initialize directions. On a real batch, all 380 trainable tensors
+receive finite gradients, which seals the two-process DDP contract with
+`find_unused_parameters=False`.
+
+The first implementation is
+[`configs/fisheye_ray_decoder_v2_raw_uniform_20e.py`](configs/fisheye_ray_decoder_v2_raw_uniform_20e.py).
+Its core and host integration currently pass 26 focused tests, including a
+real Sparse4D matcher/loss/backward test and the isotropic-Jacobian gradient
+boundary. The broader repository regression passes 998 tests after excluding
+the historical near-native harness whose sealed external snapshot path is not
+present in this workspace. A real Fisheye3DOD batch also passes a 200-iteration
+two-GPU stability gate through the image backbone, matcher, all 54 losses,
+deterministic backward, gradient clipping, and parameter update. This gate
+specifically covers the learned-ray trajectory that exposed the original
+`acos` axis-singularity after roughly 140 iterations.
+
+The accuracy baseline is the separately trained fresh 20-epoch C0, not an
+epoch-20 checkpoint from a 30-epoch cosine schedule. It obtained mAP 0.5644
+and NDS 0.6342. The checkpoint hashes, per-class AP, and matched protocol are
+recorded in
+[`c0_raw_uniform_20e_reference.json`](results/raw_metrics/evaluations/c0_raw_uniform_20e_reference.json).
+Against the queued V2 run, dataset, raw-uniform sampling, global batch 8,
+optimizer, 20-epoch scheduler, seed, backbone/FPN, preprocessing, and official
+evaluator are identical; the detector head is the intended intervention.
+
+The completed epoch-20 comparison is:
+
+| Detector head | mAP | NDS/FDS | mATE ↓ | mASE ↓ | mAOE ↓ |
+|---|---:|---:|---:|---:|---:|
+| corrected Sparse4D C0 | **0.5644** | **0.6342** | **0.4623** | **0.0858** | **0.3402** |
+| Fisheye Sparse-Ray Detector V2 | 0.5288 | 0.5913 | 0.5216 | 0.1448 | 0.3723 |
+
+V2 therefore does not beat C0: its deltas are -0.0356 mAP and -0.0429 NDS.
+The largest class-AP regression is Bus (-0.1044), followed by Truck (-0.0446),
+while Pedestrian (-0.0041) and Cyclist (-0.0039) nearly match C0. The best V2
+mAP is 0.5307 at epoch 16; epoch 20 is the best NDS checkpoint. These results
+point to metric centre/size estimation for large vehicles, rather than sparse
+angular evidence itself, as the first refinement target.
+
+On the same GPU and native batch, the reproducible harness at
+[`tools/benchmark_fisheye_ray_decoder_v2.py`](tools/benchmark_fisheye_ray_decoder_v2.py)
+measured:
+
+| Complete detector path | C0 | V2 | V2/C0 |
+|---|---:|---:|---:|
+| deterministic train, batch 4, forward + loss + backward | 267.00 ms | 361.25 ms | 1.353x |
+| deterministic train peak allocation | 8,692 MiB | 9,872 MiB | 1.136x |
+| compiled inference, batch 1 | 11.87 ms | 9.92 ms | 0.835x |
+| compiled inference peak allocation | 741 MiB | 699 MiB | 0.943x |
+| parameters | 29.67 M | 18.58 M | 0.626x |
+
+Both inference arms compile the complete head with the same
+`reduce-overhead` setting. V2's maximum eager-to-compiled differences were
+`3.3e-5` for classification, `1.9e-6` for boxes, and `2.2e-5` for quality.
+Uncompiled V2 inference is still slower (about 27.9 ms versus 19.6 ms), so the
+compiled head is the intended latency path. A cold compile is excluded from
+steady-state latency; the final V2 graph's uncached warmup took about 84
+seconds. Training uses an explicit four-gather sampler
+because CUDA `grid_sample` backward violates the sealed deterministic runner
+contract. That makes training 35.9% slower even though the intended compiled
+inference path is 16.5% faster; these are separate engineering results. The
+post-training benchmark records are
+[`fisheye_ray_decoder_v2_deterministic_train_post20e_exact.json`](results/raw_metrics/benchmarks/fisheye_ray_decoder_v2_deterministic_train_post20e_exact.json)
+and
+[`fisheye_ray_decoder_v2_compiled_inference_post20e_exact.json`](results/raw_metrics/benchmarks/fisheye_ray_decoder_v2_compiled_inference_post20e_exact.json).
+
+Focused verification and the two fair benchmarks are:
+
+```bash
+pytest -q \
+  tests/test_fisheye_ray_sparse4d_integration.py \
+  tests/test_fisheye_decoder.py tests/test_fisheye_evidence.py \
+  tests/test_fisheye_projection.py tests/test_ray_state.py \
+  tests/test_ray_losses.py tests/test_summarize_fisheye_ray_decoder_v2.py
+
+CUDA_VISIBLE_DEVICES=1 python tools/benchmark_fisheye_ray_decoder_v2.py \
+  --mode train --batch-size 4 --warmup 5 --iterations 15
+
+CUDA_VISIBLE_DEVICES=1 python tools/benchmark_fisheye_ray_decoder_v2.py \
+  --mode inference --batch-size 1 --warmup 5 --iterations 30 --compile-head
+```
+
+The queued experiment runs a 200-iteration two-GPU DDP stability preflight
+before training.
+After epoch 20, `tools/summarize_fisheye_ray_decoder_v2.py` requires the final
+official validation, checkpoints, and execution-source snapshot, then writes
+`final_metrics_vs_c0.json` with validation history, C0 deltas, and SHA256
+records. Missing completion evidence is an error rather than a partial result.
+
+### Post-training deterministic sampler optimization
+
+The sealed epoch-20 result above predates a sampler-only optimization. The
+deterministic bilinear sampler now fetches all four neighbours through one
+vectorized gather and prepares normalized query/camera coordinates once per
+FPN pyramid. It preserves deterministic CUDA output, feature gradients, and
+UV gradients. On the same complete batch-4 training benchmark, V2 changed
+from 361.25 ms/iteration to 290.90 ms/iteration. The matched rerun measured
+270.32 ms for C0, making optimized V2 1.076x C0 instead of 1.353x. Peak
+allocation remains 1.124x C0 and requires separate work. This code has not
+been retrained for an accuracy claim.
+
+The machine-readable benchmark is
+[`fisheye_ray_decoder_v2_one_gather_train_post20e.json`](results/raw_metrics/benchmarks/fisheye_ray_decoder_v2_one_gather_train_post20e.json).
+The sampler oracle, focused/integration suite, and broad sealed-host regression
+pass 999 tests in total (the unavailable historical near-native harness remains
+excluded).
+
+## Fisheye box decoder V3 (implemented research arm)
+
+V2 showed that a direction-only query observed at one image point is
+insufficient for large-object centre and extent estimation. V3 therefore
+returns to corrected Sparse4D C0 as its host instead of deleting the box-query
+pipeline:
+
+```text
+300 learned query features + anchor boxes
+  -> native-fisheye centre-ray box initializer
+  -> D0: current box -> 13 points -> fisheye ROSA -> RFL -> refine
+  -> D1: current box -> 13 points -> fisheye ROSA -> RFL -> refine
+  -> D2: current box -> 13 points -> fisheye ROSA -> RFL -> refine
+  -> D3: current box -> 13 points -> fisheye ROSA -> RFL -> refine
+  -> D4: current box -> 13 points -> fisheye ROSA -> RFL -> refine
+  -> D5: current box -> 13 points -> fisheye ROSA -> RFL -> final box
+```
+
+The initializer uses one centre ray across four cameras and four FPN levels.
+RFL supplies spherical-ray appearance lifting; ROSA uses the calibrated lens
+Jacobian, lens margin, camera overlap, and image evidence to gate a residual to
+the existing anchor box. It does not introduce a probabilistic tracking decoder
+or a 2D/depth prompt.
+
+Each D0--D5 stage derives seven fixed object-frame points from the current box
+(centre and positive/negative face centres on all three axes) and six
+query-learned in-box points. Every point is projected into the four native
+fisheye views. Query-conditioned ROSA logits combine the analytic fisheye
+Jacobian, lens margin, overlap, and expected angular footprint to select among
+camera x FPN-level observations independently for each point. Per-point RFL
+then couples the fused appearance with that point's calibrated ego ray, and a
+separate query-conditioned attention fuses all 13 points. The result refines
+spherical direction, log-range, log-size, ray-relative yaw, and velocity before
+propagation to the next stage. Setting `num_learnable_points=0` is the sealed
+seven-point ablation.
+
+The production implementation presents each box point to Sparse4D's fused DAF
+CUDA kernel as an independent one-keypoint sparse anchor. DAF is only the
+bilinear weighted feature reader: V3 owns the fisheye projection, calibrated
+ROSA weights, point rays, RFL, 13-point attention, and box update. This removes
+the initial materialized `[B,Q,13,4,4,256]` carrier without reverting to C0's
+query-only aggregation weights.
+
+Temporal cross-frame propagation remains disabled for the first matched C0
+comparison. Decoder-to-decoder query and box propagation is retained. ROSA and
+RFL are decoder-internal observation operators rather than a post-D5 sidecar.
+
+The implemented config is
+[`configs/fisheye_box_decoder_v3_raw_uniform_20e.py`](configs/fisheye_box_decoder_v3_raw_uniform_20e.py).
+It retains C0's 300 free boxes, five DN groups (up to 320 additional training
+queries), six decoder stages, raw-uniform sampling, seed 3407, and global batch
+8. It has 18.91 M parameters versus C0's 29.67 M. On the matched pre-training
+benchmark, batch-4 forward/loss/backward is 349.34 ms versus C0's 266.41 ms
+(1.311x), while batch-1 inference is 39.64 ms versus 21.90 ms (1.810x, 25.2
+FPS). Inference peak allocation is slightly lower than C0; training peak is
+12.34 GiB versus 8.69 GiB. The machine-readable record is
+[`fisheye_box_decoder_v3_pretrain_benchmark.json`](results/raw_metrics/benchmarks/fisheye_box_decoder_v3_pretrain_benchmark.json).
+
+The V3 unit/integration tests and complete sealed-host repository regression
+pass 1037 tests. A real 200-iteration stability preflight completed with finite
+losses and no unused trainable parameters. The two-GPU launch helper waits for
+both GPUs to be genuinely free, reruns the 200-step DDP gate, snapshots the
+source, and then starts the matched 20-epoch experiment.
+
+The matched 20-epoch run completed successfully. At epoch 20, V3 reached mAP
+0.5924 and NDS 0.6333 versus C0's 0.5644 and 0.6342. Translation improved
+(mATE 0.4497 versus 0.4623), while scale and orientation regressed (mASE
+0.1212 versus 0.0858; mAOE 0.4066 versus 0.3402). The best checkpoint was
+epoch 16 at mAP 0.5950 and NDS 0.6337. The compact result, per-class AP,
+checkpoint hashes, source-snapshot hash, and exact C0 deltas are recorded in
+[`fisheye_box_decoder_v3_final_20e.json`](results/raw_metrics/evaluations/fisheye_box_decoder_v3_final_20e.json).
+
+The detector host, official evaluator, and dataset environment variables in
+the setup table below must be exported for these integration commands.
+
 ## Repository
 
 ```text

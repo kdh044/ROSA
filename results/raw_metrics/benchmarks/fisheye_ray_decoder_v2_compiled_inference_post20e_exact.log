@@ -1,0 +1,92 @@
+/usr/local/lib/python3.10/dist-packages/matplotlib/projections/__init__.py:63: UserWarning: Unable to import Axes3D. This may be due to multiple versions of Matplotlib being installed (e.g. as a system package and as a pip package). As a result, the 3D projection is not available.
+  warnings.warn("Unable to import Axes3D. This may be due to multiple versions of "
+08/11 01:25:44 - mmengine - INFO - ------------------------------
+08/11 01:25:44 - mmengine - INFO - The length of training dataset: 8820
+08/11 01:25:44 - mmengine - INFO - The number of instances per category in the dataset:
++------------+--------+
+| category   | number |
++------------+--------+
+| Car        | 0      |
+| Van        | 0      |
+| Truck      | 0      |
+| Bus        | 0      |
+| Pedestrian | 0      |
+| Cyclist    | 0      |
++------------+--------+
+/usr/local/lib/python3.10/dist-packages/torch/_dynamo/variables/functions.py:2082: UserWarning: Dynamo does not know how to trace the builtin `projects.mmdet3d_plugin.ops.deformable_aggregation_ext.pybind11_detail_function_record_v1_system_libstdcpp_gxx_abi_1xxx_use_cxx11_abi_1.deformable_aggregation_forward.` This function is either a Python builtin (e.g. _warnings.warn) or a third-party C/C++ Python extension (perhaps created with pybind).
+If it is a Python builtin, please file an issue on GitHub so the PyTorch team can add support for it and see the next case for a workaround.
+If it is a third-party C/C++ Python extension, please either wrap it into a PyTorch-understood custom operator (see https://pytorch.org/tutorials/advanced/custom_ops_landing_page.html for more details) or, if it is traceable, use `torch.compiler.allow_in_graph`.
+  torch._dynamo.utils.warn_once(explanation + "\n" + "\n".join(hints))
+08/11 01:25:51 - mmengine - INFO - ------------------------------
+08/11 01:25:51 - mmengine - INFO - The length of training dataset: 8820
+08/11 01:25:51 - mmengine - INFO - The number of instances per category in the dataset:
++------------+--------+
+| category   | number |
++------------+--------+
+| Car        | 0      |
+| Van        | 0      |
+| Truck      | 0      |
+| Bus        | 0      |
+| Pedestrian | 0      |
+| Cyclist    | 0      |
++------------+--------+
+/usr/local/lib/python3.10/dist-packages/torch/_inductor/compile_fx.py:322: UserWarning: TensorFloat32 tensor cores for float32 matrix multiplication available but not enabled. Consider setting `torch.set_float32_matmul_precision('high')` for better performance.
+  warnings.warn(
+[
+  {
+    "batch_size": 1,
+    "compile_parity_max_abs": {
+      "classification": 0.00010600686073303223,
+      "prediction": 0.0004432201385498047,
+      "quality": 7.447600364685059e-05
+    },
+    "compiled_head": true,
+    "config": "/home/airlab/user/kdh/.runs/rosa_ray_decoder_v2/configs/rosa_r18_main126_v5_c0_sparse4d_raw_uniform_30e.py",
+    "deterministic_algorithms": true,
+    "head_type": "ROSAOfficialResidualNativeBaselineHead",
+    "iterations": 30,
+    "latency_ms_mean": 11.874502309163411,
+    "latency_ms_median": 11.869855880737305,
+    "latency_ms_p95": 11.912223815917969,
+    "memory_baseline_mib": 145.0048828125,
+    "memory_iteration_delta_mib": 596.0712890625,
+    "memory_peak_mib": 741.076171875,
+    "mode": "inference",
+    "model_type": "Fisheye3DODGravityCenterSparse4D",
+    "parameters": 29667109,
+    "throughput_frames_s": 84.21405579485315,
+    "warmup": 5,
+    "warmup_wall_seconds": 3.497778387973085
+  },
+  {
+    "batch_size": 1,
+    "compile_parity_max_abs": {
+      "classification": 3.337860107421875e-05,
+      "prediction": 1.9073486328125e-06,
+      "quality": 2.288818359375e-05
+    },
+    "compiled_head": true,
+    "config": "/home/airlab/user/kdh/.runs/rosa_ray_decoder_v2/configs/fisheye_ray_decoder_v2_raw_uniform_20e.py",
+    "deterministic_algorithms": true,
+    "head_type": "FisheyeSparseRayHead",
+    "iterations": 30,
+    "latency_ms_mean": 9.916849104563395,
+    "latency_ms_median": 9.917407989501953,
+    "latency_ms_p95": 9.93388843536377,
+    "memory_baseline_mib": 103.064453125,
+    "memory_iteration_delta_mib": 595.5126953125,
+    "memory_peak_mib": 698.5771484375,
+    "mode": "inference",
+    "model_type": "Fisheye3DODGravityCenterSparse4D",
+    "parameters": 18576894,
+    "throughput_frames_s": 100.838480998953,
+    "warmup": 5,
+    "warmup_wall_seconds": 82.46792745101266
+  },
+  {
+    "comparison": "second_vs_first",
+    "latency_ratio_mean": 0.8351380838008412,
+    "latency_ratio_median": 0.8355120811193814,
+    "peak_memory_ratio": 0.9426522872406313
+  }
+]
