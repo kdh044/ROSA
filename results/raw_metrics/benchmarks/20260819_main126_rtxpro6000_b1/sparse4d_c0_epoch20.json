@@ -1,0 +1,18 @@
+{
+  "method": "Sparse4D C0",
+  "checkpoint_epoch": 20,
+  "warmup_iterations": 50,
+  "measured_iterations": 300,
+  "samples": 300,
+  "mean_batch_size": 1.0,
+  "mean_iteration_ms": 27.41549107401321,
+  "median_iteration_ms": 27.396366000175476,
+  "p95_iteration_ms": 27.777506038546562,
+  "mean_latency_per_sample_ms": 27.415491074013215,
+  "samples_per_second": 36.475728167710514,
+  "peak_cuda_memory_mib": 776.830078125,
+  "parameter_count": 29667109,
+  "trainable_parameter_count": 29590180,
+  "config_sha256": "196270f803cf9830a9708fba1b32c5a3fbca81ac52d140677c7d7d044c3172d0",
+  "checkpoint_sha256": "545852b47f1c8763b98a62bc492083aa04e9761b3d4b9e41c8bbfaf95e02a745"
+}

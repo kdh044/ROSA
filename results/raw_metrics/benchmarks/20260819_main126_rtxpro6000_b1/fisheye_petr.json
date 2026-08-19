@@ -1,0 +1,18 @@
+{
+  "method": "FisheyePETR",
+  "checkpoint_epoch": "released",
+  "warmup_iterations": 50,
+  "measured_iterations": 300,
+  "samples": 300,
+  "mean_batch_size": 1.0,
+  "mean_iteration_ms": 22.537298313497256,
+  "median_iteration_ms": 22.535920958034694,
+  "p95_iteration_ms": 22.78563193976879,
+  "mean_latency_per_sample_ms": 22.537298313497256,
+  "samples_per_second": 44.37089069372236,
+  "peak_cuda_memory_mib": 800.2373046875,
+  "parameter_count": 25084130,
+  "trainable_parameter_count": 23644122,
+  "config_sha256": "fd5e6e5e453f427482337acb296cf65899ca5d891ee2a937b9e54424e395bd2c",
+  "checkpoint_sha256": "a2334020c5dfc44087269dbcd25bd2d27efa3658390ca71b4fefd835e76f5e3f"
+}

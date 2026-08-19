@@ -1,0 +1,37 @@
+{
+  "date_utc": "2026-08-19",
+  "gpu": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "gpu_memory_mib": 97887,
+  "driver": "590.48.01",
+  "pytorch": "2.11.0+cu128",
+  "cuda_runtime": "12.8",
+  "mmengine": "0.10.7",
+  "batch_size": 1,
+  "num_workers": 0,
+  "persistent_workers": false,
+  "cudnn_benchmark": false,
+  "warmup_iterations": 50,
+  "measured_iterations": 300,
+  "execution": "single process, single GPU, models measured sequentially on the same GPU",
+  "timed_region": "model.test_step with CUDA synchronization before and after; dataloader next() excluded",
+  "memory": "torch.cuda.max_memory_allocated after resetting peak statistics with the loaded model resident",
+  "released_benchmark_script_sha256": "1d42ff2d596dc900c7c9efb083f453bd1ccceb1262fb6590a1a140f5185155b8",
+  "measurement_script_sha256": "0453f208b54f3d3e26b83fd867d7f1a7b1781265a654c4c1d2412c2a8bb9a495",
+  "script_difference": "docstring only; executable statements are identical",
+  "rosa_source_base_commit": "b3e09daa770ea6140f705f8111ce315591642f24",
+  "sparse4d_c0_training_source_commit": "9c05051f016b6a6578605c9835866d415458a113",
+  "detector_host_base_commit": "e0817a30b90ec22f9a9d02952d45ad734de2468c",
+  "detector_host_minimal_patch_sha256": "28b37f85ceddb98557679b03bbfd9f8dcb1d86d0507ad716a046c845f5322360",
+  "detector_host_minimal_patch_files": [
+    "projects/mmdet3d_plugin/ops/__init__.py",
+    "projects/mmdet3d_plugin/ops/deformable_aggregation.py",
+    "projects/mmdet3d_plugin/ops/src/deformable_aggregation.cpp",
+    "projects/mmdet3d_plugin/ops/src/deformable_aggregation_cuda.cu"
+  ],
+  "notes": [
+    "Fisheye3DOD is the official project/dataset/evaluator, not a separate third detector checkpoint.",
+    "FisheyePETR and FisheyeBEVDet use the two available released checkpoints.",
+    "ROSA and Sparse4D C0 were remeasured with the same clean host base plus the four-file minimal patch.",
+    "Exact public reproduction still requires publishing the recorded per-camera deformable-aggregation patch."
+  ]
+}

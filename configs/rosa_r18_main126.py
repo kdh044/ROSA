@@ -33,25 +33,25 @@ data_root = str(
         )
     ).resolve()
 )
-ann_root = Path(
+ann_root = str(Path(
     os.environ.get(
         "FISHEYE3DOD_ANN_ROOT",
         Path(data_root) / "ImageSets-main126",
     )
-).resolve()
-anchor_root = Path(
+).resolve())
+anchor_root = str(Path(
     os.environ.get("FISHEYE3DOD_ANCHOR_ROOT", _project_root / "assets")
-).resolve()
+).resolve())
 anchor_file = str(
     Path(
         os.environ.get(
             "FISHEYE3DOD_ANCHOR",
-            anchor_root / "fisheye3dod_main126_train_kmeans300_seed3407.npy",
+            Path(anchor_root) / "fisheye3dod_main126_train_kmeans300_seed3407.npy",
         )
     ).resolve()
 )
-ann_train = str(ann_root / "fisheye3dod_infos_train.pkl")
-ann_val = str(ann_root / "fisheye3dod_infos_val.pkl")
+ann_train = str(Path(ann_root) / "fisheye3dod_infos_train.pkl")
+ann_val = str(Path(ann_root) / "fisheye3dod_infos_val.pkl")
 cameras = (
     'fisheye_camera_front',
     'fisheye_camera_left',

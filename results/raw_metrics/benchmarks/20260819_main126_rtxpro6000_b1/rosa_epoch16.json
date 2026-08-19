@@ -1,0 +1,18 @@
+{
+  "method": "ROSA",
+  "checkpoint_epoch": 16,
+  "warmup_iterations": 50,
+  "measured_iterations": 300,
+  "samples": 300,
+  "mean_batch_size": 1.0,
+  "mean_iteration_ms": 48.20255178570127,
+  "median_iteration_ms": 47.97191149555147,
+  "p95_iteration_ms": 49.199771136045456,
+  "mean_latency_per_sample_ms": 48.20255178570127,
+  "samples_per_second": 20.745789651257397,
+  "peak_cuda_memory_mib": 749.80712890625,
+  "parameter_count": 22162005,
+  "trainable_parameter_count": 22085202,
+  "config_sha256": "1393e29436e59eb914cf897e85c1a55e3a8ea2f16e19831ff9bf93536cd69ed0",
+  "checkpoint_sha256": "98580a5f9a0e50d7921e9d718361da4f98980e530e153507082a2f1899809afc"
+}

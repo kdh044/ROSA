@@ -30,6 +30,25 @@ does not estimate cross-seed variance. Main126 follows the dataset's within-
 sequence split and is not a scene-disjoint held-out claim. Exact values and
 artifact hashes are in [results/metrics/main126_final.json](results/metrics/main126_final.json).
 
+## Runtime
+
+Single-GPU inference on an NVIDIA RTX PRO 6000 Blackwell Server Edition,
+batch size 1, 50 warm-up iterations, and 300 measured iterations:
+
+| Method | Latency (ms) ↓ | P95 (ms) ↓ | FPS ↑ | Peak allocated GPU memory (MiB) ↓ |
+|---|---:|---:|---:|---:|
+| FisheyeBEVDet | **16.16** | **16.61** | **61.88** | 1086.9 |
+| FisheyePETR | 22.54 | 22.79 | 44.37 | 800.2 |
+| Sparse4D | 27.42 | 27.78 | 36.48 | 776.8 |
+| ROSA (Ours) | 48.20 | 49.20 | 20.75 | **749.8** |
+
+The timed region is the complete MMEngine `model.test_step`, synchronized
+before and after each iteration; fetching the next dataloader batch is outside
+the timer. Peak memory is CUDA allocated memory with the loaded model resident,
+not reserved memory. Exact outputs, artifact hashes, environment, and the known
+detector-host worktree condition are recorded in
+[results/raw_metrics/benchmarks/20260819_main126_rtxpro6000_b1/protocol.json](results/raw_metrics/benchmarks/20260819_main126_rtxpro6000_b1/protocol.json).
+
 ## Method
 
 Each D0-D5 stage performs one recurrent update:
@@ -101,12 +120,10 @@ ROSA/
         └── fisheye3dod_infos_val.pkl
 ```
 
-The tested public dependency revisions are:
+The official evaluator revision is public:
 
 ```bash
-git clone https://github.com/kdh044/sphere_stream_sparse4d.git external/detector_host
 git clone https://github.com/weiyangdaren/Fisheye3DOD.git external/fisheye3dod
-git -C external/detector_host checkout e0817a30b90ec22f9a9d02952d45ad734de2468c
 git -C external/fisheye3dod checkout a28726ed002a02cb1328960848c0f4f2473748de
 python -m pip install -e ".[integration,dev]"
 (
@@ -114,6 +131,15 @@ python -m pip install -e ".[integration,dev]"
   python setup.py build_ext --inplace
 )
 ```
+
+The former detector-host URL, `kdh044/sphere_stream_sparse4d`, now redirects
+to this ROSA repository and must not be used as a host clone. The final fused
+model was validated from detector-host base commit
+`e0817a30b90ec22f9a9d02952d45ad734de2468c` plus a four-file per-camera
+deformable-aggregation patch. That minimal patch builds and runs the released
+checkpoint, but it still needs a stable public host repository before the
+integration can be called fully reproducible. Its exact file list and diff
+hash are recorded in the runtime protocol linked above.
 
 The config supports `ROSA_DETECTOR_HOST_ROOT`, `SPARSE4D_ROOT`,
 `FISHEYE3DOD_OFFICIAL_ROOT`, `FISHEYE3DOD_DATA_ROOT`,
@@ -141,6 +167,19 @@ Evaluate the selected checkpoint:
 python tools/run.py evaluate \
   configs/rosa_r18_main126.py \
   weights/rosa_r18_main126_best_fds_epoch16.pth
+```
+
+Reproduce the ROSA runtime measurement with batch size 1:
+
+```bash
+python tools/benchmark.py \
+  configs/rosa_r18_main126.py \
+  weights/rosa_r18_main126_best_fds_epoch16.pth \
+  --output results/raw_metrics/benchmarks/local/rosa.json \
+  --warmup 50 --iterations 300 \
+  --cfg-options test_dataloader.batch_size=1 \
+    test_dataloader.num_workers=0 \
+    test_dataloader.persistent_workers=False
 ```
 
 ## Checkpoint
