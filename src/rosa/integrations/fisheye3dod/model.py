@@ -2,15 +2,181 @@
 
 from __future__ import annotations
 
+import operator
+
 import torch
 from mmdet3d.registry import MODELS
 from mmdet3d.structures import LiDARInstance3DBoxes
+from projects.mmdet3d_plugin.data_preprocessor.sparse4d_preprocessor import (
+    Sparse4DDataPreprocessor,
+)
 from projects.mmdet3d_plugin.models.sparse4d import Sparse4D
+
+from rosa.integrations.sparse4d import (
+    ROSANativeBaselineHead,
+    ROSAOfficialResidualNativeBaselineHead,
+    ROSAOfficialResidualRefinementHead,
+    ROSARefinementHead,
+)
+
+
+@MODELS.register_module()
+class Fisheye3DODSingleFrameDataPreprocessor(Sparse4DDataPreprocessor):
+    """Keep temporal-only metadata on CPU during single-frame prediction.
+
+    Sparse4D's common preprocessor otherwise copies these tensors to CUDA and
+    ``_build_metas`` immediately materializes them back on the host.  They
+    remain unchanged during training, and the paired model rejects this
+    preprocessor when temporal instance slots are enabled.
+    """
+
+    _CPU_PREDICTION_KEYS = ("T_global", "T_global_inv", "timestamp")
+
+    def forward(self, data, training: bool = False):
+        if isinstance(data, list):
+            if training:
+                return super().forward(data, training=True)
+            raise ValueError(
+                "single-frame CPU metadata prediction does not support TTA/list input"
+            )
+        if training or not isinstance(data, dict):
+            return super().forward(data, training=training)
+        inputs = data.get("inputs")
+        if not isinstance(inputs, dict):
+            return super().forward(data, training=training)
+
+        host_metadata = {
+            name: inputs[name] for name in self._CPU_PREDICTION_KEYS if name in inputs
+        }
+        if not host_metadata:
+            return super().forward(data, training=training)
+        for name, value in host_metadata.items():
+            if not isinstance(value, torch.Tensor) or value.device.type != "cpu":
+                raise ValueError(
+                    f"single-frame prediction metadata {name} must enter on CPU"
+                )
+
+        device_data = dict(data)
+        device_inputs = dict(inputs)
+        for name in host_metadata:
+            device_inputs.pop(name)
+        device_data["inputs"] = device_inputs
+        processed = super().forward(device_data, training=training)
+        processed_inputs = processed["inputs"]
+        restored_inputs = {
+            name: (
+                host_metadata[name] if name in host_metadata else processed_inputs[name]
+            )
+            for name in inputs
+        }
+        restored_inputs.update(
+            (name, value)
+            for name, value in processed_inputs.items()
+            if name not in restored_inputs
+        )
+        processed["inputs"] = restored_inputs
+        return processed
+
+
+@MODELS.register_module()
+class Fisheye3DODSingleFrameInplaceDataPreprocessor(
+    Fisheye3DODSingleFrameDataPreprocessor
+):
+    """Normalize compact uint8 prediction images without a FP32 temporary.
+
+    This deployment-only path is sealed to released uint8 ingress.  Either a
+    fixed BGR-to-RGB flip or ``float()`` creates fresh storage before the
+    in-place normalization, so caller-owned input tensors are never mutated.
+    Training retains its separately validated preprocessor contract instead
+    of silently taking this runtime-only path.
+    """
+
+    def forward(self, data, training: bool = False):
+        if training:
+            raise RuntimeError(
+                "in-place uint8 preprocessing is prediction-only; use the "
+                "training config that produced the checkpoint"
+            )
+        return super().forward(data, training=False)
+
+    def _process_img(self, img: torch.Tensor) -> torch.Tensor:
+        if not isinstance(img, torch.Tensor):
+            raise TypeError("in-place uint8 preprocessing requires a tensor")
+        if img.dtype != torch.uint8:
+            raise TypeError("in-place uint8 preprocessing requires torch.uint8 ingress")
+        if img.requires_grad:
+            raise ValueError("image ingress must not require gradients")
+        if img.ndim != 5 or img.shape[-3] != 3:
+            raise ValueError(
+                "in-place uint8 preprocessing requires [B,camera,3,H,W] input"
+            )
+        # For BGR ingress, flip allocates fresh uint8 storage without an
+        # advanced-index kernel.  For already-packed RGB, float itself owns
+        # fresh storage.  In both cases in-place normalization cannot mutate
+        # the caller's uint8 tensor.
+        if self._channel_conversion:
+            img = img.flip(dims=(-3,))
+        img = img.float()
+        if self._enable_normalize:
+            shape = [1] * (img.dim() - 3) + list(self.mean.shape)
+            mean = self.mean.view(shape)
+            std = self.std.view(shape)
+            img.sub_(mean).div_(std)
+        if self.pad_size_divisor > 1:
+            height, width = img.shape[-2:]
+            divisor = self.pad_size_divisor
+            pad_height = (divisor - height % divisor) % divisor
+            pad_width = (divisor - width % divisor) % divisor
+            if pad_height or pad_width:
+                img = torch.nn.functional.pad(
+                    img,
+                    (0, pad_width, 0, pad_height),
+                    value=self.pad_value,
+                )
+        return img
+
+
+def _require_temporal_free_metadata_path(head) -> None:
+    if type(head) not in (
+        ROSANativeBaselineHead,
+        ROSAOfficialResidualNativeBaselineHead,
+        ROSAOfficialResidualRefinementHead,
+        ROSARefinementHead,
+    ):
+        raise TypeError(
+            "single-frame CPU metadata is sealed to the exact "
+            "audited temporal-free heads"
+        )
+    instance_bank = getattr(head, "instance_bank", None)
+    raw_count = getattr(instance_bank, "num_temp_instances", None)
+    if isinstance(raw_count, bool):
+        raise TypeError("num_temp_instances must be an exact integer zero")
+    try:
+        count = operator.index(raw_count)
+    except TypeError as error:
+        raise TypeError("num_temp_instances must be an exact integer zero") from error
+    if count != 0:
+        raise ValueError(
+            "Fisheye3DODSingleFrameDataPreprocessor requires num_temp_instances=0"
+        )
+    operation_order = getattr(head, "operation_order", None)
+    if not isinstance(operation_order, (list, tuple)):
+        raise TypeError("the audited native head requires an operation_order sequence")
+    if "temp_gnn" in operation_order:
+        raise ValueError("single-frame CPU metadata forbids temp_gnn operations")
 
 
 @MODELS.register_module()
 class Fisheye3DODGravityCenterSparse4D(Sparse4D):
     """Use gravity centres in state space without adding parameters."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        if isinstance(
+            self.data_preprocessor,
+            Fisheye3DODSingleFrameDataPreprocessor,
+        ):
+            _require_temporal_free_metadata_path(self.head)
 
     @staticmethod
     def _build_metas(inputs, data_samples=None):
@@ -49,4 +215,8 @@ class Fisheye3DODGravityCenterSparse4D(Sparse4D):
         return outputs
 
 
-__all__ = ["Fisheye3DODGravityCenterSparse4D"]
+__all__ = [
+    "Fisheye3DODGravityCenterSparse4D",
+    "Fisheye3DODSingleFrameDataPreprocessor",
+    "Fisheye3DODSingleFrameInplaceDataPreprocessor",
+]

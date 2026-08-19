@@ -12,10 +12,18 @@ from typing import Any
 
 
 def __getattr__(name: str) -> Any:
-    if name in {"ROSARefinementHead", "ClosedLoopROSAHead"}:
+    if name in {
+        "ROSARefinementHead",
+        "ROSAOfficialResidualRefinementHead",
+        "ClosedLoopROSAHead",
+    }:
         module = import_module(".sparse4d", __name__)
         return getattr(module, name)
     raise AttributeError(name)
 
 
-__all__ = ["ClosedLoopROSAHead", "ROSARefinementHead"]
+__all__ = [
+    "ClosedLoopROSAHead",
+    "ROSAOfficialResidualRefinementHead",
+    "ROSARefinementHead",
+]

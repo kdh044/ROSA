@@ -73,6 +73,9 @@ def train(args: argparse.Namespace, config: Config) -> None:
 
 
 def evaluate(args: argparse.Namespace, config: Config) -> None:
+    # MMEngine checkpoints can contain HistoryBuffer metadata in addition to
+    # tensors. The user explicitly supplies this trusted local artifact.
+    os.environ.setdefault("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD", "1")
     config.load_from = str(args.checkpoint.resolve())
     config.resume = False
     if args.dump:

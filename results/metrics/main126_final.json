@@ -1,0 +1,72 @@
+{
+  "dataset": "Fisheye3DOD Main126 validation",
+  "validation_frames": 3906,
+  "metric_protocol": "official Fisheye3DOD center-distance evaluator",
+  "matching_thresholds_m": [0.5, 1.0, 2.0, 4.0],
+  "temporal": false,
+  "models": {
+    "FisheyePETR": {
+      "backbone": "ResNet-18",
+      "mAP": 0.3883,
+      "FDS": 0.4842,
+      "mATE": 0.7110,
+      "mASE": 0.1413,
+      "mAOE": 0.4075,
+      "checkpoint_sha256": "a2334020c5dfc44087269dbcd25bd2d27efa3658390ca71b4fefd835e76f5e3f",
+      "prediction_sha256": "b6c0060f7b94d7f507eff68e45da737e4b4a8fe8879d9c608bada714eeb833fe"
+    },
+    "FisheyeBEVDet": {
+      "backbone": "ResNet-18",
+      "mAP": 0.3987,
+      "FDS": 0.5000,
+      "mATE": 0.5821,
+      "mASE": 0.1616,
+      "mAOE": 0.4523,
+      "checkpoint_sha256": "5913172cac419e7fd0df69d3471e8f53ac647b9f1301ae21239fb9a5e93979b0",
+      "prediction_sha256": "478ca6be5c4b37268e3be76570298711c93ebdad38db7b1c589549824b0bc08b"
+    },
+    "DAPETR": {
+      "backbone": "VoVNet-99",
+      "mAP": 0.4396,
+      "FDS": 0.5047,
+      "mATE": 0.7319,
+      "mASE": 0.1598,
+      "mAOE": 0.3987,
+      "provenance": "reported Main126 result"
+    },
+    "Sparse4D": {
+      "backbone": "ResNet-18",
+      "epoch": 20,
+      "mAP": 0.5644,
+      "FDS": 0.6342,
+      "mATE": 0.4623,
+      "mASE": 0.0858,
+      "mAOE": 0.3402,
+      "checkpoint_sha256": "545852b47f1c8763b98a62bc492083aa04e9761b3d4b9e41c8bbfaf95e02a745"
+    },
+    "ROSA (Ours)": {
+      "backbone": "ResNet-18",
+      "epoch": 16,
+      "mAP": 0.6143192120860669,
+      "FDS": 0.6647210036535152,
+      "mATE": 0.4289368878654696,
+      "mASE": 0.07880575782090997,
+      "mAOE": 0.3468889686507303,
+      "class_AP": {
+        "Car": 0.651024675807178,
+        "Van": 0.6275456257543519,
+        "Truck": 0.5980487315890428,
+        "Bus": 0.566003861674268,
+        "Pedestrian": 0.5984250083988794,
+        "Cyclist": 0.6448673692926807
+      },
+      "full_checkpoint_bytes": 286119832,
+      "full_checkpoint_sha256": "fdee3f33572233d25e6b3009b81313a0fd4cdcfcc461eab709af2a44cded51f0",
+      "best_mAP_checkpoint_sha256": "b33e2766184096d3087b86113948ddce7901a86039499eeee1309c84b2ae3994",
+      "best_FDS_checkpoint_sha256": "98580a5f9a0e50d7921e9d718361da4f98980e530e153507082a2f1899809afc",
+      "source_commit": "6f114618cac95a378834825a63e063aafe01592d"
+    }
+  },
+  "selection_note": "ROSA epoch 16 maximizes both validation mAP and FDS across epochs 4, 8, 12, 16, and 20.",
+  "limitation": "Single-seed validation checkpoint selection on Main126; this is not a scene-disjoint held-out test claim."
+}

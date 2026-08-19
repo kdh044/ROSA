@@ -61,10 +61,13 @@ def convert_ocamcamera(ocam: OcamLike) -> ROSAOcamCalibration:
     polynomial = np.asarray(ocam._invpol, dtype=np.float32)
     if polynomial.ndim != 1 or polynomial.size < 2:
         raise ValueError("released OCam inverse polynomial is missing")
+    lens_fov_deg = float(ocam._fov)
+    if not np.isfinite(lens_fov_deg) or not 0 < lens_fov_deg <= 360:
+        raise ValueError("released OCam FOV must be finite and in (0,360]")
     return ROSAOcamCalibration(
         intrinsic=intrinsic,
         polynomial=polynomial,
-        lens_fov_deg=float(ocam._fov),
+        lens_fov_deg=lens_fov_deg,
     )
 
 

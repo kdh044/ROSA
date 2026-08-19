@@ -4,6 +4,33 @@ from __future__ import annotations
 
 import torch
 from torch import Tensor
+import torch.nn.functional as F
+
+
+def orthonormal_bev_radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
+    """Return a deterministic orthonormal radial/tangent frame in BEV.
+
+    The radial direction is undefined exactly at the ego origin.  Falling
+    back to the positive x-axis keeps center refinement trainable there and
+    avoids the all-zero "basis" returned by ``F.normalize`` for a zero
+    vector.  Non-finite detector boxes use the same fail-safe frame rather
+    than propagating NaNs through candidate construction and diagnostics.
+    """
+
+    if center_xy.ndim < 1 or center_xy.shape[-1] != 2:
+        raise ValueError("BEV centers must end in an XY pair")
+    if not center_xy.is_floating_point():
+        raise TypeError("BEV centers must be floating point")
+
+    finite = torch.isfinite(center_xy).all(dim=-1, keepdim=True)
+    safe_center = torch.where(finite, center_xy, torch.zeros_like(center_xy))
+    norm = torch.linalg.vector_norm(safe_center, dim=-1, keepdim=True)
+    radial = F.normalize(safe_center, dim=-1, eps=1e-6)
+    fallback = torch.zeros_like(radial)
+    fallback[..., 0] = 1.0
+    radial = torch.where(finite & norm.gt(1e-6), radial, fallback)
+    tangent = torch.stack((-radial[..., 1], radial[..., 0]), dim=-1)
+    return radial, tangent
 
 
 class _ExactZeroDetachedBaseAdd(torch.autograd.Function):
@@ -23,7 +50,22 @@ class _ExactZeroDetachedBaseAdd(torch.autograd.Function):
 
 
 def exact_zero_detached_base_add(base: Tensor, delta: Tensor) -> Tensor:
-    """Return ``base + delta`` with gradient assigned only to ``delta``."""
+    """Return ``base + delta`` with gradient assigned only to ``delta``.
+
+    Detector anchors intentionally remain FP32 under autocast while learned
+    sidecar residuals may be FP16/BF16.  Promote the residual to the
+    detector-owned base dtype before entering the strict custom autograd
+    boundary.  Autograd carries the gradient back through this cast to the
+    original residual dtype, and an exactly-zero residual still returns the
+    base value bit-for-bit.
+    """
+
+    if base.device != delta.device:
+        raise ValueError("base and delta must share a device")
+    if base.dtype != delta.dtype:
+        if not base.is_floating_point() or not delta.is_floating_point():
+            raise TypeError("mixed-dtype residual addition requires floating tensors")
+        delta = delta.to(dtype=base.dtype)
 
     return _ExactZeroDetachedBaseAdd.apply(base, delta)
 
@@ -63,9 +105,47 @@ class _ExactZeroDetachedBaseYawRotation(torch.autograd.Function):
 
 
 def exact_zero_detached_base_yaw_rotation(base: Tensor, delta_yaw: Tensor) -> Tensor:
-    """Rotate an encoded yaw while detaching the detector-owned base."""
+    """Rotate an encoded yaw while detaching the detector-owned base.
+
+    As with :func:`exact_zero_detached_base_add`, preserve the anchor dtype
+    under autocast and let the differentiable cast return gradients to the
+    lower-precision yaw residual.
+    """
+
+    if base.device != delta_yaw.device:
+        raise ValueError("base and delta_yaw must share a device")
+    if base.dtype != delta_yaw.dtype:
+        if not base.is_floating_point() or not delta_yaw.is_floating_point():
+            raise TypeError("mixed-dtype yaw rotation requires floating tensors")
+        delta_yaw = delta_yaw.to(dtype=base.dtype)
 
     return _ExactZeroDetachedBaseYawRotation.apply(base, delta_yaw)
+
+
+def yaw_vector_to_angle(yaw: Tensor) -> Tensor:
+    """Decode an encoded ``[sin(yaw), cos(yaw)]`` vector."""
+
+    if yaw.shape[-1] != 2:
+        raise ValueError("yaw encoding must end in [sin, cos]")
+    return torch.atan2(yaw[..., 0], yaw[..., 1])
+
+
+def wrapped_angle_difference(prediction: Tensor, target: Tensor) -> Tensor:
+    """Return the signed shortest angular difference between yaw vectors."""
+
+    if prediction.shape != target.shape or prediction.shape[-1] != 2:
+        raise ValueError("yaw tensors must share shape [...,2]")
+    prediction = F.normalize(prediction, dim=-1, eps=1e-6)
+    target = F.normalize(target, dim=-1, eps=1e-6)
+    sine = prediction[..., 0] * target[..., 1] - prediction[..., 1] * target[..., 0]
+    cosine = (prediction * target).sum(dim=-1)
+    return torch.atan2(sine, cosine)
+
+
+def wrap_angle(angle: Tensor) -> Tensor:
+    """Map a scalar angle to the differentiable principal interval [-pi, pi]."""
+
+    return torch.atan2(angle.sin(), angle.cos())
 
 
 def bitwise_equal(left: Tensor, right: Tensor) -> bool:
@@ -93,4 +173,8 @@ __all__ = [
     "bitwise_equal",
     "exact_zero_detached_base_add",
     "exact_zero_detached_base_yaw_rotation",
+    "orthonormal_bev_radial_basis",
+    "wrap_angle",
+    "wrapped_angle_difference",
+    "yaw_vector_to_angle",
 ]

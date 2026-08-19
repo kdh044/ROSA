@@ -12,13 +12,21 @@ class ObservationEncoding:
     """Camera- and point-aggregated evidence for each object query."""
 
     object_feature: Tensor
-    point_features: Tensor
-    camera_weights: Tensor
+    point_features: Tensor | None
+    camera_weights: Tensor | None
     valid: Tensor
     supported: Tensor
-    cross_camera_consistency: Tensor
-    camera_weight_mean: Tensor
-    camera_geometry_summary: Tensor
+    cross_camera_consistency: Tensor | None
+    camera_weight_mean: Tensor | None
+    camera_geometry_summary: Tensor | None
+
+
+@dataclass(frozen=True)
+class RayFeatureRelation:
+    """Only the calibrated ray and validity channels consumed by RFL."""
+
+    ray: Tensor
+    valid: Tensor
 
 
 @dataclass
@@ -43,6 +51,11 @@ class ROSAOutput:
     initial_supported: Tensor
     posterior_entropy: Tensor
     posterior_margin: Tensor
+    searched_candidate_probabilities: Tensor | None = None
+    searched_candidate_logits: Tensor | None = None
+    searched_candidate_supported: Tensor | None = None
+    total_radial_delta: Tensor | None = None
+    total_tangent_delta: Tensor | None = None
     distribution_mean: Tensor | None = None
     distribution_std: Tensor | None = None
     candidate_offsets: Tensor | None = None
@@ -53,10 +66,19 @@ class ROSAOutput:
     iteration_candidate_offsets: Tensor | None = None
     iteration_candidate_probabilities: Tensor | None = None
     iteration_candidate_supported: Tensor | None = None
+    iteration_observation_supported: Tensor | None = None
+    iteration_radial_proposal: Tensor | None = None
+    iteration_radial_gate: Tensor | None = None
+    iteration_radial_gate_logit: Tensor | None = None
     iteration_radial_safe: Tensor | None = None
     iteration_tangent_delta: Tensor | None = None
+    iteration_yaw_raw_delta: Tensor | None = None
+    iteration_yaw_gate: Tensor | None = None
+    iteration_yaw_gate_logit: Tensor | None = None
+    iteration_yaw_delta: Tensor | None = None
+    iteration_reliability_context: Tensor | None = None
     iteration_camera_weight_mean: Tensor | None = None
     iteration_camera_geometry_summary: Tensor | None = None
 
 
-__all__ = ["ObservationEncoding", "ROSAOutput"]
+__all__ = ["ObservationEncoding", "ROSAOutput", "RayFeatureRelation"]

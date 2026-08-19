@@ -24,9 +24,17 @@ def test_release_config_uses_only_clean_integration_imports():
     assert "fisheye3dod_official" not in source
     for module in (
         "rosa.integrations.sparse4d",
+        "rosa.integrations.optim",
         "rosa.integrations.fisheye3dod.dataset",
         "rosa.integrations.fisheye3dod.model",
         "rosa.integrations.fisheye3dod.metric",
+        "rosa.integrations.fisheye_box_sparse4d",
     ):
         assert module in source
-    assert 'projection_contract="legacy_front_only"' in source
+    assert "type='FisheyeSparseBoxHead'" in source
+    assert "camera_rfl_before_rosa=True" in source
+    assert "num_temp_instances=0" in source
+    assert "sparse4d_size_head_layers=(" in source
+    assert all(f"            {stage}," in source for stage in range(6))
+    assert "V49" not in source
+    assert "C0" not in source

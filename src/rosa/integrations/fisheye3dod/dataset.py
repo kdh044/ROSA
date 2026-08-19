@@ -11,6 +11,7 @@ from typing import Optional
 
 import mmcv
 import numpy as np
+import torch
 from mmcv.transforms import BaseTransform
 from mmdet3d.datasets import Det3DDataset
 from mmdet3d.registry import DATASETS, TRANSFORMS
@@ -20,7 +21,9 @@ from .calibration import convert_lidar2cam, convert_ocamcamera
 from .constants import (
     CAMERAS,
     CAMERA_IMAGE_SIZE,
+    CLASSES,
     DEFAULT_OFFICIAL_REPO,
+    OFFICIAL_CLASS_RANGES,
     OFFICIAL_POINT_CLOUD_RANGE,
 )
 
@@ -174,8 +177,43 @@ class OfficialFisheye3DODRangeFilter(BaseTransform):
 
 
 @TRANSFORMS.register_module()
+class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
+    """Apply the evaluator's exact class-conditional radial GT range."""
+
+    class_ranges = tuple(float(OFFICIAL_CLASS_RANGES[name]) for name in CLASSES)
+
+    def transform(self, results: dict) -> dict:
+        annotation = results.get("ann_info")
+        if not annotation:
+            return results
+        boxes = annotation["gt_bboxes_3d"]
+        labels = np.asarray(annotation["gt_labels_3d"], dtype=np.int64)
+        if len(boxes) != len(labels):
+            raise ValueError("Fisheye3DOD boxes and labels are misaligned")
+        if len(labels) == 0:
+            return results
+        if labels.min() < 0 or labels.max() >= len(self.class_ranges):
+            raise ValueError("Fisheye3DOD evaluator-range label is invalid")
+        label_tensor = boxes.tensor.new_tensor(labels, dtype=torch.long)
+        limits = boxes.tensor.new_tensor(self.class_ranges)[label_tensor]
+        radius = torch.linalg.vector_norm(boxes.tensor[:, :2], dim=-1)
+        # The released evaluator uses strict `ego_dist < class_range`.
+        keep_tensor = radius < limits
+        keep = keep_tensor.detach().cpu().numpy().astype(bool)
+        annotation["gt_bboxes_3d"] = boxes[keep_tensor]
+        annotation["gt_labels_3d"] = labels[keep]
+        if "instance_inds" in annotation:
+            annotation["instance_inds"] = np.asarray(
+                annotation["instance_inds"]
+            )[keep]
+        return results
+
+
+@TRANSFORMS.register_module()
 class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
     """Load four native 800×800 OCam images in the fixed released order."""
+
+    _EMIT_CAM2EGO = True
 
     def __init__(
         self,
@@ -236,12 +274,30 @@ class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
             pad_shape=shapes,
             ocam_lens_fov_deg=float(fovs[0]),
         )
-        results["cam2ego"] = np.linalg.inv(results["lidar2cam"]).astype(np.float32)
+        if self._EMIT_CAM2EGO:
+            results["cam2ego"] = np.linalg.inv(results["lidar2cam"]).astype(
+                np.float32
+            )
         return results
 
 
+@TRANSFORMS.register_module()
+class LoadOfficialFisheye3DODLeanForSparse4D(
+    LoadOfficialFisheye3DODForSparse4D
+):
+    """Exact native loader without the unused camera-pose inverse.
+
+    This variant is only for pipelines that do not consume ``cam2ego``.  Keep
+    the default loader for the optional ego D4/C4 augmentation branches.
+    """
+
+    _EMIT_CAM2EGO = False
+
+
 __all__ = [
+    "Fisheye3DODEvaluatorRangeFilter",
     "Fisheye3DODSparse4DDataset",
+    "LoadOfficialFisheye3DODLeanForSparse4D",
     "LoadOfficialFisheye3DODForSparse4D",
     "OfficialFisheye3DODRangeFilter",
 ]
