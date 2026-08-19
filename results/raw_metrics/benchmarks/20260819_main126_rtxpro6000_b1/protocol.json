@@ -21,6 +21,7 @@
   "rosa_source_base_commit": "b3e09daa770ea6140f705f8111ce315591642f24",
   "sparse4d_c0_training_source_commit": "9c05051f016b6a6578605c9835866d415458a113",
   "detector_host_base_commit": "e0817a30b90ec22f9a9d02952d45ad734de2468c",
+  "detector_host_local_commit": "979e29c5551f3be602086223d9104f61523ee49f",
   "detector_host_minimal_patch_sha256": "28b37f85ceddb98557679b03bbfd9f8dcb1d86d0507ad716a046c845f5322360",
   "detector_host_minimal_patch_files": [
     "projects/mmdet3d_plugin/ops/__init__.py",
