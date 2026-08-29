@@ -1,0 +1,29 @@
+# ROSA — verified against the environment that produced the reported numbers.
+#
+# PyTorch is intentionally not pinned here: install the build that matches your
+# CUDA toolkit first (see docs/INSTALL.md), then install this file.
+# Reference environment: Python 3.10, torch 2.11.0+cu128 on an RTX PRO 6000.
+
+# --- OpenMMLab -------------------------------------------------------------
+# mmcv 2.x is required.  ROSA runs on the MMEngine registry and the MMDet3D 1.4
+# data pipeline; mmcv 1.x (mmcv-full) will not import.
+mmcv==2.2.0
+mmengine==0.10.7
+mmdet==3.2.0
+mmdet3d==1.4.0
+
+# --- numeric / geometry ----------------------------------------------------
+numpy>=2.0
+scipy>=1.15
+numba>=0.60
+pyquaternion>=0.9.9
+shapely<2.0
+
+# --- data and evaluation ---------------------------------------------------
+nuscenes-devkit>=1.1.11
+opencv-python>=4.9
+terminaltables>=3.1
+yapf>=0.40
+
+# --- misc ------------------------------------------------------------------
+einops>=0.8

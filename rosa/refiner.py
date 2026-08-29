@@ -1,0 +1,1378 @@
+"""Detector-agnostic adaptive ROSA box refinement."""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+import math
+
+import torch
+from torch import Tensor, nn
+import torch.nn.functional as F
+
+from . import observation as _observation
+from . import rfl as _rfl
+from .attention import PointwiseROSA, masked_softmax
+from .config import ROSAConfig
+from .observation import (
+    _sample_multiscale_features_prepared_inference,
+    project_and_describe,
+    sample_multiscale_features,
+)
+from .ops import (
+    exact_zero_detached_base_add,
+    exact_zero_detached_base_yaw_rotation,
+    orthonormal_bev_radial_basis,
+)
+from .sampling import (
+    DeterministicBilinearSampler,
+    FusedBilinearSampler,
+)
+from .rfl import SphericalRayFeatureLifting, _prepare_ray_feature_relation
+from .types import ObservationEncoding, ROSAOutput
+
+_SIZE = slice(3, 6)
+_YAW = slice(6, 8)
+_LEGACY_SIGMA_POINTS = (-2.0, -1.0, 0.0, 1.0, 2.0)
+# Keep the same outer search interval while avoiding the two redundant
+# intermediate re-observations in the vectorized profile.
+_COMPACT_SIGMA_POINTS = (-2.0, 0.0, 2.0)
+KeypointGenerator = Callable[[Tensor, Tensor], Tensor]
+_RELEASED_POINTWISE_ROSA_FORWARD = PointwiseROSA.forward
+_RELEASED_POINTWISE_ROSA_LEAN_FORWARD = PointwiseROSA._forward_compact_lean_inference
+_RELEASED_POINTWISE_ROSA_IMPL = PointwiseROSA._forward_impl
+_RELEASED_POINTWISE_ROSA_REUSE_GUARD = PointwiseROSA._can_reuse_owned_rfl_delta
+_RELEASED_PROJECT_AND_DESCRIBE = project_and_describe
+_RELEASED_OBSERVATION_PROJECT_AND_DESCRIBE = _observation.project_and_describe
+_RELEASED_PREPARE_RAY_FEATURE_RELATION = _prepare_ray_feature_relation
+_RELEASED_RFL_PREPARE_RAY_FEATURE_RELATION = _rfl._prepare_ray_feature_relation
+_RELEASED_RFL_PREPARED_RELATION_TYPE = _rfl._PreparedRayFeatureRelation
+_RELEASED_RFL_PREPARED_RELATION_PROVENANCE = _rfl._PREPARED_RELATION_PROVENANCE
+_RELEASED_RFL_PREPARED_BASIS = _rfl._prepared_compact_basis_and_valid
+_RELEASED_MODULE_CALL_IMPL = nn.Module._call_impl
+_RELEASED_RFL_FORWARD = SphericalRayFeatureLifting.forward
+_RELEASED_RFL_OWNED_DELTA_FORWARD = (
+    SphericalRayFeatureLifting._forward_lifted_owned_delta_inference
+)
+_RELEASED_RFL_PREPARED_RELATION_GUARD = (
+    SphericalRayFeatureLifting._can_use_prepared_relation
+)
+
+
+@dataclass
+class _CandidateEvidence:
+    features: Tensor
+    supported: Tensor
+    logits: Tensor
+    probabilities: Tensor
+    offsets: Tensor
+    radial_delta: Tensor
+    entropy: Tensor
+    margin: Tensor
+    weighted_feature: Tensor
+
+
+@dataclass
+class _RefinementStep:
+    base_anchor: Tensor
+    anchor: Tensor
+    shape_anchor: Tensor
+    shape_size_delta: Tensor
+    shape_yaw_delta: Tensor
+    distribution_mean: Tensor
+    distribution_std: Tensor
+    candidates: _CandidateEvidence
+    radial_proposal: Tensor
+    radial_gate: Tensor
+    radial_gate_logit: Tensor
+    radial_safe: Tensor
+    tangent_delta: Tensor
+    yaw_raw_delta: Tensor
+    yaw_gate: Tensor
+    yaw_gate_logit: Tensor
+    feedback: Tensor
+    reliability_context: Tensor
+    observation: ObservationEncoding
+
+
+def _make_head(
+    input_dims: int,
+    hidden_dims: int,
+    output_dims: int,
+) -> nn.Sequential:
+    return nn.Sequential(
+        nn.LayerNorm(input_dims),
+        nn.Linear(input_dims, hidden_dims),
+        nn.SiLU(),
+        nn.Linear(hidden_dims, output_dims),
+    )
+
+
+def _make_compact_head(input_dims: int, output_dims: int) -> nn.Sequential:
+    """A normalized linear readout for already-processed shared features."""
+
+    return nn.Sequential(
+        nn.LayerNorm(input_dims),
+        nn.Linear(input_dims, output_dims),
+    )
+
+
+def _zero_last(module: nn.Sequential) -> None:
+    final = module[-1]
+    if not isinstance(final, nn.Linear):
+        raise TypeError("the final head layer must be Linear")
+    nn.init.zeros_(final.weight)
+    nn.init.zeros_(final.bias)
+
+
+def _compose_shape(
+    anchor: Tensor,
+    size_delta: Tensor,
+    yaw_delta: Tensor,
+) -> Tensor:
+    return _compose_yaw(_compose_size(anchor, size_delta), yaw_delta)
+
+
+def _compose_size(anchor: Tensor, size_delta: Tensor) -> Tensor:
+    return torch.cat(
+        (
+            anchor[..., :3],
+            exact_zero_detached_base_add(
+                anchor[..., _SIZE],
+                size_delta,
+            ),
+            anchor[..., 6:],
+        ),
+        dim=-1,
+    )
+
+
+def _compose_yaw(anchor: Tensor, yaw_delta: Tensor) -> Tensor:
+    return torch.cat(
+        (
+            anchor[..., :6],
+            exact_zero_detached_base_yaw_rotation(anchor[..., _YAW], yaw_delta),
+            anchor[..., 8:],
+        ),
+        dim=-1,
+    )
+
+
+def _compose_center(anchor: Tensor, delta_xy: Tensor) -> Tensor:
+    if delta_xy.shape != anchor.shape[:2] + (2,):
+        raise ValueError("center delta must be [B,N,2]")
+    return torch.cat(
+        (
+            exact_zero_detached_base_add(
+                anchor[..., :2],
+                delta_xy,
+            ),
+            anchor[..., 2:],
+        ),
+        dim=-1,
+    )
+
+
+def _normalized_geometry_yaw(anchor: Tensor) -> Tensor:
+    """Normalize yaw for geometry without changing the detector-owned box."""
+
+    yaw = anchor[..., _YAW]
+    norm = torch.linalg.vector_norm(yaw, dim=-1, keepdim=True)
+    fallback = torch.zeros_like(yaw)
+    fallback[..., 1] = 1.0
+    normalized = torch.where(
+        norm > 1e-6,
+        yaw / norm.clamp_min(1e-6),
+        fallback,
+    )
+    return torch.cat(
+        (anchor[..., :6], normalized, anchor[..., 8:]),
+        dim=-1,
+    )
+
+
+def _radial_basis(center_xy: Tensor) -> tuple[Tensor, Tensor]:
+    return orthonormal_bev_radial_basis(center_xy)
+
+
+def _observation_reliability_context(
+    observation: ObservationEncoding,
+) -> Tensor:
+    """Summarize evidence that should control rather than define a correction."""
+
+    if (
+        observation.cross_camera_consistency is None
+        or observation.camera_geometry_summary is None
+    ):
+        raise RuntimeError("reliability context requires full observation details")
+
+    camera_valid = observation.valid.any(dim=-1)
+    valid_float = camera_valid.to(observation.camera_geometry_summary.dtype)
+    valid_count = valid_float.sum(dim=-1).clamp_min(1.0)
+    geometry = observation.camera_geometry_summary
+
+    def valid_mean(value: Tensor) -> Tensor:
+        return (value * valid_float).sum(dim=-1) / valid_count
+
+    anisotropy = geometry[..., 4]
+    positive_inf = torch.full_like(anisotropy, float("inf"))
+    negative_inf = torch.full_like(anisotropy, float("-inf"))
+    anisotropy_min = torch.where(camera_valid, anisotropy, positive_inf).amin(dim=-1)
+    anisotropy_max = torch.where(camera_valid, anisotropy, negative_inf).amax(dim=-1)
+    anisotropy_gap = torch.where(
+        valid_count > 1,
+        anisotropy_max - anisotropy_min,
+        torch.zeros_like(anisotropy_min),
+    )
+    context = torch.stack(
+        (
+            observation.cross_camera_consistency,
+            valid_float.mean(dim=-1),
+            valid_mean(anisotropy.abs()),
+            anisotropy_gap,
+            valid_mean(geometry[..., 5]),
+            valid_mean(geometry[..., 6]),
+        ),
+        dim=-1,
+    )
+    return torch.nan_to_num(context)
+
+
+def _yaw_reliability_gate(
+    reliability_context: Tensor,
+    supported: Tensor,
+    config: ROSAConfig,
+) -> Tensor:
+    """Return a deterministic yaw gate without adding learned parameters."""
+
+    if config.yaw_gate_mode == "none":
+        return torch.ones_like(reliability_context[..., :1])
+    support = supported[..., None].to(reliability_context.dtype)
+    if config.yaw_gate_mode == "support":
+        return support
+    anisotropy_gap = reliability_context[..., 3:4]
+    camera_count = reliability_context[..., 1:2] * config.num_cameras
+    overlap_gate = torch.sigmoid(
+        (config.yaw_anisotropy_threshold - anisotropy_gap)
+        / config.yaw_anisotropy_temperature
+    )
+    return (
+        torch.where(
+            camera_count >= 2,
+            overlap_gate,
+            torch.ones_like(overlap_gate),
+        )
+        * support
+    )
+
+
+def _candidate_confidence(
+    probabilities: Tensor,
+    supported: Tensor,
+    *,
+    legacy: bool,
+) -> tuple[Tensor, Tensor]:
+    """Summarize only supported hypotheses as entropy and top-two margin."""
+
+    count = int(probabilities.shape[-1])
+    if legacy:
+        safe_probability = probabilities.clamp_min(1e-8)
+        entropy = -(safe_probability * safe_probability.log()).sum(dim=-1) / math.log(
+            count
+        )
+        center_probability = probabilities[..., count // 2]
+        margin = probabilities.max(dim=-1).values - center_probability
+        return entropy, margin
+
+    support_count = supported.sum(dim=-1)
+    safe_probability = probabilities.clamp_min(1e-8)
+    raw_entropy = -(
+        torch.where(
+            supported,
+            safe_probability * safe_probability.log(),
+            torch.zeros_like(safe_probability),
+        )
+    ).sum(dim=-1)
+    entropy = torch.where(
+        support_count > 1,
+        raw_entropy / support_count.clamp_min(2).to(raw_entropy.dtype).log(),
+        torch.zeros_like(raw_entropy),
+    )
+    supported_probability = torch.where(
+        supported,
+        probabilities,
+        torch.full_like(probabilities, -1.0),
+    )
+    top_two = supported_probability.topk(2, dim=-1).values
+    margin = torch.where(
+        support_count > 1,
+        top_two[..., 0] - top_two[..., 1],
+        torch.where(
+            support_count == 1,
+            torch.ones_like(top_two[..., 0]),
+            torch.zeros_like(top_two[..., 0]),
+        ),
+    )
+    return entropy, margin
+
+
+class ROSARefiner(nn.Module):
+    """Refine encoded 3D boxes from calibrated multiview evidence."""
+
+    def __init__(
+        self,
+        config: ROSAConfig,
+        projection_type: str = "ocam_fisheye",
+    ) -> None:
+        super().__init__()
+        if projection_type != "ocam_fisheye":
+            raise ValueError("ROSA supports native OCam fisheye projection only")
+        self.cfg = config
+        self.projection_type = projection_type
+
+        dims = config.embed_dims
+        hidden = config.hidden_dims
+        self.sampler = (
+            DeterministicBilinearSampler()
+            if config.architecture_profile == "legacy"
+            else FusedBilinearSampler()
+        )
+        self.level_head = nn.Linear(dims, config.num_levels)
+        self.rosa = PointwiseROSA(config)
+        self.refinement_trunk = nn.Sequential(
+            nn.LayerNorm(dims),
+            nn.Linear(dims, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, dims),
+            nn.SiLU(),
+        )
+        make_head = lambda input_dims, output_dims: (
+            _make_compact_head(input_dims, output_dims)
+            if config.architecture_profile == "compact"
+            else _make_head(input_dims, hidden, output_dims)
+        )
+        self.shared_shape_head = make_head(dims, 4)
+        self.shared_tangent_head = make_head(dims, 1)
+        self.range_distribution_head = make_head(dims, 2)
+
+        candidate_dims = dims * 2 + 4
+        feedback_dims = (
+            candidate_dims
+            if config.architecture_profile == "legacy"
+            else candidate_dims + 3
+        )
+        self.candidate_head = make_head(candidate_dims, 1)
+        self.center_gate_head = make_head(feedback_dims, 1)
+        self.quality_head = (
+            make_head(feedback_dims, 1)
+            if (config.architecture_profile == "legacy" or config.enable_quality_score)
+            else None
+        )
+        # ``nn.Module.compile`` replaces the complete module call boundary.
+        # The latency profile needs a narrower contract: only the one-step
+        # anchor calculation may be compiled, while detector scores, ranking,
+        # decoding, public validation, and hooks remain ordinary eager code.
+        # Keep the callable outside the state dict so checkpoints retain the
+        # exact same learned topology.
+        self._compiled_fast_anchor_impl = None
+        self.reset_parameters()
+
+    def reset_parameters(self) -> None:
+        nn.init.zeros_(self.level_head.weight)
+        nn.init.zeros_(self.level_head.bias)
+        self.rosa.reset_parameters()
+
+        released_heads = tuple(
+            head
+            for head in (
+                self.refinement_trunk,
+                self.shared_shape_head,
+                self.shared_tangent_head,
+                self.range_distribution_head,
+                self.candidate_head,
+                self.center_gate_head,
+                self.quality_head,
+            )
+            if head is not None
+        )
+        for head in released_heads:
+            for layer in head:
+                if isinstance(layer, nn.Linear):
+                    nn.init.xavier_uniform_(layer.weight)
+                    nn.init.zeros_(layer.bias)
+        for head in released_heads[1:]:
+            _zero_last(head)
+
+        target = self.cfg.initial_log_range_std - self.cfg.min_log_range_std
+        inverse_softplus = math.log(math.expm1(target))
+        with torch.no_grad():
+            self.range_distribution_head[-1].bias[1] = inverse_softplus
+
+    def _encode(
+        self,
+        anchor: Tensor,
+        keypoints: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metadata: dict,
+        observation_usage: str = "full",
+    ) -> ObservationEncoding:
+        rfl = getattr(self.rosa, "rfl", None)
+        relation_modules = tuple(self.rosa.modules())
+        released_relation_surface = bool(
+            type(self.rosa) is PointwiseROSA
+            and project_and_describe is _RELEASED_PROJECT_AND_DESCRIBE
+            and _observation.project_and_describe
+            is _RELEASED_OBSERVATION_PROJECT_AND_DESCRIBE
+            and _prepare_ray_feature_relation is _RELEASED_PREPARE_RAY_FEATURE_RELATION
+            and _rfl._prepare_ray_feature_relation
+            is _RELEASED_RFL_PREPARE_RAY_FEATURE_RELATION
+            and _rfl._PreparedRayFeatureRelation is _RELEASED_RFL_PREPARED_RELATION_TYPE
+            and _rfl._PREPARED_RELATION_PROVENANCE
+            is _RELEASED_RFL_PREPARED_RELATION_PROVENANCE
+            and _rfl._prepared_compact_basis_and_valid is _RELEASED_RFL_PREPARED_BASIS
+            and "forward" not in self.rosa.__dict__
+            and type(self.rosa).forward is _RELEASED_POINTWISE_ROSA_FORWARD
+            and "_call_impl" not in self.rosa.__dict__
+            and type(self.rosa)._call_impl is _RELEASED_MODULE_CALL_IMPL
+            and "_forward_compact_lean_inference" not in self.rosa.__dict__
+            and type(self.rosa)._forward_compact_lean_inference
+            is _RELEASED_POINTWISE_ROSA_LEAN_FORWARD
+            and "_forward_impl" not in self.rosa.__dict__
+            and type(self.rosa)._forward_impl is _RELEASED_POINTWISE_ROSA_IMPL
+            and "_can_reuse_owned_rfl_delta" not in self.rosa.__dict__
+            and type(self.rosa)._can_reuse_owned_rfl_delta
+            is _RELEASED_POINTWISE_ROSA_REUSE_GUARD
+            and type(rfl) is SphericalRayFeatureLifting
+            and "forward" not in rfl.__dict__
+            and type(rfl).forward is _RELEASED_RFL_FORWARD
+            and "_forward_lifted_owned_delta_inference" not in rfl.__dict__
+            and type(rfl)._forward_lifted_owned_delta_inference
+            is _RELEASED_RFL_OWNED_DELTA_FORWARD
+            and "_can_use_prepared_relation" not in rfl.__dict__
+            and type(rfl)._can_use_prepared_relation
+            is _RELEASED_RFL_PREPARED_RELATION_GUARD
+            and all(
+                "_call_impl" not in module.__dict__
+                and type(module)._call_impl is _RELEASED_MODULE_CALL_IMPL
+                for module in relation_modules
+            )
+        )
+        relation_hooks_active = bool(
+            any(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+                for module in relation_modules
+            )
+            or torch.nn.modules.module._global_forward_pre_hooks
+            or torch.nn.modules.module._global_forward_hooks
+            or torch.nn.modules.module._global_backward_pre_hooks
+            or torch.nn.modules.module._global_backward_hooks
+        )
+        uv, geometry, relation, valid = project_and_describe(
+            keypoints,
+            anchor,
+            metadata,
+            self.cfg.projection_contract,
+            anchor_z_is_bottom=self.cfg.anchor_z_is_bottom,
+            # Preserve the historical Tensor relation seen by local/global
+            # hooks.  Ordinary hook-free execution uses the compact owned
+            # ray/valid carrier and avoids two large 19-channel copies.
+            compact_relation=(released_relation_surface and not relation_hooks_active),
+        )
+        private_prepared_inference = bool(
+            observation_usage != "full"
+            and released_relation_surface
+            and not relation_hooks_active
+        )
+        private_rfl_buffer_inference = bool(
+            private_prepared_inference
+            and not torch.jit.is_scripting()
+            and not torch.jit.is_tracing()
+            and not torch._dynamo.is_compiling()
+        )
+        sample_features = (
+            _sample_multiscale_features_prepared_inference
+            if private_prepared_inference
+            else sample_multiscale_features
+        )
+        features = sample_features(
+            fpn,
+            uv,
+            query,
+            self.sampler,
+            self.level_head,
+        )
+        if private_rfl_buffer_inference:
+            relation = _prepare_ray_feature_relation(relation)
+            return self.rosa._forward_compact_lean_inference(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage=observation_usage,
+            )
+        if released_relation_surface and not relation_hooks_active:
+            return self.rosa(
+                features,
+                geometry,
+                relation,
+                valid,
+                query,
+                observation_usage=observation_usage,
+            )
+        return self.rosa(features, geometry, relation, valid, query)
+
+    def _observe(
+        self,
+        anchor: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metadata: dict,
+        keypoint_generator: KeypointGenerator,
+        observation_usage: str = "full",
+    ) -> ObservationEncoding:
+        observation_anchor = (
+            anchor
+            if self.cfg.architecture_profile == "legacy"
+            else _normalized_geometry_yaw(anchor)
+        )
+        with torch.no_grad():
+            keypoints = keypoint_generator(observation_anchor, query)
+        return self._encode(
+            observation_anchor,
+            keypoints.detach(),
+            query,
+            fpn,
+            metadata,
+            observation_usage,
+        )
+
+    def _candidate_offsets(
+        self,
+        current_range: Tensor,
+        distribution_mean: Tensor,
+        distribution_std: Tensor,
+        sigma_points: Tensor,
+        fixed_metric: bool,
+    ) -> Tensor:
+        config = self.cfg
+        if fixed_metric:
+            candidate_range = (
+                current_range[..., None] + config.radial_step_m * sigma_points
+            )
+        else:
+            log_ratio = (
+                distribution_mean[..., None]
+                + distribution_std[..., None] * sigma_points
+            )
+            candidate_range = current_range[..., None] * log_ratio.exp()
+        candidate_range = candidate_range.clamp(
+            min=config.min_candidate_range_m,
+            max=config.max_candidate_range_m,
+        )
+        return candidate_range - current_range[..., None]
+
+    def _posterior_radial_proposal(
+        self,
+        candidates: _CandidateEvidence,
+        current_range: Tensor,
+        distribution_mean: Tensor,
+        distribution_std: Tensor,
+        sigma_points: Tensor,
+        fixed_metric: bool,
+        step: int,
+    ) -> Tensor:
+        """Decode a posterior correction with an exact zero uniform prior."""
+
+        if step > 0:
+            proposal_range = (current_range * distribution_mean.exp()).clamp(
+                min=self.cfg.min_candidate_range_m,
+                max=self.cfg.max_candidate_range_m,
+            )
+            return proposal_range - current_range
+        support = candidates.supported.to(candidates.probabilities.dtype)
+        support_prior = support / support.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        support_prior = torch.where(
+            candidates.supported.any(dim=-1, keepdim=True),
+            support_prior,
+            torch.full_like(
+                support_prior,
+                1.0 / candidates.probabilities.shape[-1],
+            ),
+        )
+        posterior_residual = candidates.probabilities - support_prior
+        if fixed_metric:
+            return (posterior_residual * candidates.offsets).sum(dim=-1)
+
+        expected_sigma = (posterior_residual * sigma_points[None, None, :]).sum(dim=-1)
+        posterior_log_ratio = distribution_mean + distribution_std * expected_sigma
+        proposal_range = (current_range * posterior_log_ratio.exp()).clamp(
+            min=self.cfg.min_candidate_range_m,
+            max=self.cfg.max_candidate_range_m,
+        )
+        return proposal_range - current_range
+
+    def _search_candidates(
+        self,
+        feature: Tensor,
+        tangent_anchor: Tensor,
+        radial: Tensor,
+        offsets: Tensor,
+        current_range: Tensor,
+        sigma_points: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metadata: dict,
+        keypoint_generator: KeypointGenerator,
+        observation_usage: str,
+    ) -> _CandidateEvidence:
+        candidate_count = int(offsets.shape[-1])
+        if self.cfg.architecture_profile == "legacy":
+            candidate_features = []
+            candidate_consistency = []
+            candidate_supported = []
+            for index in range(candidate_count):
+                candidate_anchor = _compose_center(
+                    tangent_anchor,
+                    radial * offsets[..., index, None],
+                )
+                geometry_anchor = (
+                    candidate_anchor.detach()
+                    if self.cfg.detach_candidate_geometry
+                    else candidate_anchor
+                )
+                observation = self._observe(
+                    geometry_anchor,
+                    query,
+                    fpn,
+                    metadata,
+                    keypoint_generator,
+                    observation_usage,
+                )
+                candidate_features.append(observation.object_feature)
+                candidate_consistency.append(observation.cross_camera_consistency)
+                candidate_supported.append(observation.supported)
+
+            candidates = torch.stack(candidate_features, dim=2)
+            consistency = torch.stack(candidate_consistency, dim=2)
+            support = torch.stack(candidate_supported, dim=2)
+        else:
+            batch, queries, box_dims = tangent_anchor.shape
+            feature_dims = query.shape[-1]
+            expanded_anchor = tangent_anchor[:, :, None, :].expand(
+                -1, -1, candidate_count, -1
+            )
+            candidate_anchor = _compose_center(
+                expanded_anchor.reshape(
+                    batch,
+                    queries * candidate_count,
+                    box_dims,
+                ),
+                (radial[:, :, None, :] * offsets[..., None]).reshape(
+                    batch, queries * candidate_count, 2
+                ),
+            )
+            expanded_query = query[:, :, None, :].expand(-1, -1, candidate_count, -1)
+            geometry_anchor = (
+                candidate_anchor.detach()
+                if self.cfg.detach_candidate_geometry
+                else candidate_anchor
+            )
+            observation = self._observe(
+                geometry_anchor,
+                expanded_query.reshape(
+                    batch,
+                    queries * candidate_count,
+                    feature_dims,
+                ),
+                fpn,
+                metadata,
+                keypoint_generator,
+                observation_usage,
+            )
+            candidates = observation.object_feature.reshape(
+                batch,
+                queries,
+                candidate_count,
+                -1,
+            )
+            if observation.cross_camera_consistency is None:
+                raise RuntimeError("candidate observation omitted consistency")
+            consistency = observation.cross_camera_consistency.reshape(
+                batch,
+                queries,
+                candidate_count,
+            )
+            support = observation.supported.reshape(
+                batch,
+                queries,
+                candidate_count,
+            )
+        standardized = sigma_points[None, None, :, None].expand(
+            feature.shape[0],
+            feature.shape[1],
+            -1,
+            -1,
+        )
+        relative_offset = (offsets / current_range[..., None].clamp_min(1e-3))[
+            ..., None
+        ]
+        candidate_input = torch.cat(
+            (
+                feature[:, :, None].expand_as(candidates),
+                candidates,
+                consistency[..., None],
+                support[..., None].to(candidates.dtype),
+                standardized,
+                relative_offset,
+            ),
+            dim=-1,
+        )
+        logits = self.candidate_head(candidate_input).squeeze(-1)
+        probabilities = masked_softmax(logits, support, dim=2)
+        any_candidate = support.any(dim=2)
+        probabilities = torch.where(
+            any_candidate[..., None],
+            probabilities,
+            torch.full_like(
+                probabilities,
+                1.0 / candidate_count,
+            ),
+        )
+        radial_delta = (probabilities * offsets).sum(dim=-1)
+        entropy, margin = _candidate_confidence(
+            probabilities,
+            support,
+            legacy=self.cfg.architecture_profile == "legacy",
+        )
+        weighted_feature = (probabilities[..., None] * candidates).sum(dim=2)
+        return _CandidateEvidence(
+            features=candidates,
+            supported=support,
+            logits=logits,
+            probabilities=probabilities,
+            offsets=offsets,
+            radial_delta=radial_delta,
+            entropy=entropy,
+            margin=margin,
+            weighted_feature=weighted_feature,
+        )
+
+    def _direct_second_pass(
+        self,
+        feature: Tensor,
+        supported: Tensor,
+        offsets: Tensor,
+        current_range: Tensor,
+        distribution_mean: Tensor,
+    ) -> _CandidateEvidence:
+        count = int(offsets.shape[-1])
+        candidates = feature[:, :, None].expand(-1, -1, count, -1)
+        support = supported[..., None].expand(-1, -1, count)
+        direct_range = (current_range * distribution_mean.exp()).clamp(
+            min=self.cfg.min_candidate_range_m,
+            max=self.cfg.max_candidate_range_m,
+        )
+        radial_delta = direct_range - current_range
+        return _CandidateEvidence(
+            features=candidates,
+            supported=support,
+            logits=torch.zeros_like(offsets),
+            probabilities=torch.full_like(offsets, 1.0 / count),
+            offsets=offsets,
+            radial_delta=radial_delta,
+            entropy=(
+                torch.zeros_like(radial_delta)
+                if self.cfg.architecture_profile == "legacy"
+                else supported.to(radial_delta.dtype)
+            ),
+            margin=torch.zeros_like(radial_delta),
+            weighted_feature=feature,
+        )
+
+    def _refine_once(
+        self,
+        current: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metadata: dict,
+        keypoint_generator: KeypointGenerator,
+        step: int,
+        sigma_points: Tensor,
+        materialize_diagnostics: bool,
+    ) -> _RefinementStep:
+        config = self.cfg
+        geometry_base = current.detach()
+        composition_base = (
+            current if config.architecture_profile == "legacy" else geometry_base
+        )
+        lean_observation = bool(
+            not materialize_diagnostics
+            and not self.training
+            and not torch.is_grad_enabled()
+            and config.yaw_gate_mode != "anisotropy_gap"
+        )
+        observation = self._observe(
+            geometry_base,
+            query,
+            fpn,
+            metadata,
+            keypoint_generator,
+            "base_support" if lean_observation else "full",
+        )
+        feature = observation.object_feature
+        shared = feature + self.refinement_trunk(feature)
+
+        raw_shape = self.shared_shape_head(shared)
+        size_limit = (
+            config.max_log_size_delta if step == 0 else config.max_second_log_size_delta
+        )
+        yaw_limit = (
+            config.max_yaw_delta_rad if step == 0 else config.max_second_yaw_delta_rad
+        )
+        if config.enable_shape_refinement:
+            size_delta = raw_shape[..., :3].tanh() * size_limit
+        else:
+            # Preserve a zero-valued graph edge so controlled ablations remain
+            # compatible with DDP ``find_unused_parameters=False``.
+            size_delta = raw_shape[..., :3] * 0.0
+        if config.mask_unsupported_updates:
+            size_delta = torch.where(
+                observation.supported[..., None],
+                size_delta,
+                torch.zeros_like(size_delta),
+            )
+
+        legacy_yaw = config.yaw_update_mode == "legacy_shared"
+        yaw_enabled = (
+            config.enable_shape_refinement
+            and config.yaw_update_steps != "off"
+            and (step == 0 or config.yaw_update_steps == "both")
+        )
+        if legacy_yaw and yaw_enabled:
+            yaw_raw_delta = raw_shape[..., 3:4].tanh() * yaw_limit
+            yaw_gate = torch.ones_like(yaw_raw_delta)
+            yaw_gate_logit = torch.zeros_like(yaw_raw_delta)
+            if config.mask_unsupported_updates:
+                yaw_raw_delta = torch.where(
+                    observation.supported[..., None],
+                    yaw_raw_delta,
+                    torch.zeros_like(yaw_raw_delta),
+                )
+                yaw_gate = torch.where(
+                    observation.supported[..., None],
+                    yaw_gate,
+                    torch.zeros_like(yaw_gate),
+                )
+            yaw_delta = yaw_raw_delta
+            shape_anchor = _compose_shape(
+                composition_base,
+                size_delta,
+                yaw_delta,
+            )
+        else:
+            yaw_raw_delta = raw_shape[..., 3:4] * 0.0
+            yaw_gate = torch.zeros_like(yaw_raw_delta)
+            yaw_gate_logit = torch.zeros_like(yaw_raw_delta)
+            yaw_delta = torch.zeros_like(yaw_raw_delta)
+            shape_anchor = _compose_size(composition_base, size_delta)
+
+        # Corrected profiles optimize each pass from a detached box. Published
+        # training intentionally retains its historical step-2 gradient path.
+        tangent_base = (
+            current if config.architecture_profile == "legacy" else geometry_base
+        )
+        radial, tangent = _radial_basis(tangent_base[..., :2])
+        tangent_raw = self.shared_tangent_head(shared).squeeze(-1)
+        tangent_delta = (
+            tangent_raw.tanh() * config.max_tangent_delta_m
+            if config.enable_tangent
+            else tangent_raw * 0.0
+        )
+        if config.mask_unsupported_updates:
+            tangent_delta = torch.where(
+                observation.supported,
+                tangent_delta,
+                torch.zeros_like(tangent_delta),
+            )
+        tangent_anchor = _compose_center(
+            shape_anchor,
+            tangent * tangent_delta[..., None],
+        )
+
+        # Corrected center refinement uses one orthonormal frame for both
+        # components.  Recomputing the radial axis after the tangent update
+        # makes the two axes non-orthogonal and leaves a deterministic XY
+        # residual even when both scalar targets are exact.  The historical
+        # sequential frame remains available for old checkpoint reproduction.
+        fixed_base_center = config.center_target_mode == "fixed_base"
+        if not fixed_base_center:
+            radial, _ = _radial_basis(tangent_anchor[..., :2])
+
+        distribution = self.range_distribution_head(shared)
+        distribution_mean = distribution[..., 0]
+        distribution_std = (
+            config.min_log_range_std + F.softplus(distribution[..., 1])
+        ).clamp(max=config.max_log_range_std)
+        range_anchor = tangent_base if fixed_base_center else tangent_anchor
+        current_range = torch.linalg.vector_norm(
+            range_anchor[..., :2], dim=-1
+        ).clamp_min(config.min_candidate_range_m)
+        offsets = self._candidate_offsets(
+            current_range,
+            distribution_mean,
+            distribution_std,
+            sigma_points,
+            fixed_metric=(step == 0 and config.fixed_metric_radial_hypotheses),
+        )
+        if step == 0:
+            candidates = self._search_candidates(
+                feature,
+                tangent_anchor,
+                radial,
+                offsets,
+                current_range,
+                sigma_points,
+                query,
+                fpn,
+                metadata,
+                keypoint_generator,
+                "candidate" if lean_observation else "full",
+            )
+        else:
+            candidates = self._direct_second_pass(
+                feature,
+                observation.supported,
+                offsets,
+                current_range,
+                distribution_mean,
+            )
+
+        if config.center_update_mode == "legacy_candidate_gate":
+            radial_proposal = candidates.radial_delta
+        else:
+            radial_proposal = self._posterior_radial_proposal(
+                candidates,
+                current_range,
+                distribution_mean,
+                distribution_std,
+                sigma_points,
+                fixed_metric=(step == 0 and config.fixed_metric_radial_hypotheses),
+                step=step,
+            )
+
+        # The corrected gate observes the same proposal that it controls and
+        # that the loss supervises.  Keep the historical scalar for explicit
+        # sequential-mode checkpoint reproduction.
+        gate_proposal_feature = (
+            radial_proposal if fixed_base_center else candidates.radial_delta
+        )
+        scalar_feedback = [
+            gate_proposal_feature,
+            candidates.entropy,
+            candidates.margin,
+            distribution_std,
+        ]
+        if config.architecture_profile != "legacy":
+            scalar_feedback.extend(
+                (
+                    candidates.supported.to(feature.dtype).mean(dim=-1),
+                    candidates.supported[..., candidates.supported.shape[-1] // 2].to(
+                        feature.dtype
+                    ),
+                    torch.full_like(
+                        candidates.radial_delta,
+                        1.0 if step == 0 else 0.0,
+                    ),
+                )
+            )
+        feedback = torch.cat(
+            (
+                feature,
+                candidates.weighted_feature,
+                torch.stack(tuple(scalar_feedback), dim=-1),
+            ),
+            dim=-1,
+        )
+        if lean_observation:
+            reliability_context = feature.new_zeros(feature.shape[:2] + (6,))
+        else:
+            reliability_context = _observation_reliability_context(observation)
+        radial_supported = observation.supported & candidates.supported.any(dim=2)
+        if config.center_update_mode == "legacy_candidate_gate":
+            radial_gate_logit = self.center_gate_head(feedback).squeeze(-1)
+            radial_gate = (2.0 * torch.sigmoid(radial_gate_logit) - 1.0).clamp(0.0, 1.0)
+        else:
+            radial_gate_logit = self.center_gate_head(feedback).squeeze(-1)
+            radial_gate = torch.sigmoid(radial_gate_logit)
+
+        if config.mask_unsupported_updates:
+            radial_proposal = torch.where(
+                radial_supported,
+                radial_proposal,
+                torch.zeros_like(radial_proposal),
+            )
+            radial_gate = torch.where(
+                radial_supported,
+                radial_gate,
+                torch.zeros_like(radial_gate),
+            )
+        if config.force_radial_gate_one:
+            radial_gate = (
+                radial_supported.to(radial_gate.dtype)
+                if config.mask_unsupported_updates
+                else torch.ones_like(radial_gate)
+            ) + 0.0 * radial_gate
+        radial_safe = (
+            radial_gate * radial_proposal
+            if config.enable_radial
+            else radial_gate * radial_proposal * 0.0
+        )
+        center_anchor = _compose_center(
+            tangent_anchor,
+            radial * radial_safe[..., None],
+        )
+
+        if not legacy_yaw and yaw_enabled:
+            yaw_raw_delta = raw_shape[..., 3:4].tanh() * yaw_limit
+            yaw_gate_logit = torch.zeros_like(yaw_raw_delta)
+            yaw_gate = _yaw_reliability_gate(
+                reliability_context,
+                observation.supported,
+                config,
+            )
+            if config.mask_unsupported_updates:
+                support = observation.supported[..., None]
+                yaw_raw_delta = torch.where(
+                    support, yaw_raw_delta, torch.zeros_like(yaw_raw_delta)
+                )
+                yaw_gate = torch.where(support, yaw_gate, torch.zeros_like(yaw_gate))
+            yaw_delta = yaw_gate * yaw_raw_delta
+            shape_anchor = _compose_yaw(shape_anchor, yaw_delta)
+        updated = (
+            center_anchor if legacy_yaw else _compose_yaw(center_anchor, yaw_delta)
+        )
+        return _RefinementStep(
+            base_anchor=geometry_base,
+            anchor=updated,
+            shape_anchor=shape_anchor,
+            shape_size_delta=size_delta,
+            shape_yaw_delta=yaw_delta,
+            distribution_mean=distribution_mean,
+            distribution_std=distribution_std,
+            candidates=candidates,
+            radial_proposal=radial_proposal,
+            radial_gate=radial_gate,
+            radial_gate_logit=radial_gate_logit,
+            radial_safe=radial_safe,
+            tangent_delta=tangent_delta,
+            yaw_raw_delta=yaw_raw_delta,
+            yaw_gate=yaw_gate,
+            yaw_gate_logit=yaw_gate_logit,
+            feedback=feedback,
+            reliability_context=reliability_context,
+            observation=observation,
+        )
+
+    def _fast_anchor_core(
+        self,
+        base: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metadata: dict,
+        keypoint_generator: KeypointGenerator,
+    ) -> Tensor:
+        """Return the fast profile's refined anchor through one pure boundary."""
+
+        sigma_points = base.new_tensor(_COMPACT_SIGMA_POINTS)
+        return self._refine_once(
+            base,
+            query,
+            fpn,
+            metadata,
+            keypoint_generator,
+            0,
+            sigma_points,
+            False,
+        ).anchor
+
+    def compile_fast_anchor(
+        self,
+        *,
+        mode: str = "max-autotune-no-cudagraphs",
+        fullgraph: bool = True,
+    ) -> None:
+        """Compile only the sealed one-step, anchor-only inference graph.
+
+        This deliberately does not call :meth:`nn.Module.compile`.  In the
+        Sparse4D integration, class/quality scores and their ranking are
+        computed outside this module and must remain on the original eager
+        path.  The method is an explicit deployment action performed only
+        after checkpoint loading; training never enables it implicitly.
+        """
+
+        if (
+            self.cfg.architecture_profile != "compact"
+            or self.cfg.num_refinement_steps != 1
+            or self.cfg.enable_quality_score
+            or self.quality_head is not None
+        ):
+            raise RuntimeError(
+                "fast-anchor compilation requires one-step compact inference "
+                "without a quality head"
+            )
+        if self.training:
+            raise RuntimeError("fast-anchor compilation requires eval mode")
+        if self._compiled_fast_anchor_impl is not None:
+            return
+        self._compiled_fast_anchor_impl = torch.compile(
+            self._fast_anchor_core,
+            mode=mode,
+            fullgraph=fullgraph,
+        )
+
+    def _compiled_fast_anchor_is_usable(
+        self,
+        keypoint_generator: KeypointGenerator,
+    ) -> bool:
+        """Keep dynamic PyTorch hook semantics outside the compiled core."""
+
+        if self._compiled_fast_anchor_impl is None:
+            return False
+        modules = tuple(self.modules())
+        if isinstance(keypoint_generator, nn.Module):
+            modules = (*modules, *tuple(keypoint_generator.modules()))
+        return not bool(
+            any(
+                module._forward_pre_hooks
+                or module._forward_hooks
+                or module._backward_pre_hooks
+                or module._backward_hooks
+                for module in modules
+            )
+            or torch.nn.modules.module._global_forward_pre_hooks
+            or torch.nn.modules.module._global_forward_hooks
+            or torch.nn.modules.module._global_backward_pre_hooks
+            or torch.nn.modules.module._global_backward_hooks
+        )
+
+    def forward(
+        self,
+        baseline_anchor: Tensor,
+        query: Tensor,
+        fpn: Sequence[Tensor],
+        metas: dict,
+        keypoint_generator: KeypointGenerator,
+        *,
+        materialize_diagnostics: bool = True,
+        return_final_anchor_only: bool = False,
+    ) -> ROSAOutput | Tensor:
+        if not isinstance(materialize_diagnostics, bool):
+            raise TypeError("materialize_diagnostics must be a bool")
+        if not isinstance(return_final_anchor_only, bool):
+            raise TypeError("return_final_anchor_only must be a bool")
+        if return_final_anchor_only and materialize_diagnostics:
+            raise ValueError(
+                "final-anchor-only inference cannot materialize diagnostics"
+            )
+        if return_final_anchor_only and (
+            self.training
+            or torch.is_grad_enabled()
+            or self.cfg.architecture_profile != "compact"
+            or self.cfg.enable_quality_score
+            or self.quality_head is not None
+        ):
+            raise RuntimeError(
+                "final-anchor-only output requires compact no-grad eval with "
+                "no quality head"
+            )
+        base = baseline_anchor.detach()
+        query_sidecar = query.detach()
+        if return_final_anchor_only and self.cfg.num_refinement_steps == 1:
+            anchor_impl = (
+                self._compiled_fast_anchor_impl
+                if self._compiled_fast_anchor_is_usable(keypoint_generator)
+                else self._fast_anchor_core
+            )
+            return anchor_impl(
+                base,
+                query_sidecar,
+                fpn,
+                metas,
+                keypoint_generator,
+            )
+        sigma_points = base.new_tensor(
+            _LEGACY_SIGMA_POINTS
+            if self.cfg.architecture_profile == "legacy"
+            else _COMPACT_SIGMA_POINTS
+        )
+
+        steps: list[_RefinementStep] = []
+        current = base
+        for step_index in range(self.cfg.num_refinement_steps):
+            step = self._refine_once(
+                current,
+                query_sidecar,
+                fpn,
+                metas,
+                keypoint_generator,
+                step_index,
+                sigma_points,
+                materialize_diagnostics,
+            )
+            steps.append(step)
+            current = step.anchor
+
+        # The compact production path ranks detections with the untouched
+        # native score and consumes only the refined anchor.  Return before
+        # rebuilding analysis-only total deltas, zero quality tensors, and
+        # the large ROSAOutput carrier.  Training and public analysis calls
+        # retain the complete historical return contract above this explicit
+        # opt-in boundary.
+        if return_final_anchor_only:
+            return current
+
+        first = steps[0]
+        final = steps[-1]
+        base_radial, base_tangent = _radial_basis(base[..., :2])
+        center_delta = current[..., :2] - base[..., :2]
+        total_radial = (center_delta * base_radial).sum(dim=-1)
+        total_tangent = (center_delta * base_tangent).sum(dim=-1)
+
+        quality_feedback = (
+            final.feedback
+            if self.cfg.architecture_profile == "legacy"
+            else final.feedback.detach()
+        )
+        if self.quality_head is None:
+            # Compact profiles without score refinement have no quality
+            # parameters or loss edge.  Materialize their exact-zero public
+            # result once instead of running multiply/where zero kernels.
+            quality_delta = torch.zeros_like(final.feedback[..., :1])
+        else:
+            quality_raw = self.quality_head(quality_feedback).tanh()
+            if self.cfg.enable_quality_score:
+                quality_delta = self.cfg.max_quality_delta_logit * quality_raw
+                if self.cfg.architecture_profile == "legacy":
+                    quality_delta = (
+                        quality_delta * final.radial_gate.detach()[..., None]
+                    )
+            else:
+                quality_delta = quality_raw * 0.0
+            quality_delta = torch.where(
+                final.candidates.supported.any(dim=2)[..., None],
+                quality_delta,
+                torch.zeros_like(quality_delta),
+            )
+        if len(steps) == 2:
+            second_size = final.shape_size_delta
+            second_yaw = final.shape_yaw_delta
+        else:
+            second_size = torch.zeros_like(first.shape_size_delta)
+            second_yaw = torch.zeros_like(first.shape_yaw_delta)
+
+        def diagnostic_stack(values) -> Tensor | None:
+            if not materialize_diagnostics:
+                return None
+            return torch.stack(tuple(values), dim=2)
+
+        return ROSAOutput(
+            final_anchor=current,
+            shape1_anchor=first.shape_anchor,
+            candidate_probabilities=final.candidates.probabilities,
+            candidate_logits=final.candidates.logits,
+            candidate_features=final.candidates.features,
+            candidate_supported=final.candidates.supported,
+            radial_raw=total_radial,
+            radial_gate=final.radial_gate,
+            radial_safe=total_radial,
+            tangent_delta=total_tangent,
+            shape1_size_delta=first.shape_size_delta,
+            shape1_yaw_delta=first.shape_yaw_delta,
+            shape2_size_delta=second_size,
+            shape2_yaw_delta=second_yaw,
+            quality_delta=quality_delta,
+            initial_supported=first.observation.supported,
+            posterior_entropy=first.candidates.entropy,
+            posterior_margin=first.candidates.margin,
+            searched_candidate_probabilities=first.candidates.probabilities,
+            searched_candidate_logits=first.candidates.logits,
+            searched_candidate_supported=first.candidates.supported,
+            total_radial_delta=total_radial,
+            total_tangent_delta=total_tangent,
+            distribution_mean=final.distribution_mean,
+            distribution_std=final.distribution_std,
+            candidate_offsets=final.candidates.offsets,
+            iteration_base_anchors=diagnostic_stack(step.base_anchor for step in steps),
+            iteration_anchors=diagnostic_stack(step.anchor for step in steps),
+            iteration_distribution_mean=diagnostic_stack(
+                step.distribution_mean for step in steps
+            ),
+            iteration_distribution_std=diagnostic_stack(
+                step.distribution_std for step in steps
+            ),
+            iteration_candidate_offsets=diagnostic_stack(
+                step.candidates.offsets for step in steps
+            ),
+            iteration_candidate_probabilities=diagnostic_stack(
+                step.candidates.probabilities for step in steps
+            ),
+            iteration_candidate_supported=diagnostic_stack(
+                step.candidates.supported for step in steps
+            ),
+            iteration_observation_supported=diagnostic_stack(
+                step.observation.supported for step in steps
+            ),
+            iteration_radial_proposal=diagnostic_stack(
+                step.radial_proposal for step in steps
+            ),
+            iteration_radial_gate=diagnostic_stack(step.radial_gate for step in steps),
+            iteration_radial_gate_logit=diagnostic_stack(
+                step.radial_gate_logit for step in steps
+            ),
+            iteration_radial_safe=diagnostic_stack(step.radial_safe for step in steps),
+            iteration_tangent_delta=diagnostic_stack(
+                step.tangent_delta for step in steps
+            ),
+            iteration_yaw_raw_delta=diagnostic_stack(
+                step.yaw_raw_delta for step in steps
+            ),
+            iteration_yaw_gate=diagnostic_stack(step.yaw_gate for step in steps),
+            iteration_yaw_gate_logit=diagnostic_stack(
+                step.yaw_gate_logit for step in steps
+            ),
+            iteration_yaw_delta=diagnostic_stack(
+                step.shape_yaw_delta for step in steps
+            ),
+            iteration_reliability_context=diagnostic_stack(
+                step.reliability_context for step in steps
+            ),
+            iteration_camera_weight_mean=diagnostic_stack(
+                step.observation.camera_weight_mean.detach() for step in steps
+            ),
+            iteration_camera_geometry_summary=diagnostic_stack(
+                step.observation.camera_geometry_summary.detach() for step in steps
+            ),
+        )
+
+
+# Capture the released call surface in the defining module.  Importers can
+# therefore detect a class-level forward override even when it happened before
+# the optional Sparse4D integration itself was imported.
+_RELEASED_ROSA_REFINER_FORWARD = ROSARefiner.forward
+
+ClosedLoopROSAConfig = ROSAConfig
+ClosedLoopROSAStage = ROSARefiner
+ClosedLoopROSAOutput = ROSAOutput
+
+__all__ = [
+    "ObservationEncoding",
+    "PointwiseROSA",
+    "ROSAConfig",
+    "ROSAOutput",
+    "ROSARefiner",
+]
