@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Datasets and external checkouts are fetched, never committed
+data/
+external/
+
+# Checkpoints ship on the Releases page, not in the tree
+weights/
+*.pth
+*.ckpt
+
+# Training output
+work_dirs/
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

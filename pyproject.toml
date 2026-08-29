@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rosa"
+version = "1.0.0"
+description = "Ray-aware Observation Selection and Aggregation for surround-view fisheye 3D detection"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.setuptools.packages.find]
+include = ["rosa*"]
