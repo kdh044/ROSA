@@ -188,22 +188,7 @@ that repository yourself and follow whatever terms its authors set.
 
 ## Acknowledgement
 
-We thank these works and open-source codebases:
-
-* **Framework.** [MMDetection3D](https://github.com/open-mmlab/mmdetection3d),
-  [MMEngine](https://github.com/open-mmlab/mmengine).
-* **Base detector.** [Sparse4D](https://github.com/HorizonRobotics/Sparse4D) —
-  ROSA replaces only its image-feature aggregation.
-* **Fisheye 3D detection.**
-  [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD) for the benchmark,
-  evaluator, VoVNet-99 backbone and the FisheyePETR / FisheyeBEVDet baselines;
-  DAPETR for the mixed pinhole–fisheye protocol this work follows on KITTI-360.
-* **Compared detectors.** [DETR3D](https://github.com/WangYueFt/detr3d),
-  [PETR](https://github.com/megvii-research/PETR),
-  [SparseBEV](https://github.com/MCG-NJU/SparseBEV),
-  [StreamPETR](https://github.com/exiawsh/StreamPETR), Graph-DETR3D, SRCN3D.
-* **Data.** [KITTI-360](https://www.cvlibs.net/datasets/kitti-360/) for the
-  real-world recordings; [CARLA](https://carla.org/), which Fisheye3DOD is
-  simulated in.
-* **Direction encoding.** The spherical-harmonic formulation follows NeRF,
-  PlenOctrees, Plenoxels and Instant-NGP.
+ROSA is built on [Sparse4D](https://github.com/HorizonRobotics/Sparse4D) and
+evaluated with the [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD)
+benchmark. The KITTI-360 arm uses the FishBEVOD VoVNet-99 backbone released
+with Fisheye3DOD. We thank the authors of both projects.
