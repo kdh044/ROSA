@@ -28,15 +28,15 @@ data/Fisheye3DOD/
 └── ...
 ```
 
-We use the **Main126** split: 126 scenes, 3,906 validation frames, objects
-scored within 48 m. If your dataset is elsewhere:
+We evaluate on 3,906 validation frames from 126 scenes, scoring objects
+within 48 m. If your dataset is elsewhere:
 
 ```bash
 export ROSA_DATA_ROOT=/path/to/Fisheye3DOD
 ```
 
 The anchor file shipped in `assets/` is the 300-cluster k-means anchor set fit
-on the Main126 training split with seed 3407. It is what the released config
+on the training split with seed 3407. It is what the released config
 uses; regenerating it is unnecessary.
 
 ## KITTI-360
