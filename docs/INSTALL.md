@@ -61,7 +61,36 @@ export PYTHONPATH=$PWD:$FISHEYE3DOD_OFFICIAL_ROOT:$PYTHONPATH
 `external/` is the default location, so if you clone there the environment
 variable is optional.
 
-## 4. Verify
+## 4. Fused CUDA kernels (required)
+
+The released configs enable the fused observation path
+(`streaming_camera_rfl_cuda`, `use_fused_daf`), which the reported runtimes
+were measured with. Those kernels extend the Sparse4D deformable-aggregation
+extension and are **not** built automatically — without them the model raises
+`RuntimeError: fused V3 sampling requires the Sparse4D CUDA host` on the first
+forward pass. Copy them into the host checkout and build:
+
+```bash
+cp -r ops/* $FISHEYE3DOD_OFFICIAL_ROOT/projects/mmdet3d_plugin/ops/
+cd $FISHEYE3DOD_OFFICIAL_ROOT/projects/mmdet3d_plugin/ops
+python setup.py develop
+```
+
+This needs `nvcc` and a PyTorch built against the same CUDA version; the build
+takes a few minutes. Check it with:
+
+```bash
+python -c "
+from projects.mmdet3d_plugin.ops import v49_point_attention_inference
+print('fused kernels OK')
+"
+```
+
+To skip the build, set `streaming_camera_rfl_cuda=False` and
+`use_fused_daf=False` in the config. The PyTorch path is slower but scores the
+same 0.6143 mAP / 0.6647 FDS. See `ops/README.md`.
+
+## 5. Verify
 
 ```bash
 python -c "
@@ -79,11 +108,3 @@ from rosa.integrations.kitti360 import dataset, metric, backbone
 print('KITTI-360 import OK')
 "
 ```
-
-## Notes on the fast path
-
-The released configuration enables the fused CUDA observation kernels that the
-reported runtimes were measured with. They are plain PyTorch extensions built
-at first use; no manual compilation step is required. If your GPU or driver
-cannot build them, the model falls back to the reference implementation with
-identical outputs and lower throughput.

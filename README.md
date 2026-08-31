@@ -33,8 +33,8 @@ git clone https://github.com/weiyangdaren/Fisheye3DOD external/fisheye3dod
 export FISHEYE3DOD_OFFICIAL_ROOT=$PWD/external/fisheye3dod
 export PYTHONPATH=$PWD:$FISHEYE3DOD_OFFICIAL_ROOT:$PYTHONPATH
 
-# the released configs run the fused observation path, which needs these
-# kernels built into that host -- see ops/README.md
+# required: the released configs run the fused observation path, whose kernels
+# are not built automatically (see ops/README.md)
 cp -r ops/* $FISHEYE3DOD_OFFICIAL_ROOT/projects/mmdet3d_plugin/ops/
 (cd $FISHEYE3DOD_OFFICIAL_ROOT/projects/mmdet3d_plugin/ops && python setup.py develop)
 ```
