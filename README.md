@@ -188,18 +188,22 @@ that repository yourself and follow whatever terms its authors set.
 
 ## Acknowledgement
 
-This work is built on open-source 3D perception codebases, chiefly
-[Sparse4D](https://github.com/HorizonRobotics/Sparse4D), whose decoder ROSA
-extends, together with
-[MMDetection3D](https://github.com/open-mmlab/mmdetection3d),
-[DETR3D](https://github.com/WangYueFt/detr3d),
-[PETR](https://github.com/megvii-research/PETR),
-[SparseBEV](https://github.com/MCG-NJU/SparseBEV) and
-[StreamPETR](https://github.com/exiawsh/StreamPETR).
+We thank these works and open-source codebases:
 
-Evaluation uses the [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD)
-benchmark, simulated in [CARLA](https://carla.org/), and the real-world
-[KITTI-360](https://www.cvlibs.net/datasets/kitti-360/) recordings; the
-mixed pinhole–fisheye protocol follows DAPETR.
-
-We gratefully acknowledge these contributions.
+* **Framework.** [MMDetection3D](https://github.com/open-mmlab/mmdetection3d),
+  [MMEngine](https://github.com/open-mmlab/mmengine).
+* **Base detector.** [Sparse4D](https://github.com/HorizonRobotics/Sparse4D) —
+  ROSA replaces only its image-feature aggregation.
+* **Fisheye 3D detection.**
+  [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD) for the benchmark,
+  evaluator, VoVNet-99 backbone and the FisheyePETR / FisheyeBEVDet baselines;
+  DAPETR for the mixed pinhole–fisheye protocol this work follows on KITTI-360.
+* **Compared detectors.** [DETR3D](https://github.com/WangYueFt/detr3d),
+  [PETR](https://github.com/megvii-research/PETR),
+  [SparseBEV](https://github.com/MCG-NJU/SparseBEV),
+  [StreamPETR](https://github.com/exiawsh/StreamPETR), Graph-DETR3D, SRCN3D.
+* **Data.** [KITTI-360](https://www.cvlibs.net/datasets/kitti-360/) for the
+  real-world recordings; [CARLA](https://carla.org/), which Fisheye3DOD is
+  simulated in.
+* **Direction encoding.** The spherical-harmonic formulation follows NeRF,
+  PlenOctrees, Plenoxels and Instant-NGP.
