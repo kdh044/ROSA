@@ -168,7 +168,7 @@ Submitted to WACV 2027; under review. This entry will be updated if it is
 accepted.
 
 ```bibtex
-@unpublished{rosa2026,
+@unpublished{ROSA,
   title  = {ROSA: Ray-aware Observation Selection and Aggregation for
             Surround-View Fisheye 3D Detection},
   author = {Kim, DongHun and Lee, Sang Jun and Jo, HyungGi},
