@@ -188,7 +188,36 @@ that repository yourself and follow whatever terms its authors set.
 
 ## Acknowledgement
 
-ROSA is built on [Sparse4D](https://github.com/HorizonRobotics/Sparse4D) and
-evaluated with the [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD)
-benchmark. The KITTI-360 arm uses the FishBEVOD VoVNet-99 backbone released
-with Fisheye3DOD. We thank the authors of both projects.
+ROSA stands on a lot of released work.
+
+**Base detector.** The decoder, anchor formulation and sampling scheme come
+from [Sparse4D](https://github.com/HorizonRobotics/Sparse4D) (Lin et al.,
+*Sparse4D: Multi-view 3D Object Detection with Sparse Spatial-Temporal
+Fusion*, and *Sparse4D v2*). ROSA replaces its image-feature aggregation and
+leaves the rest intact.
+
+**Benchmark and fisheye baselines.** The Fisheye3DOD benchmark, its evaluator,
+its FishBEVOD VoVNet-99 backbone, and the FisheyePETR / FisheyeBEVDet
+baselines are from Yan et al., *Exploring Surround-View Fisheye Camera 3D
+Object Detection* (AAAI 2026), released at
+[weiyangdaren/Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD). This
+work would not have been possible without that release.
+
+**Closest prior work.** DAPETR — Liu, *Distortion-aware PETR for BEV object
+detection with mixed pinhole–fisheye cameras* (ICRA 2026) — and its
+mixed-camera benchmarking protocol shaped how the KITTI-360 arm is set up.
+
+**Dataset.** [KITTI-360](https://www.cvlibs.net/datasets/kitti-360/) (Liao et
+al., TPAMI 2023) provides the real-world recordings and the calibration for
+its two perspective and two MEI fisheye cameras.
+
+**Compared detectors.** PETR and PETRv2, DETR3D, Graph-DETR3D, SparseBEV,
+SRCN3D and StreamPETR were all retrained here from their public
+implementations; the comparison in the paper exists only because their authors
+released working code.
+
+**Also drawn on.** The spherical-harmonic direction encoding follows the
+practice established by NeRF, PlenOctrees, Plenoxels and Instant-NGP, and the
+simulation behind Fisheye3DOD is built in [CARLA](https://carla.org/).
+
+We thank all of these authors.
