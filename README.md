@@ -164,15 +164,16 @@ outside either rectified camera's field of view.
 
 ## Citation
 
-The paper is under review; this entry will be updated once it appears.
+Submitted to WACV 2027; under review. This entry will be updated if it is
+accepted.
 
 ```bibtex
-@misc{kim2026rosa,
+@unpublished{rosa2026,
   title  = {ROSA: Ray-aware Observation Selection and Aggregation for
             Surround-View Fisheye 3D Detection},
   author = {Kim, DongHun and Lee, Sang Jun and Jo, HyungGi},
   year   = {2026},
-  note   = {Under review}
+  note   = {Submitted to WACV 2027}
 }
 ```
 
