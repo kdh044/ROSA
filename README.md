@@ -1,6 +1,8 @@
-# ROSA: Ray-aware Observation Selection and Aggregation for Surround-View Fisheye 3D Detection
+# ROSA
 
-Official implementation of **ROSA**.
+**[WACV 2027] Ray-aware Observation Selection and Aggregation for Surround-View Fisheye 3D Detection**
+
+Official implementation of **ROSA**, accepted to WACV 2027.
 
 DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</sup> Corresponding author</sub>
 
@@ -14,6 +16,10 @@ harmonics.
 <p align="center">
   <img src="assets/figures/teaser.png" width="100%">
 </p>
+
+## News
+
+- **[2026/10/15] ROSA is accepted by WACV 2027!**
 
 ---
 
@@ -207,8 +213,7 @@ outside either rectified camera's field of view.
 
 ## Citation
 
-Submitted to WACV 2027; under review. This entry will be updated if it is
-accepted.
+Accepted to WACV 2027. Official proceedings citation will be updated upon publication.
 
 ```bibtex
 @unpublished{ROSA,
@@ -216,7 +221,7 @@ accepted.
             Surround-View Fisheye 3D Detection},
   author = {Kim, DongHun and Lee, Sang Jun and Jo, HyungGi},
   year   = {2026},
-  note   = {Submitted to WACV 2027}
+  note   = {Accepted to WACV 2027}
 }
 ```
 
