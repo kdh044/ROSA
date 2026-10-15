@@ -2,7 +2,7 @@
 
 **[WACV 2027] Ray-aware Observation Selection and Aggregation for Surround-View Fisheye 3D Detection**
 
-Official implementation of **ROSA**, accepted to WACV 2027.
+This repository is the official PyTorch implementation of **ROSA**, accepted to WACV 2027.
 
 DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</sup> Corresponding author</sub>
 
@@ -19,7 +19,8 @@ harmonics.
 
 ## News
 
-- **[2026/10/15] ROSA is accepted by WACV 2027!**
+- **[2026/10/15]** ROSA has been accepted to WACV 2027!
+- **[2026/10/15]** The official implementation is now publicly available.
 
 ---
 
