@@ -11,6 +11,8 @@ This repository is the official PyTorch implementation of **ROSA**, accepted to 
 
 DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</sup> Corresponding author</sub>
 
+## Abstract
+
 A fisheye lens bends and compresses the image differently at every location,
 so two samples of the same object are not interchangeable. ROSA measures the
 condition of each projected observation — visibility, image location, scale,
