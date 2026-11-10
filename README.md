@@ -31,15 +31,6 @@ https://github.com/user-attachments/assets/368c0d84-e00c-42e8-bccd-473feab84650
   <img src="assets/figures/overview.png" width="100%">
 </p>
 
-## Qualitative results
-
-Sparse4D (top) and ROSA (bottom) on Fisheye3DOD and KITTI-360.
-
-<p align="center">
-  <img src="assets/figures/qualitative_fisheye3dod.jpg" width="100%">
-  <img src="assets/figures/qualitative_kitti360.jpg" width="100%">
-</p>
-
 ## Getting started
 
 1. [Installation](docs/INSTALL.md): create a Python environment and run `bash tools/install.sh`.
