@@ -48,7 +48,7 @@ Accepted to WACV 2027. The proceedings citation will be added upon publication.
   title  = {ROSA: Ray-aware Observation Selection and Aggregation for
             Surround-View Fisheye 3D Detection},
   author = {Kim, DongHun and Lee, Sang Jun and Jo, HyungGi},
-  year   = {2026},
+  year   = {2027},
   note   = {WACV 2027}
 }
 ```
