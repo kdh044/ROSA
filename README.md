@@ -1,22 +1,23 @@
-# ROSA
+<div align="center">
 
-**[WACV 2027] Ray-aware Observation Selection and Aggregation for Surround-View Fisheye 3D Detection**
+# ROSA: Ray-aware Observation Selection and Aggregation for Surround-View Fisheye 3D Detection
 
-DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</sup> Corresponding author</sub>
+**WACV 2027**
 
-**Datasets & checkpoints:**
+DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup>
+<br><sub><sup>†</sup> Corresponding author</sub>
+
 [Fisheye3DOD](https://huggingface.co/datasets/danny042/Fisheye3DOD) ·
 [KITTI-360](https://huggingface.co/datasets/danny042/KITTI-360-fisheye)
+<br><sub>datasets & checkpoints</sub>
 
-ROSA is a 3D object detector for surround-view **fisheye** cameras.
-
-**Fisheye3DOD**
+</div>
 
 https://github.com/user-attachments/assets/95b32f78-1ce0-4324-afab-87e9886f0d78
 
-**KITTI-360**
-
 https://github.com/user-attachments/assets/368c0d84-e00c-42e8-bccd-473feab84650
+
+<p align="center"><sub>Top: Fisheye3DOD · Bottom: KITTI-360</sub></p>
 
 ## News
 
@@ -24,7 +25,9 @@ https://github.com/user-attachments/assets/368c0d84-e00c-42e8-bccd-473feab84650
 - **[2026/10/15]** ROSA has been accepted to WACV 2027!
 - **[2026/10/15]** The official implementation is now publicly available.
 
-## Overview
+## Introduction
+
+ROSA is a 3D object detector for surround-view fisheye cameras.
 
 <p align="center">
   <img src="assets/figures/overview.png" width="100%">
