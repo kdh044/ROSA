@@ -14,10 +14,13 @@ It runs on the raw fisheye images, without undistortion, and for every
 observation of an object it decides which camera and which feature scale to
 trust, from where and how the object appears in each fisheye view.
 
-<p align="center">
-  <img src="assets/demo/fisheye3dod.jpg" width="100%">
-  <img src="assets/demo/kitti360.jpg" width="100%">
-</p>
+**Fisheye3DOD**: four fisheye cameras (day, sunset, rain, night)
+
+https://github.com/user-attachments/assets/95b32f78-1ce0-4324-afab-87e9886f0d78
+
+**KITTI-360**: two front pinhole cameras and two side fisheye cameras
+
+https://github.com/user-attachments/assets/368c0d84-e00c-42e8-bccd-473feab84650
 
 ## News
 
