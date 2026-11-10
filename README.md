@@ -27,7 +27,12 @@ https://github.com/user-attachments/assets/368c0d84-e00c-42e8-bccd-473feab84650
 
 ## Introduction
 
-ROSA is a 3D object detector for surround-view fisheye cameras.
+ROSA is a 3D object detector for surround-view fisheye cameras. In a fisheye
+image, the same object looks different depending on where it is projected:
+it can be small, stretched by distortion, or seen by several cameras at once.
+For each observation of an object, ROSA uses these projection cues to weight
+the camera views and feature scales, and adds the calibrated viewing direction
+to the sampled features.
 
 <p align="center">
   <img src="assets/figures/overview.png" width="100%">
