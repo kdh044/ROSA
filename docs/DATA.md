@@ -36,7 +36,7 @@ data/Fisheye3DOD/
 ```
 
 Evaluation uses the official Fisheye3DOD metric (objects within the class
-ranges, up to 48 m). The anchor file is in `assets/`.
+ranges, up to 48 m). The anchors are in `assets/anchors/`.
 
 ## KITTI-360
 
@@ -63,8 +63,8 @@ data/KITTI-360/
 
 The info files hold six classes (car, truck, trailer, motorcycle, bicycle,
 pedestrian) at 2 Hz from nine drives, in the nuScenes-style format of the
-metric. The anchor file (300 k-means centres of the training boxes) is in
-`assets/`.
+metric. The anchors (300 k-means centres of the training boxes) are in
+`assets/anchors/`.
 
 ## Pretrained weights
 

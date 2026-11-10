@@ -11,14 +11,14 @@ hf download danny042/KITTI-360-fisheye checkpoints/rosa_kitti360_vov99_24e.pth -
 
 | Benchmark | Backbone | mAP | FDS / NDS | Config | Checkpoint |
 |---|---|---|---|---|---|
-| Fisheye3DOD | ResNet-18, 20e | 0.6143 | 0.6647 | [config](../configs/fisheye3dod/rosa_r18_fisheye3dod_20e.py) | `checkpoints/rosa_fisheye3dod_r18_20e.pth` |
-| KITTI-360 | VoVNet-99, 24e | 0.3114 | 0.3377 | [config](../configs/kitti360/rosa_vov99_kitti360_24e.py) | `checkpoints/rosa_kitti360_vov99_24e.pth` |
+| Fisheye3DOD | ResNet-18, 20e | 0.6143 | 0.6647 | [config](../configs/fisheye3dod.py) | `checkpoints/rosa_fisheye3dod_r18_20e.pth` |
+| KITTI-360 | VoVNet-99, 24e | 0.3114 | 0.3377 | [config](../configs/kitti360.py) | `checkpoints/rosa_kitti360_vov99_24e.pth` |
 
 ## Evaluate
 
 ```bash
-python tools/run.py evaluate configs/fisheye3dod/rosa_r18_fisheye3dod_20e.py checkpoints/rosa_fisheye3dod_r18_20e.pth
-python tools/run.py evaluate configs/kitti360/rosa_vov99_kitti360_24e.py checkpoints/rosa_kitti360_vov99_24e.pth
+python tools/run.py evaluate configs/fisheye3dod.py checkpoints/rosa_fisheye3dod_r18_20e.pth
+python tools/run.py evaluate configs/kitti360.py checkpoints/rosa_kitti360_vov99_24e.pth
 
 # multiple GPUs
 bash tools/dist_test.sh CONFIG CHECKPOINT NUM_GPUS
@@ -27,8 +27,8 @@ bash tools/dist_test.sh CONFIG CHECKPOINT NUM_GPUS
 ## Train
 
 ```bash
-bash tools/dist_train.sh configs/fisheye3dod/rosa_r18_fisheye3dod_20e.py 2
-bash tools/dist_train.sh configs/kitti360/rosa_vov99_kitti360_24e.py 2   # needs checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth (DATA.md)
+bash tools/dist_train.sh configs/fisheye3dod.py 2
+bash tools/dist_train.sh configs/kitti360.py 2   # needs checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth (DATA.md)
 ```
 
 Recipe: AdamW (lr 2e-4, weight decay 1e-3, backbone lr x0.5), 500-iteration
@@ -40,7 +40,7 @@ On two RTX PRO 6000 Blackwell GPUs training takes about 9 h (Fisheye3DOD) and
 ## Runtime
 
 ```bash
-python tools/run.py benchmark configs/fisheye3dod/rosa_r18_fisheye3dod_20e.py \
+python tools/run.py benchmark configs/fisheye3dod.py \
     --checkpoint checkpoints/rosa_fisheye3dod_r18_20e.pth --output runtime.json
 ```
 
@@ -60,6 +60,7 @@ rosa/
 ├── losses.py               auxiliary ray losses
 └── integrations/           detector, head, datasets and metrics (MMDetection3D)
 projects/mmdet3d_plugin/    Sparse4D components (adapted, MIT) and CUDA ops
-configs/                    fisheye3dod/ (ResNet-18), kitti360/ (VoVNet-99)
+configs/                    fisheye3dod.py (ResNet-18), kitti360.py (VoVNet-99)
+assets/                     anchors/, paper figures, demo frames
 tools/                      run.py (train / evaluate / benchmark), install and dist scripts
 ```

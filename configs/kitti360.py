@@ -1,31 +1,33 @@
-# ROSA on Fisheye3DOD (126 scenes): ResNet-18, 20 epochs, 2 GPUs x 4 images.
+# ROSA on KITTI-360 (six classes): VoVNet-99, 24 epochs, 2 GPUs x 4 images.
 #
-# Set ROSA_DATA_ROOT if the dataset is not at ./data/Fisheye3DOD.
+# KITTI-360 combines a rectified pinhole pair with two MEI fisheyes, so the
+# decoder uses the mixed pinhole/MEI projection.  ROSA_KITTI360_ROOT points at
+# the dataset; the FCOS3D VoVNet-99 initialization is downloaded to
+# checkpoints/ (docs/DATA.md) or set with ROSA_VOVNET_CKPT.
 import os
 
-data_root = os.environ.get("ROSA_DATA_ROOT", "data/Fisheye3DOD")
-ann_dir = "ImageSets-main126"  # relative to data_root
-anchor_file = "assets/fisheye3dod_main126_train_kmeans300_seed3407.npy"
+data_root = os.environ.get("ROSA_KITTI360_ROOT", "data/KITTI-360")
+ann_dir = "ImageSets-rosa-6class"  # relative to data_root
+anchor_file = "assets/anchors/kitti360.npy"
+pretrained_backbone = os.environ.get(
+    "ROSA_VOVNET_CKPT", "checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth"
+)
 seed = int(os.environ.get("ROSA_SEED", 3407))
 
-classes = ("Car", "Van", "Truck", "Bus", "Pedestrian", "Cyclist")
-cameras = (
-    "fisheye_camera_front",
-    "fisheye_camera_left",
-    "fisheye_camera_right",
-    "fisheye_camera_rear",
-)
-num_epochs = 20
+classes = ("car", "truck", "trailer", "motorcycle", "bicycle", "pedestrian")
+cameras = ("CAM_FRONT", "CAM_FRONT_RIGHT", "CAM_BACK_RIGHT", "CAM_BACK_LEFT")
+num_epochs = 24
 
 custom_imports = dict(
     imports=[
         "projects.mmdet3d_plugin",
         "rosa.integrations.box_loss",
         "rosa.integrations.optim",
-        "rosa.integrations.fisheye3dod.dataset",
         "rosa.integrations.detector",
-        "rosa.integrations.fisheye3dod.metric",
         "rosa.integrations.head",
+        "rosa.integrations.kitti360.dataset",
+        "rosa.integrations.kitti360.metric",
+        "rosa.integrations.kitti360.backbone",
     ],
     allow_failed_imports=False,
 )
@@ -42,20 +44,18 @@ model = dict(
         pad_size_divisor=32,
     ),
     img_backbone=dict(
-        type="mmdet.ResNet",
-        depth=18,
-        num_stages=4,
-        out_indices=(0, 1, 2, 3),
-        frozen_stages=-1,
-        norm_cfg=dict(type="BN", requires_grad=True),
-        norm_eval=False,
-        style="pytorch",
+        type="ROSAVoVNetCP",
+        spec_name="V-99-eSE",
         with_cp=False,
-        init_cfg=dict(type="Pretrained", checkpoint="torchvision://resnet18"),
+        input_ch=3,
+        out_features=("stage2", "stage3", "stage4", "stage5"),
+        frozen_stages=-1,
+        norm_eval=False,
+        init_cfg=None,
     ),
     img_neck=dict(
         type="mmdet.FPN",
-        in_channels=[64, 128, 256, 512],
+        in_channels=[256, 512, 768, 1024],
         out_channels=256,
         num_outs=4,
         start_level=0,
@@ -71,8 +71,7 @@ model = dict(
             num_cameras=4,
             num_learnable_points=6,
             fixed_keypoint_scale=0.45,
-            # Fused DAF + camera RFL kernel (inference only, OCam).
-            streaming_camera_rfl_cuda=True,
+            projection_type="mixed_kitti360",
         ),
         instance_bank=dict(
             type="InstanceBank",
@@ -119,29 +118,25 @@ model = dict(
 
 # ----------------------------------------------------------------- data
 load_images = dict(
-    type="LoadOfficialFisheye3DODForSparse4D",
-    cam_names=cameras,
+    type="LoadKITTI360MixedCameraImages",
+    cameras=cameras,
+    data_root=data_root,
     to_float32=True,
 )
 train_pipeline = [
     load_images,
-    dict(
-        type="LoadAnnotations3D",
-        with_bbox_3d=True,
-        with_label_3d=True,
-        with_bbox=False,
-        with_label=False,
-    ),
-    # Ground truth beyond the evaluator's class ranges is dropped.
-    dict(type="Fisheye3DODEvaluatorRangeFilter"),
-    dict(type="PackSparse4DInputs", ocam_lens_fov_deg=220.0),
+    dict(type="DAPETRImageAugment", training=True),
+    dict(type="DAPETRGlobalRotScale", training=True),
+    dict(type="KITTI360ObjectRangeFilter"),
+    dict(type="PackSparse4DInputs"),
 ]
 test_pipeline = [
     load_images,
-    dict(type="PackSparse4DInputs", ocam_lens_fov_deg=220.0),
+    dict(type="DAPETRImageAugment", training=False),
+    dict(type="PackSparse4DInputs"),
 ]
 dataset = dict(
-    type="Fisheye3DODSparse4DDataset",
+    type="KITTI360MixedCameraDataset",
     data_root=data_root,
     metainfo=dict(classes=classes),
     with_velocity=True,
@@ -154,7 +149,7 @@ train_dataloader = dict(
     collate_fn=dict(type="default_collate"),
     dataset=dict(
         **dataset,
-        ann_file=os.path.join(ann_dir, "fisheye3dod_infos_train.pkl"),
+        ann_file=os.path.join(ann_dir, "kitti360_rosa_infos_train.pkl"),
         pipeline=train_pipeline,
         test_mode=False,
         filter_empty_gt=True,
@@ -168,14 +163,18 @@ val_dataloader = dict(
     collate_fn=dict(type="default_collate"),
     dataset=dict(
         **dataset,
-        ann_file=os.path.join(ann_dir, "fisheye3dod_infos_val.pkl"),
+        ann_file=os.path.join(ann_dir, "kitti360_rosa_infos_val.pkl"),
         pipeline=test_pipeline,
         test_mode=True,
         filter_empty_gt=False,
     ),
 )
 test_dataloader = val_dataloader
-val_evaluator = dict(type="Fisheye3DODOfficialMetric", prefix="fisheye_bev")
+val_evaluator = dict(
+    type="KITTI360DAPETRMetric",
+    ann_file=os.path.join(data_root, ann_dir, "kitti360_rosa_infos_val.pkl"),
+    prefix="kitti360_bev",
+)
 test_evaluator = val_evaluator
 
 # ------------------------------------------------------------- schedule
@@ -216,7 +215,7 @@ default_hooks = dict(
         type="CheckpointHook",
         interval=1,
         max_keep_ckpts=5,
-        save_best=["fisheye_bev/mAP", "fisheye_bev/NDS"],
+        save_best=["kitti360_bev/mAP", "kitti360_bev/NDS"],
         rule=["greater", "greater"],
     ),
     sampler_seed=dict(type="DistSamplerSeedHook"),
@@ -228,11 +227,11 @@ env_cfg = dict(
     dist_cfg=dict(backend="nccl"),
 )
 randomness = dict(seed=seed, deterministic=True)
-find_unused_parameters = False
-load_from = None
+find_unused_parameters = True
+load_from = pretrained_backbone
 resume = False
 log_processor = dict(type="LogProcessor", window_size=50, by_epoch=True)
 log_level = "INFO"
 vis_backends = [dict(type="LocalVisBackend")]
 visualizer = dict(type="Det3DLocalVisualizer", vis_backends=vis_backends, name="visualizer")
-work_dir = "work_dirs/rosa_r18_fisheye3dod_20e"
+work_dir = "work_dirs/kitti360"
