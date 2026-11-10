@@ -43,7 +43,7 @@ def _stable_instance_id(scene: str, raw_id: object) -> int:
 
 
 @DATASETS.register_module()
-class Fisheye3DODSparse4DDataset(Det3DDataset):
+class ROSAFisheye3DODDataset(Det3DDataset):
     """Read the official ``fisheye3dod_infos_*.pkl`` files."""
 
     METAINFO = {
@@ -150,7 +150,7 @@ class Fisheye3DODSparse4DDataset(Det3DDataset):
 
 
 @TRANSFORMS.register_module()
-class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
+class Fisheye3DODRangeFilter(BaseTransform):
     """Apply the evaluator's class-dependent radial GT range."""
 
     class_ranges = tuple(float(OFFICIAL_CLASS_RANGES[name]) for name in CLASSES)
@@ -183,10 +183,8 @@ class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
+class LoadFisheye3DODImages(BaseTransform):
     """Load the four 800x800 OCam images in a fixed camera order."""
-
-    _EMIT_CAM2EGO = True
 
     def __init__(
         self,
@@ -243,28 +241,11 @@ class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
             pad_shape=shapes,
             ocam_lens_fov_deg=float(fovs[0]),
         )
-        if self._EMIT_CAM2EGO:
-            results["cam2ego"] = np.linalg.inv(results["lidar2cam"]).astype(
-                np.float32
-            )
         return results
 
 
-@TRANSFORMS.register_module()
-class LoadOfficialFisheye3DODLeanForSparse4D(
-    LoadOfficialFisheye3DODForSparse4D
-):
-    """Same loader without the ``cam2ego`` output.
-
-    Use the default loader for pipelines that need ``cam2ego``.
-    """
-
-    _EMIT_CAM2EGO = False
-
-
 __all__ = [
-    "Fisheye3DODEvaluatorRangeFilter",
-    "Fisheye3DODSparse4DDataset",
-    "LoadOfficialFisheye3DODLeanForSparse4D",
-    "LoadOfficialFisheye3DODForSparse4D",
+    "Fisheye3DODRangeFilter",
+    "ROSAFisheye3DODDataset",
+    "LoadFisheye3DODImages",
 ]

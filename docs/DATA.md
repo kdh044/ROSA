@@ -1,23 +1,15 @@
-# Data preparation
+# Data and checkpoints
 
-Both benchmarks are mirrored on Hugging Face in their original layout,
-together with the info files ROSA reads. Nothing has to be converted: download,
-extract, and point ROSA at the folder.
+Everything is on Hugging Face, in the original dataset layouts:
 
-```
-data/
-├── Fisheye3DOD/
-└── KITTI-360/
-```
+| Repository | Contents |
+|---|---|
+| [danny042/Fisheye3DOD](https://huggingface.co/datasets/danny042/Fisheye3DOD) | Fisheye3DOD (126 scenes, 163 GB), info files, ROSA checkpoint |
+| [danny042/KITTI-360-fisheye](https://huggingface.co/datasets/danny042/KITTI-360-fisheye) | KITTI-360 cameras used by ROSA (94 GB), calibration, info files, ROSA checkpoint, VoVNet-99 initialization |
 
-Use `data/` inside the repository, or set `ROSA_DATA_ROOT` /
-`ROSA_KITTI360_ROOT` to the folders.
+Run the commands below from the repository root. Nothing needs to be converted.
 
 ## Fisheye3DOD
-
-Source: [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD), mirrored at
-[`danny042/Fisheye3DOD`](https://huggingface.co/datasets/danny042/Fisheye3DOD)
-(126 scenes, 163 GB).
 
 ```bash
 hf download danny042/Fisheye3DOD --repo-type dataset --local-dir data/Fisheye3DOD \
@@ -25,26 +17,16 @@ hf download danny042/Fisheye3DOD --repo-type dataset --local-dir data/Fisheye3DO
 cd data/Fisheye3DOD && for f in scenes/*.tar; do tar -xf "$f" && rm "$f"; done && cd -
 ```
 
+Result:
+
 ```
 data/Fisheye3DOD/
 ├── calib_results.txt
-├── ImageSets-main126/
-│   ├── fisheye3dod_infos_train.pkl      8,820 frames
-│   └── fisheye3dod_infos_val.pkl        3,906 frames
-├── train-Town01_Opt-ClearNight-.../
-└── ...                                  126 scene folders
+├── ImageSets-main126/            info files (8,820 train / 3,906 val frames)
+└── train-Town01_Opt-.../ ...     126 scene folders
 ```
 
-Evaluation uses the official Fisheye3DOD metric (objects within the class
-ranges, up to 48 m). The anchors are in `assets/anchors/`.
-
 ## KITTI-360
-
-Source: [KITTI-360](https://www.cvlibs.net/datasets/kitti-360/) (CC BY-NC-SA
-3.0), mirrored at
-[`danny042/KITTI-360-fisheye`](https://huggingface.co/datasets/danny042/KITTI-360-fisheye).
-ROSA uses the two rectified perspective cameras and the two MEI fisheyes
-(94 GB); the LiDAR folder of the mirror is not needed.
 
 ```bash
 hf download danny042/KITTI-360-fisheye --repo-type dataset --local-dir data/KITTI-360 \
@@ -52,31 +34,36 @@ hf download danny042/KITTI-360-fisheye --repo-type dataset --local-dir data/KITT
 cd data/KITTI-360 && for f in data_2d_raw/*.tar; do tar -xf "$f" && rm "$f"; done && cd -
 ```
 
+Result:
+
 ```
 data/KITTI-360/
 ├── calibration/
-├── data_2d_raw/2013_05_28_drive_*_sync/image_0{0,1,2,3}/
-└── ImageSets-rosa-6class/
-    ├── kitti360_rosa_infos_train.pkl    10,999 frames
-    └── kitti360_rosa_infos_val.pkl       2,860 frames
+├── data_2d_raw/                  two front pinhole + two side fisheye cameras, 9 drives
+└── ImageSets-rosa-6class/        info files (10,999 train / 2,860 val frames, 6 classes)
 ```
 
-The info files hold six classes (car, truck, trailer, motorcycle, bicycle,
-pedestrian) at 2 Hz from nine drives, in the nuScenes-style format of the
-metric. The anchors (300 k-means centres of the training boxes) are in
-`assets/anchors/`.
+KITTI-360 is released under CC BY-NC-SA 3.0.
 
-## Pretrained weights
-
-All weights are on Hugging Face, next to the datasets:
+## Checkpoints
 
 ```bash
-# ROSA checkpoints
+# ROSA, Fisheye3DOD (ResNet-18)
 hf download danny042/Fisheye3DOD checkpoints/rosa_fisheye3dod_r18_20e.pth --repo-type dataset --local-dir .
+# ROSA, KITTI-360 (VoVNet-99)
 hf download danny042/KITTI-360-fisheye checkpoints/rosa_kitti360_vov99_24e.pth --repo-type dataset --local-dir .
-# VoVNet-99 initialization for KITTI-360 training (FCOS3D weights from PETR)
+# VoVNet-99 initialization, only for KITTI-360 training (FCOS3D weights released with PETR)
 hf download danny042/KITTI-360-fisheye checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth --repo-type dataset --local-dir .
 ```
 
-The ResNet-18 ImageNet weights for Fisheye3DOD training are fetched
-automatically by torchvision. `ROSA_VOVNET_CKPT` overrides the VoVNet path.
+The files land in `checkpoints/`, where the configs expect them.
+
+## Other locations
+
+If the data is stored elsewhere, point ROSA to it:
+
+```bash
+export ROSA_DATA_ROOT=/path/to/Fisheye3DOD
+export ROSA_KITTI360_ROOT=/path/to/KITTI-360
+export ROSA_VOVNET_CKPT=/path/to/fcos3d_vovnet_imgbackbone-remapped.pth
+```

@@ -1,4 +1,4 @@
-"""Box keypoints and ROSA evidence attention.
+"""Box keypoints and ROSA observation aggregation.
 
 Each decoder stage observes 13 support points of every box (7 fixed, 6
 learned) in all fisheye views.  For each point ROSA weights camera x level
@@ -16,8 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .cues import angular_fpn_geometry
-from .projection import FisheyeObservationGeometry, NativeFisheyeProjector
+from .cues import projection_cues
+from .projection import ObservationGeometry, Projector
 from .ray import normalize_direction
 from .rfl import SphericalRayFeatureLifting
 from .types import RayFeatureRelation
@@ -28,11 +28,11 @@ class BoxPointProjection:
     """Native-fisheye projection with an explicit box-point dimension."""
 
     uv: Tensor
-    geometry: FisheyeObservationGeometry
+    geometry: ObservationGeometry
 
 
 @dataclass(frozen=True)
-class FisheyeBoxEvidenceOutput:
+class AggregationOutput:
     query: Tensor
     camera_level_attention: Tensor
     point_attention: Tensor
@@ -40,7 +40,7 @@ class FisheyeBoxEvidenceOutput:
     signed_face_features: Tensor
 
 
-class CameraWiseRFLBeforeROSA(nn.Module):
+class CameraRFL(nn.Module):
     """Make each camera observation ray-aware before camera fusion.
 
     Applied after DAF has reduced the FPN levels within each camera.  The RFL
@@ -58,19 +58,19 @@ class CameraWiseRFLBeforeROSA(nn.Module):
         self.embed_dims = int(embed_dims)
         self.num_heads = int(num_heads)
         self.key_head_dims = int(attention_dims) // int(num_heads)
-        self.rfl = SphericalRayFeatureLifting.for_compact_profile(embed_dims)
+        self.rfl = SphericalRayFeatureLifting(embed_dims)
         self.key_proj = nn.Linear(embed_dims, attention_dims, bias=False)
         self.reliability = nn.Linear(embed_dims, num_heads, bias=False)
-        self._streaming_compact_cache = None
+        self._fused_logit_cache = None
         self.reset_parameters()
 
     def reset_parameters(self) -> None:
-        self._streaming_compact_cache = None
+        self._fused_logit_cache = None
         self.rfl.reset_parameters()
         nn.init.xavier_uniform_(self.key_proj.weight)
         nn.init.xavier_uniform_(self.reliability.weight)
 
-    def streaming_compact_weights(self) -> tuple[Tensor, Tensor]:
+    def fused_logit_weights(self) -> tuple[Tensor, Tensor]:
         """Collapse the two linear RFL logit maps once for eval deployment."""
 
         parameters = (
@@ -82,7 +82,7 @@ class CameraWiseRFLBeforeROSA(nn.Module):
             (value.data_ptr(), value._version, value.device, value.dtype)
             for value in parameters
         )
-        cached = self._streaming_compact_cache
+        cached = self._fused_logit_cache
         if cached is None or cached[0] != signature:
             output_weight, key_weight, reliability_weight = parameters
             key_rfl_weight = torch.mm(key_weight, output_weight).contiguous()
@@ -90,7 +90,7 @@ class CameraWiseRFLBeforeROSA(nn.Module):
                 reliability_weight, output_weight
             ).contiguous()
             cached = (signature, key_rfl_weight, reliability_rfl_weight)
-            self._streaming_compact_cache = cached
+            self._fused_logit_cache = cached
         return cached[1], cached[2]
 
     def forward(
@@ -144,14 +144,14 @@ class CameraWiseRFLBeforeROSA(nn.Module):
 
 
 def _reshape_point_geometry(
-    geometry: FisheyeObservationGeometry,
+    geometry: ObservationGeometry,
     batch: int,
     queries: int,
     points: int,
     cameras: int,
-) -> FisheyeObservationGeometry:
+) -> ObservationGeometry:
     prefix = (batch, queries, points, cameras)
-    return FisheyeObservationGeometry(
+    return ObservationGeometry(
         rays=geometry.rays.reshape(prefix + (3,)),
         tangent=geometry.tangent.reshape(prefix + (2,)),
         jacobian=geometry.jacobian.reshape(prefix + (2, 2)),
@@ -162,7 +162,7 @@ def _reshape_point_geometry(
 
 
 def project_box_keypoints(
-    projector: NativeFisheyeProjector,
+    projector: Projector,
     keypoints: Tensor,
     metadata: dict,
 ) -> BoxPointProjection:
@@ -190,7 +190,7 @@ def project_box_keypoints(
     )
 
 
-class FisheyeBoxKeypointGenerator(nn.Module):
+class KeypointGenerator(nn.Module):
     """Generate seven fixed and optional learned points from a ray box state."""
 
     def __init__(
@@ -268,8 +268,8 @@ class FisheyeBoxKeypointGenerator(nn.Module):
         return state.center[:, :, None, :] + rotated
 
 
-class FisheyeBoxEvidenceAttention(nn.Module):
-    """Factorized ROSA camera-level and semantic-point evidence attention."""
+class ObservationAggregation(nn.Module):
+    """Camera/level attention with projection cues and RFL, then point attention."""
 
     geometry_dims = 9
 
@@ -298,12 +298,10 @@ class FisheyeBoxEvidenceAttention(nn.Module):
             nn.SiLU(),
             nn.Linear(64, config.num_heads),
         )
-        self.rfl = SphericalRayFeatureLifting.for_compact_profile(
-            embed_dims=config.embed_dims
-        )
+        self.rfl = SphericalRayFeatureLifting(config.embed_dims)
         # The forked RNG keeps the initialization of the other modules unchanged.
         with torch.random.fork_rng(devices=[]):
-            self.camera_rfl_before_rosa = CameraWiseRFLBeforeROSA(
+            self.camera_rfl = CameraRFL(
                 config.embed_dims,
                 config.num_heads,
                 config.attention_dims,
@@ -353,7 +351,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
                         nn.init.zeros_(module.bias)
         self.rfl.reset_parameters()
         with torch.random.fork_rng(devices=[]):
-            self.camera_rfl_before_rosa.reset_parameters()
+            self.camera_rfl.reset_parameters()
 
     def _prefuse_center(
         self,
@@ -464,7 +462,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
         updated = query + self.dropout(self.output_proj(evidence))
         return updated, point_attention, signed_faces
 
-    def forward_fused_daf(
+    def forward(
         self,
         query: Tensor,
         projection: BoxPointProjection,
@@ -472,8 +470,8 @@ class FisheyeBoxEvidenceAttention(nn.Module):
         point_rays: Tensor,
         formatted_fpn: tuple[Tensor, Tensor, Tensor],
         precomputed_geometry: tuple[Tensor, Tensor] | None = None,
-    ) -> FisheyeBoxEvidenceOutput:
-        """Fuse camera/level evidence for each point in one Sparse4D CUDA read.
+    ) -> AggregationOutput:
+        """Aggregate camera/level features for each point in one CUDA call.
 
         Every box point is passed to DAF as a one-keypoint anchor; DAF only
         performs bilinear sampling and the weighted reduction.
@@ -494,7 +492,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
         geometry = projection.geometry
         flat_prefix = (batch, queries * points, cameras)
         if precomputed_geometry is None:
-            descriptor, compatibility = angular_fpn_geometry(
+            descriptor, compatibility = projection_cues(
                 geometry.tangent.reshape(flat_prefix + (2,)),
                 geometry.jacobian.reshape(flat_prefix + (2, 2)),
                 geometry.lens_margin.reshape(flat_prefix + (1,)),
@@ -563,19 +561,19 @@ class FisheyeBoxEvidenceAttention(nn.Module):
             batch, queries * points, 1, cameras, levels, heads
         ).contiguous()
 
-        use_streaming_camera_cuda = (
-            cfg.streaming_camera_rfl_cuda
+        use_fused_camera_rfl = (
+            cfg.fused_camera_rfl
             and not self.training
             and not torch.is_grad_enabled()
         )
-        if use_streaming_camera_cuda:
+        if use_fused_camera_rfl:
             from projects.mmdet3d_plugin.ops import (
                 deformable_aggregation_rfl_rosa_inference,
             )
 
-            rfl = self.camera_rfl_before_rosa.rfl
+            rfl = self.camera_rfl.rfl
             key_rfl_weight, reliability_rfl_weight = (
-                self.camera_rfl_before_rosa.streaming_compact_weights()
+                self.camera_rfl.fused_logit_weights()
             )
             point_features_flat, camera_attention_flat = (
                 deformable_aggregation_rfl_rosa_inference(
@@ -621,7 +619,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
             camera_features = camera_features.reshape(
                 batch, queries, points, cameras, cfg.embed_dims
             )
-            camera_features, camera_delta = self.camera_rfl_before_rosa(
+            camera_features, camera_delta = self.camera_rfl(
                 camera_features,
                 geometry.rays,
                 geometry.valid,
@@ -650,7 +648,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
         )
 
         point_valid = geometry.valid.any(dim=3)
-        return self._post_daf_evidence_fusion(
+        return self._lift_and_fuse_points(
             query,
             point_features,
             point_valid,
@@ -659,7 +657,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
             compatibility,
         )
 
-    def _post_daf_evidence_fusion(
+    def _lift_and_fuse_points(
         self,
         query: Tensor,
         point_features: Tensor,
@@ -667,8 +665,8 @@ class FisheyeBoxEvidenceAttention(nn.Module):
         point_rays: Tensor,
         attention: Tensor,
         compatibility: Tensor,
-    ) -> FisheyeBoxEvidenceOutput:
-        """Post-DAF evidence fusion (pure PyTorch, ``torch.compile``-friendly)."""
+    ) -> AggregationOutput:
+        """RFL on the point features, then point attention."""
         point_features = self.feature_norm(point_features)
         rfl_features = point_features[:, :, None, :, :]
         rfl_rays = normalize_direction(point_rays)[:, :, None, :, :]
@@ -683,7 +681,7 @@ class FisheyeBoxEvidenceAttention(nn.Module):
             point_features,
             point_valid,
         )
-        return FisheyeBoxEvidenceOutput(
+        return AggregationOutput(
             query=updated,
             camera_level_attention=attention,
             point_attention=point_attention,
@@ -694,8 +692,8 @@ class FisheyeBoxEvidenceAttention(nn.Module):
 
 __all__ = [
     "BoxPointProjection",
-    "FisheyeBoxEvidenceAttention",
-    "FisheyeBoxEvidenceOutput",
-    "FisheyeBoxKeypointGenerator",
+    "ObservationAggregation",
+    "AggregationOutput",
+    "KeypointGenerator",
     "project_box_keypoints",
 ]

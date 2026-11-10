@@ -34,7 +34,7 @@ def _stable_int64(value: object) -> int:
 
 
 @DATASETS.register_module()
-class KITTI360MixedCameraDataset(Det3DDataset):
+class KITTI360Dataset(Det3DDataset):
     """KITTI-360 mixed-camera dataset (two pinhole and two MEI fisheye views)."""
 
     METAINFO = {
@@ -138,7 +138,7 @@ def _native_to_network_affine(
 
 
 @TRANSFORMS.register_module()
-class LoadKITTI360MixedCameraImages(BaseTransform):
+class LoadKITTI360Images(BaseTransform):
     """Load two pinhole and two native-MEI views using DAPETR's crops."""
 
     def __init__(
@@ -261,7 +261,7 @@ class LoadKITTI360MixedCameraImages(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class DAPETRImageAugment(BaseTransform):
+class KITTI360ImageAugment(BaseTransform):
     """Apply the shared 1408x376 DAPETR resize/crop/flip augmentation."""
 
     def __init__(
@@ -331,7 +331,7 @@ class DAPETRImageAugment(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class DAPETRGlobalRotScale(BaseTransform):
+class KITTI360GlobalRotScale(BaseTransform):
     """Jointly augment ego boxes and the ego-to-camera projection."""
 
     def __init__(
@@ -377,7 +377,7 @@ class DAPETRGlobalRotScale(BaseTransform):
 
 
 @TRANSFORMS.register_module()
-class KITTI360ObjectRangeFilter(BaseTransform):
+class KITTI360RangeFilter(BaseTransform):
     """Filter GT with the PETR/DAPETR BEV range and preserve instance IDs."""
 
     def transform(self, results: dict) -> dict:
@@ -407,9 +407,9 @@ class KITTI360ObjectRangeFilter(BaseTransform):
 
 
 __all__ = [
-    "DAPETRGlobalRotScale",
-    "DAPETRImageAugment",
-    "KITTI360MixedCameraDataset",
-    "KITTI360ObjectRangeFilter",
-    "LoadKITTI360MixedCameraImages",
+    "KITTI360GlobalRotScale",
+    "KITTI360ImageAugment",
+    "KITTI360Dataset",
+    "KITTI360RangeFilter",
+    "LoadKITTI360Images",
 ]

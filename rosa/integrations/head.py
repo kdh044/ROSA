@@ -1,4 +1,4 @@
-"""Sparse4D head that runs the ROSA hybrid box decoder."""
+"""Sparse4D head that runs the ROSA decoder."""
 
 from __future__ import annotations
 
@@ -14,14 +14,14 @@ except ImportError as exc:  # pragma: no cover - optional detector host
         "fisheye_box_sparse4d requires MMDetection3D and the Sparse4D host"
     ) from exc
 
-from ..projection import make_native_projector
+from ..projection import build_projector
 from ..decoder import (
-    HybridBoxDecoderConfig,
-    HybridSparseBoxDecoder,
-    HybridBoxState,
+    ROSADecoderConfig,
+    ROSADecoder,
+    BoxState,
 )
 from ..losses import (
-    FisheyeHybridRayAuxiliaryLoss,
+    RayAuxiliaryLoss,
     RayAuxiliaryLossConfig,
 )
 
@@ -43,7 +43,7 @@ class ROSAHead(Sparse4DHead):
         decoder: dict,
         sampler: dict,
         reg_weights=None,
-        hybrid_decoder_cfg: dict | None = None,
+        decoder_cfg: dict | None = None,
         ray_aux_loss: dict | None = None,
         num_decoder: int = 6,
         gt_cls_key: str = "gt_labels_3d",
@@ -53,9 +53,9 @@ class ROSAHead(Sparse4DHead):
     ) -> None:
         # Skip the parent constructor, which does not build an InstanceBank.
         BaseModule.__init__(self, init_cfg=init_cfg)
-        supplied_cfg = dict(hybrid_decoder_cfg or {})
+        supplied_cfg = dict(decoder_cfg or {})
         supplied_cfg.setdefault("num_layers", int(num_decoder))
-        config = HybridBoxDecoderConfig(**supplied_cfg)
+        config = ROSADecoderConfig(**supplied_cfg)
 
         self.num_decoder = int(num_decoder)
         self.num_classes = int(config.num_classes)
@@ -69,11 +69,11 @@ class ROSAHead(Sparse4DHead):
         self.decoder = TASK_UTILS.build(decoder)
         self.loss_cls = MODELS.build(loss_cls)
         self.loss_reg = MODELS.build(loss_reg)
-        self.fisheye_box_decoder = HybridSparseBoxDecoder(
-            config, projector=make_native_projector(config.projection_type)
+        self.rosa_decoder = ROSADecoder(
+            config, projector=build_projector(config.projection_type)
         )
         self.ray_auxiliary_loss = (
-            FisheyeHybridRayAuxiliaryLoss(RayAuxiliaryLossConfig(**dict(ray_aux_loss)))
+            RayAuxiliaryLoss(RayAuxiliaryLossConfig(**dict(ray_aux_loss)))
             if ray_aux_loss is not None
             else None
         )
@@ -161,7 +161,7 @@ class ROSAHead(Sparse4DHead):
             anchor,
             metas,
         )
-        output = self.fisheye_box_decoder(
+        output = self.rosa_decoder(
             feature_maps,
             metas,
             instance_feature,
@@ -170,7 +170,7 @@ class ROSAHead(Sparse4DHead):
         )
         num_free = self.instance_bank.num_anchor
         states = tuple(
-            self._slice_hybrid_state(state, num_free) for state in output.states
+            self._slice_state(state, num_free) for state in output.states
         )
         result = {
             "classification": [value[:, :num_free] for value in output.classification],
@@ -217,8 +217,8 @@ class ROSAHead(Sparse4DHead):
         return result
 
     @staticmethod
-    def _slice_hybrid_state(state: HybridBoxState, end: int) -> HybridBoxState:
-        return HybridBoxState(
+    def _slice_state(state: BoxState, end: int) -> BoxState:
+        return BoxState(
             direction=state.direction[:, :end],
             log_range=state.log_range[:, :end],
             log_size=state.log_size[:, :end],

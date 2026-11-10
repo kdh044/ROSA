@@ -20,7 +20,7 @@ class RayAuxiliaryLossConfig:
     beta: float = 0.10
 
 
-class FisheyeHybridRayAuxiliaryLoss(nn.Module):
+class RayAuxiliaryLoss(nn.Module):
     """Losses on matched queries: ray angle, log-range, and range uncertainty.
 
     The uncertainty is an auxiliary output and is not part of the box state.
@@ -105,6 +105,6 @@ class FisheyeHybridRayAuxiliaryLoss(nn.Module):
 
 
 __all__ = [
-    "FisheyeHybridRayAuxiliaryLoss",
+    "RayAuxiliaryLoss",
     "RayAuxiliaryLossConfig",
 ]

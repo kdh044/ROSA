@@ -77,7 +77,7 @@ def _network_pixels(ray_or_xyz: Tensor, metadata: dict) -> tuple[Tensor, Tensor]
     return output, valid
 
 
-def mixed_camera_project_rays_to_pixels(
+def pinhole_mei_project_rays(
     camera_rays: Tensor,
     metadata: dict,
 ) -> tuple[Tensor, Tensor]:

@@ -2,7 +2,7 @@
 
 The box centre is a viewing-ray direction plus log-range; size, yaw and
 velocity stay in the global frame.  Each of the six stages observes the box
-keypoints in all fisheye views (ROSA evidence attention) and applies gated
+keypoints in all fisheye views (ROSA observation aggregation) and applies gated
 residual updates in these coordinates.
 """
 
@@ -16,14 +16,14 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from .evidence import (
+from .aggregation import (
     BoxPointProjection,
-    FisheyeBoxEvidenceAttention,
-    FisheyeBoxEvidenceOutput,
-    FisheyeBoxKeypointGenerator,
+    ObservationAggregation,
+    AggregationOutput,
+    KeypointGenerator,
     project_box_keypoints,
 )
-from .projection import FisheyeObservationGeometry, NativeFisheyeProjector
+from .projection import ObservationGeometry, Projector
 from .rfl import SphericalRayFeatureLifting
 from .ray import normalize_direction, rotate_sin_cos, spherical_exp_map
 
@@ -39,7 +39,7 @@ def _global_yaw(value: Tensor) -> Tensor:
 
 
 @dataclass(frozen=True)
-class HybridBoxState:
+class BoxState:
     """Ray-aligned center with globally framed box attributes."""
 
     direction: Tensor
@@ -48,7 +48,7 @@ class HybridBoxState:
     yaw: Tensor
     velocity: Tensor
 
-    def validate(self) -> "HybridBoxState":
+    def validate(self) -> "BoxState":
         expected = {
             "direction": 3,
             "log_range": 1,
@@ -72,7 +72,7 @@ class HybridBoxState:
         return normalize_direction(self.direction) * self.range
 
     @classmethod
-    def from_sparse_anchor(cls, anchor: Tensor) -> "HybridBoxState":
+    def from_sparse_anchor(cls, anchor: Tensor) -> "BoxState":
         if anchor.ndim != 3 or anchor.shape[-1] != 11:
             raise ValueError("anchor must be [B,Q,11]")
         center = anchor[..., :3]
@@ -98,7 +98,7 @@ class HybridBoxState:
         )
 
 
-def hybrid_log_angular_extent(state: HybridBoxState) -> Tensor:
+def log_angular_extent_of(state: BoxState) -> Tensor:
     """Metric box footprint expressed as horizontal/vertical visual angle."""
 
     state.validate()
@@ -111,7 +111,7 @@ def hybrid_log_angular_extent(state: HybridBoxState) -> Tensor:
 
 
 @dataclass(frozen=True)
-class HybridBoxDecoderConfig:
+class ROSADecoderConfig:
     """Configuration of the hybrid-state box decoder."""
 
     embed_dims: int = 256
@@ -125,10 +125,10 @@ class HybridBoxDecoderConfig:
     level_strides: tuple[float, ...] = (4.0, 8.0, 16.0, 32.0)
     num_learnable_points: int = 6
     fixed_keypoint_scale: float = 0.45
-    # "ocam_fisheye" (Fisheye3DOD) or "mixed_kitti360" (pinhole + MEI).
-    projection_type: str = "ocam_fisheye"
+    # "ocam" (Fisheye3DOD) or "pinhole_mei" (pinhole + MEI).
+    projection_type: str = "ocam"
     # Fused DAF + camera RFL inference kernel (OCam only).
-    streaming_camera_rfl_cuda: bool = False
+    fused_camera_rfl: bool = False
     dropout: float = 0.1
 
     @property
@@ -140,7 +140,7 @@ class HybridBoxDecoderConfig:
         return self.num_fixed_points + self.num_learnable_points
 
 
-class HybridBoxPositionEncoder(nn.Module):
+class BoxPositionEncoder(nn.Module):
     """Encode ray center plus globally framed shape, yaw, and velocity."""
 
     input_dims = 18  # SH9 + log-range1 + log-size3 + yaw2 + velocity3
@@ -154,7 +154,7 @@ class HybridBoxPositionEncoder(nn.Module):
             nn.LayerNorm(embed_dims),
         )
 
-    def forward(self, state: HybridBoxState) -> Tensor:
+    def forward(self, state: BoxState) -> Tensor:
         state.validate()
         inputs = torch.cat(
             (
@@ -171,7 +171,7 @@ class HybridBoxPositionEncoder(nn.Module):
 
 
 
-class HybridBoxRefinement(nn.Module):
+class BoxRefinement(nn.Module):
     """Gated, zero-initialized residual updates of the hybrid box state.
 
     Outputs ``[d_dir(2), d_log_range, d_log_size(3), d_yaw, d_velocity(3)]``.
@@ -218,10 +218,10 @@ class HybridBoxRefinement(nn.Module):
     def forward(
         self,
         feature: Tensor,
-        state: HybridBoxState,
+        state: BoxState,
         state_feature: Tensor,
         signed_face_features: Tensor,
-    ) -> HybridBoxState:
+    ) -> BoxState:
         state.validate()
         refinement_feature = feature + state_feature
         raw = self.trunk(refinement_feature.float()).to(feature.dtype)
@@ -245,7 +245,7 @@ class HybridBoxRefinement(nn.Module):
                 face_yaw,
                 self.face_yaw_gate(refinement_feature.float()),
             )
-            return HybridBoxState(*updated).validate()
+            return BoxState(*updated).validate()
 
         gates = self.update_gate(refinement_feature.float()).sigmoid().to(feature.dtype)
         center_gate, size_gate, yaw_gate, velocity_gate = gates.split(1, dim=-1)
@@ -253,7 +253,7 @@ class HybridBoxRefinement(nn.Module):
             self.face_yaw_gate(refinement_feature.float()).sigmoid().to(feature.dtype)
         )
         yaw_residual = raw[..., 6:7] * yaw_gate + face_yaw * face_yaw_gate
-        return HybridBoxState(
+        return BoxState(
             direction=spherical_exp_map(state.direction, raw[..., 0:2] * center_gate),
             log_range=state.log_range + raw[..., 2:3] * center_gate,
             log_size=state.log_size + raw[..., 3:6] * size_gate,
@@ -262,20 +262,20 @@ class HybridBoxRefinement(nn.Module):
         ).validate()
 
 
-class HybridSparseBoxDecoderLayer(nn.Module):
+class ROSADecoderLayer(nn.Module):
     """One decoder stage: self-attention, ROSA observation, FFN, box update."""
 
     def __init__(
         self,
-        config: HybridBoxDecoderConfig,
-        projector: NativeFisheyeProjector,
+        config: ROSADecoderConfig,
+        projector: Projector,
         *,
         center_prefusion: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
         self.projector = projector
-        self.position_encoder = HybridBoxPositionEncoder(config.embed_dims)
+        self.position_encoder = BoxPositionEncoder(config.embed_dims)
         self.self_attention = nn.MultiheadAttention(
             config.embed_dims,
             config.num_heads,
@@ -283,15 +283,15 @@ class HybridSparseBoxDecoderLayer(nn.Module):
             batch_first=True,
         )
         self.self_norm = nn.LayerNorm(config.embed_dims)
-        self.keypoints = FisheyeBoxKeypointGenerator(
+        self.keypoints = KeypointGenerator(
             config.embed_dims,
             config.num_learnable_points,
             config.fixed_keypoint_scale,
         )
-        self.evidence = FisheyeBoxEvidenceAttention(
+        self.aggregation = ObservationAggregation(
             config, center_prefusion=center_prefusion
         )
-        self.evidence_norm = nn.LayerNorm(config.embed_dims)
+        self.aggregation_norm = nn.LayerNorm(config.embed_dims)
         self.ffn = nn.Sequential(
             nn.Linear(config.embed_dims, config.ffn_dims),
             nn.ReLU(inplace=True),
@@ -300,7 +300,7 @@ class HybridSparseBoxDecoderLayer(nn.Module):
             nn.Dropout(config.dropout),
         )
         self.ffn_norm = nn.LayerNorm(config.embed_dims)
-        self.refinement = HybridBoxRefinement(config.embed_dims)
+        self.refinement = BoxRefinement(config.embed_dims)
 
     def _fused_keypoint_projection(self, query, state, metadata, extent):
         """Build, project and describe the keypoints in one kernel (OCam only)."""
@@ -333,13 +333,13 @@ class HybridSparseBoxDecoderLayer(nn.Module):
             self.keypoints.learnable_fc(query.float()), metadata["lidar2cam"],
             metadata["image_wh"], metadata["ocam_intrinsic"],
             metadata["ocam_pol"], torch.deg2rad(fov * 0.5), extent,
-            self.evidence.level_strides, points,
+            self.aggregation.level_strides, points,
             self.config.fixed_keypoint_scale,
         )
         empty = rays.new_empty((0,))
         projection = BoxPointProjection(
             uv=uv.reshape(batch, queries, points, cameras, 2),
-            geometry=FisheyeObservationGeometry(
+            geometry=ObservationGeometry(
                 rays=rays.reshape(batch, queries, points, cameras, 3),
                 tangent=empty, jacobian=empty, lens_margin=empty, overlap=empty,
                 valid=valid.reshape(batch, queries, points, cameras),
@@ -351,13 +351,13 @@ class HybridSparseBoxDecoderLayer(nn.Module):
     def forward(
         self,
         query: Tensor,
-        state: HybridBoxState,
+        state: BoxState,
         metadata: dict,
         formatted_fpn: tuple[Tensor, Tensor, Tensor],
         self_attention_mask: Tensor | None = None,
-    ) -> tuple[Tensor, HybridBoxState, FisheyeBoxEvidenceOutput, Tensor]:
+    ) -> tuple[Tensor, BoxState, AggregationOutput, Tensor]:
         use_fused = (
-            self.config.projection_type == "ocam_fisheye"
+            self.config.projection_type == "ocam"
             and not self.training
             and not torch.is_grad_enabled()
             and state.direction.is_cuda
@@ -375,7 +375,7 @@ class HybridSparseBoxDecoderLayer(nn.Module):
             position = self.position_encoder.encoder(position_inputs)
         else:
             position = self.position_encoder(state)
-            extent = hybrid_log_angular_extent(state)
+            extent = log_angular_extent_of(state)
         attended, _ = self.self_attention(
             query + position,
             query + position,
@@ -394,7 +394,7 @@ class HybridSparseBoxDecoderLayer(nn.Module):
             point_rays = normalize_direction(keypoints)
             projection = project_box_keypoints(self.projector, keypoints, metadata)
             precomputed_geometry = None
-        evidence = self.evidence.forward_fused_daf(
+        evidence = self.aggregation(
             query,
             projection,
             extent,
@@ -402,18 +402,18 @@ class HybridSparseBoxDecoderLayer(nn.Module):
             formatted_fpn,
             precomputed_geometry,
         )
-        query = self.evidence_norm(evidence.query)
+        query = self.aggregation_norm(evidence.query)
         query = self.ffn_norm(query + self.ffn(query))
         state = self.refinement(query, state, position, evidence.signed_face_features)
         return query, state, evidence, position
 
 
 @dataclass(frozen=True)
-class HybridBoxDecoderOutput:
+class ROSADecoderOutput:
     classification: tuple[Tensor, ...]
     prediction: tuple[Tensor, ...]
     quality: tuple[Tensor, ...]
-    states: tuple[HybridBoxState, ...]
+    states: tuple[BoxState, ...]
     camera_level_attention: tuple[Tensor, ...]
     point_attention: tuple[Tensor, ...]
     level_compatibility: tuple[Tensor, ...]
@@ -421,20 +421,20 @@ class HybridBoxDecoderOutput:
     query: Tensor
 
 
-class HybridSparseBoxDecoder(nn.Module):
+class ROSADecoder(nn.Module):
     """Six-stage hybrid-state box decoder."""
 
     def __init__(
         self,
-        config: HybridBoxDecoderConfig | None = None,
+        config: ROSADecoderConfig | None = None,
         *,
-        projector: NativeFisheyeProjector | None = None,
+        projector: Projector | None = None,
     ) -> None:
         super().__init__()
-        self.config = config or HybridBoxDecoderConfig()
-        self.projector = projector or NativeFisheyeProjector()
+        self.config = config or ROSADecoderConfig()
+        self.projector = projector or Projector()
         self.layers = nn.ModuleList(
-            HybridSparseBoxDecoderLayer(
+            ROSADecoderLayer(
                 self.config,
                 self.projector,
                 # The first stage also conditions the query on its centre point.
@@ -484,10 +484,10 @@ class HybridSparseBoxDecoder(nn.Module):
         anchor: Tensor,
         *,
         self_attention_mask: Tensor | None = None,
-    ) -> HybridBoxDecoderOutput:
+    ) -> ROSADecoderOutput:
         from projects.mmdet3d_plugin.ops import feature_maps_format
 
-        state = HybridBoxState.from_sparse_anchor(anchor)
+        state = BoxState.from_sparse_anchor(anchor)
         query = instance_feature
         formatted_fpn = feature_maps_format(fpn)
 
@@ -521,7 +521,7 @@ class HybridSparseBoxDecoder(nn.Module):
             camera_level_attention.append(evidence.camera_level_attention)
             point_attention.append(evidence.point_attention)
             level_compatibility.append(evidence.level_compatibility)
-        return HybridBoxDecoderOutput(
+        return ROSADecoderOutput(
             classification=tuple(classifications),
             prediction=tuple(predictions),
             quality=tuple(qualities),
@@ -535,9 +535,9 @@ class HybridSparseBoxDecoder(nn.Module):
 
 
 __all__ = [
-    "HybridBoxDecoderConfig",
-    "HybridBoxDecoderOutput",
-    "HybridSparseBoxDecoder",
-    "HybridBoxRefinement",
-    "HybridBoxState",
+    "ROSADecoderConfig",
+    "ROSADecoderOutput",
+    "ROSADecoder",
+    "BoxRefinement",
+    "BoxState",
 ]

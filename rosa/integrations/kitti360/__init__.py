@@ -3,23 +3,23 @@
 from .backbone import ROSAVoVNetCP, register_vovnet
 from .constants import CAMERAS, CLASSES
 from .dataset import (
-    DAPETRGlobalRotScale,
-    DAPETRImageAugment,
-    KITTI360MixedCameraDataset,
-    KITTI360ObjectRangeFilter,
-    LoadKITTI360MixedCameraImages,
+    KITTI360GlobalRotScale,
+    KITTI360ImageAugment,
+    KITTI360Dataset,
+    KITTI360RangeFilter,
+    LoadKITTI360Images,
 )
-from .metric import KITTI360DAPETRMetric
+from .metric import KITTI360Metric
 
 __all__ = [
     "CAMERAS",
     "CLASSES",
-    "DAPETRGlobalRotScale",
-    "DAPETRImageAugment",
-    "KITTI360MixedCameraDataset",
-    "KITTI360DAPETRMetric",
-    "KITTI360ObjectRangeFilter",
-    "LoadKITTI360MixedCameraImages",
+    "KITTI360GlobalRotScale",
+    "KITTI360ImageAugment",
+    "KITTI360Dataset",
+    "KITTI360Metric",
+    "KITTI360RangeFilter",
+    "LoadKITTI360Images",
     "ROSAVoVNetCP",
     "register_vovnet",
 ]

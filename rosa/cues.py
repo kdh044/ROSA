@@ -11,7 +11,7 @@ import torch
 from torch import Tensor
 
 
-def angular_fpn_geometry(
+def projection_cues(
     tangent: Tensor,
     jacobian: Tensor,
     lens_margin: Tensor,
@@ -109,4 +109,4 @@ def angular_fpn_geometry(
 
 
 
-__all__ = ["angular_fpn_geometry"]
+__all__ = ["projection_cues"]

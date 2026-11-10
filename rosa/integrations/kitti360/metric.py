@@ -125,7 +125,7 @@ def _filter(
 
 
 @METRICS.register_module()
-class KITTI360DAPETRMetric(BaseMetric):
+class KITTI360Metric(BaseMetric):
     """nuScenes AP/TP metrics with AAE removed and NDS rebalanced.
 
     NDS = (5*mAP + ATE_score + ASE_score + AOE_score + AVE_score) / 9.
@@ -307,4 +307,4 @@ class KITTI360DAPETRMetric(BaseMetric):
         return metrics
 
 
-__all__ = ["KITTI360DAPETRMetric", "KITTI360DetectionBox"]
+__all__ = ["KITTI360Metric", "KITTI360DetectionBox"]

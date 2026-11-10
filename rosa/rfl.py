@@ -40,9 +40,6 @@ class SphericalRayFeatureLifting(nn.Module):
         self.output_proj = nn.Linear(self.hidden_dims, self.embed_dims, bias=False)
         self.reset_parameters()
 
-    @classmethod
-    def for_compact_profile(cls, embed_dims: int = 256) -> "SphericalRayFeatureLifting":
-        return cls(embed_dims=embed_dims, hidden_dims=16)
 
     def reset_parameters(self) -> None:
         nn.init.xavier_uniform_(self.appearance_proj.weight)

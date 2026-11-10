@@ -4,10 +4,15 @@
 
 DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</sup> Corresponding author</sub>
 
-ROSA is a camera-only 3D object detector for **surround-view fisheye cameras**.
-It works directly on the raw fisheye images, without undistortion, and decides
-which camera and which feature scale to trust for each observation of an
-object, based on where and how that object appears in each fisheye view.
+**Downloads** (Hugging Face):
+[Fisheye3DOD](https://huggingface.co/datasets/danny042/Fisheye3DOD) ·
+[KITTI-360 fisheye](https://huggingface.co/datasets/danny042/KITTI-360-fisheye) —
+datasets, info files and ROSA checkpoints (in `checkpoints/` of each repository)
+
+ROSA is a camera-only 3D object detector for surround-view **fisheye** cameras.
+It runs on the raw fisheye images, without undistortion, and for every
+observation of an object it decides which camera and which feature scale to
+trust, from where and how the object appears in each fisheye view.
 
 <p align="center">
   <img src="assets/demo/fisheye3dod.jpg" width="100%">
@@ -23,51 +28,25 @@ object, based on where and how that object appears in each fisheye view.
 ## Overview
 
 <p align="center">
-  <img src="assets/figures/motivation.png" width="100%">
-</p>
-
-<p align="center">
   <img src="assets/figures/overview.png" width="100%">
-</p>
-
-<p align="center">
-  <img src="assets/figures/box_refinement.png" width="45%">
-  &nbsp;
-  <img src="assets/figures/decoder_comparison.png" width="45%">
 </p>
 
 ## Qualitative results
 
+Sparse4D (top) and ROSA (bottom) on Fisheye3DOD and KITTI-360.
+
 <p align="center">
   <img src="assets/figures/qualitative_fisheye3dod.jpg" width="100%">
-</p>
-
-<p align="center">
   <img src="assets/figures/qualitative_kitti360.jpg" width="100%">
-</p>
-
-<p align="center">
-  <img src="assets/figures/qualitative_bev.jpg" width="100%">
-</p>
-
-## Analysis
-
-<p align="center">
-  <img src="assets/figures/aggregation_weights.jpg" width="100%">
-</p>
-
-<p align="center">
-  <img src="assets/figures/fpn_resolution.jpg" width="80%">
 </p>
 
 ## Getting started
 
-| | |
-|---|---|
-| [Installation](docs/INSTALL.md) | environment, CUDA ops |
-| [Data](docs/DATA.md) | Fisheye3DOD and KITTI-360 download, pretrained weights |
-| [Getting started](docs/GETTING_STARTED.md) | checkpoints, evaluation, training, runtime |
-| [Results](docs/RESULTS.md) | comparison tables and ablation |
+1. [Installation](docs/INSTALL.md): create a Python environment and run `bash tools/install.sh`.
+2. [Data](docs/DATA.md): download the datasets and checkpoints from Hugging Face.
+3. [Train and evaluate](docs/GETTING_STARTED.md): one command each.
+
+Results of all compared methods: [docs/RESULTS.md](docs/RESULTS.md).
 
 ## Citation
 

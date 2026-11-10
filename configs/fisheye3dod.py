@@ -65,14 +65,14 @@ model = dict(
     head=dict(
         type="ROSAHead",
         num_decoder=6,
-        hybrid_decoder_cfg=dict(
+        decoder_cfg=dict(
             embed_dims=256,
             num_classes=len(classes),
             num_cameras=4,
             num_learnable_points=6,
             fixed_keypoint_scale=0.45,
             # Fused DAF + camera RFL kernel (inference only, OCam).
-            streaming_camera_rfl_cuda=True,
+            fused_camera_rfl=True,
         ),
         instance_bank=dict(
             type="InstanceBank",
@@ -101,7 +101,7 @@ model = dict(
             loss_weight=2.0,
         ),
         loss_reg=dict(
-            type="EvaluatorAlignedSparseBox3DLoss",
+            type="ROSABoxLoss",
             loss_box=dict(type="mmdet.L1Loss", loss_weight=0.25),
             loss_centerness=dict(type="mmdet.CrossEntropyLoss", use_sigmoid=True),
             loss_yawness=dict(type="mmdet.GaussianFocalLoss"),
@@ -119,7 +119,7 @@ model = dict(
 
 # ----------------------------------------------------------------- data
 load_images = dict(
-    type="LoadOfficialFisheye3DODForSparse4D",
+    type="LoadFisheye3DODImages",
     cam_names=cameras,
     to_float32=True,
 )
@@ -133,7 +133,7 @@ train_pipeline = [
         with_label=False,
     ),
     # Ground truth beyond the evaluator's class ranges is dropped.
-    dict(type="Fisheye3DODEvaluatorRangeFilter"),
+    dict(type="Fisheye3DODRangeFilter"),
     dict(type="PackSparse4DInputs", ocam_lens_fov_deg=220.0),
 ]
 test_pipeline = [
@@ -141,7 +141,7 @@ test_pipeline = [
     dict(type="PackSparse4DInputs", ocam_lens_fov_deg=220.0),
 ]
 dataset = dict(
-    type="Fisheye3DODSparse4DDataset",
+    type="ROSAFisheye3DODDataset",
     data_root=data_root,
     metainfo=dict(classes=classes),
     with_velocity=True,
@@ -186,7 +186,7 @@ optim_wrapper = dict(
         custom_keys={
             "img_backbone": dict(lr_mult=0.5),
             # Range-uncertainty heads are clipped with their own norm.
-            "head.fisheye_box_decoder.range_uncertainty_heads": dict(separate_clip=True),
+            "head.rosa_decoder.range_uncertainty_heads": dict(separate_clip=True),
         }
     ),
     clip_grad=dict(max_norm=25, norm_type=2, error_if_nonfinite=True),

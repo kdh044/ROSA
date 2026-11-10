@@ -29,13 +29,13 @@ OFFICIAL_TO_ROSA_OCAM = np.asarray(
 
 
 @dataclass(frozen=True)
-class ROSAOcamCalibration:
+class OCamCalibration:
     intrinsic: np.ndarray
     polynomial: np.ndarray
     lens_fov_deg: float
 
 
-def convert_ocamcamera(ocam: OcamLike) -> ROSAOcamCalibration:
+def convert_ocamcamera(ocam: OcamLike) -> OCamCalibration:
     """Convert an ``OcamCamera``; the polynomial is copied unchanged."""
 
     affine = np.asarray(ocam._affine, dtype=np.float32)
@@ -57,7 +57,7 @@ def convert_ocamcamera(ocam: OcamLike) -> ROSAOcamCalibration:
     lens_fov_deg = float(ocam._fov)
     if not np.isfinite(lens_fov_deg) or not 0 < lens_fov_deg <= 360:
         raise ValueError("OCam FOV must be finite and in (0,360]")
-    return ROSAOcamCalibration(
+    return OCamCalibration(
         intrinsic=intrinsic,
         polynomial=polynomial,
         lens_fov_deg=lens_fov_deg,
@@ -73,7 +73,7 @@ def convert_lidar2cam(lidar2cam: np.ndarray) -> np.ndarray:
 
 __all__ = [
     "OFFICIAL_TO_ROSA_OCAM",
-    "ROSAOcamCalibration",
+    "OCamCalibration",
     "convert_lidar2cam",
     "convert_ocamcamera",
 ]

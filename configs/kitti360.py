@@ -65,13 +65,13 @@ model = dict(
     head=dict(
         type="ROSAHead",
         num_decoder=6,
-        hybrid_decoder_cfg=dict(
+        decoder_cfg=dict(
             embed_dims=256,
             num_classes=len(classes),
             num_cameras=4,
             num_learnable_points=6,
             fixed_keypoint_scale=0.45,
-            projection_type="mixed_kitti360",
+            projection_type="pinhole_mei",
         ),
         instance_bank=dict(
             type="InstanceBank",
@@ -100,7 +100,7 @@ model = dict(
             loss_weight=2.0,
         ),
         loss_reg=dict(
-            type="EvaluatorAlignedSparseBox3DLoss",
+            type="ROSABoxLoss",
             loss_box=dict(type="mmdet.L1Loss", loss_weight=0.25),
             loss_centerness=dict(type="mmdet.CrossEntropyLoss", use_sigmoid=True),
             loss_yawness=dict(type="mmdet.GaussianFocalLoss"),
@@ -118,25 +118,25 @@ model = dict(
 
 # ----------------------------------------------------------------- data
 load_images = dict(
-    type="LoadKITTI360MixedCameraImages",
+    type="LoadKITTI360Images",
     cameras=cameras,
     data_root=data_root,
     to_float32=True,
 )
 train_pipeline = [
     load_images,
-    dict(type="DAPETRImageAugment", training=True),
-    dict(type="DAPETRGlobalRotScale", training=True),
-    dict(type="KITTI360ObjectRangeFilter"),
+    dict(type="KITTI360ImageAugment", training=True),
+    dict(type="KITTI360GlobalRotScale", training=True),
+    dict(type="KITTI360RangeFilter"),
     dict(type="PackSparse4DInputs"),
 ]
 test_pipeline = [
     load_images,
-    dict(type="DAPETRImageAugment", training=False),
+    dict(type="KITTI360ImageAugment", training=False),
     dict(type="PackSparse4DInputs"),
 ]
 dataset = dict(
-    type="KITTI360MixedCameraDataset",
+    type="KITTI360Dataset",
     data_root=data_root,
     metainfo=dict(classes=classes),
     with_velocity=True,
@@ -171,7 +171,7 @@ val_dataloader = dict(
 )
 test_dataloader = val_dataloader
 val_evaluator = dict(
-    type="KITTI360DAPETRMetric",
+    type="KITTI360Metric",
     ann_file=os.path.join(data_root, ann_dir, "kitti360_rosa_infos_val.pkl"),
     prefix="kitti360_bev",
 )
@@ -185,7 +185,7 @@ optim_wrapper = dict(
         custom_keys={
             "img_backbone": dict(lr_mult=0.5),
             # Range-uncertainty heads are clipped with their own norm.
-            "head.fisheye_box_decoder.range_uncertainty_heads": dict(separate_clip=True),
+            "head.rosa_decoder.range_uncertainty_heads": dict(separate_clip=True),
         }
     ),
     clip_grad=dict(max_norm=25, norm_type=2, error_if_nonfinite=True),

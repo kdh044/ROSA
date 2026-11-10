@@ -12,7 +12,7 @@ from projects.mmdet3d_plugin.models.detection3d.losses import SparseBox3DLoss
 
 
 
-def evaluator_aligned_centerness_target(
+def centerness_target(
     prediction: Tensor,
     target: Tensor,
 ) -> Tensor:
@@ -34,7 +34,7 @@ def evaluator_aligned_centerness_target(
 
 
 @MODELS.register_module()
-class EvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
+class ROSABoxLoss(SparseBox3DLoss):
     """Sparse4D box loss with the evaluator-aligned BEV centerness target."""
 
     def forward(
@@ -61,10 +61,10 @@ class EvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
         if quality is None:
             return output
         centerness = quality[..., CNS]
-        centerness_target = evaluator_aligned_centerness_target(box, box_target)
+        cns_target = centerness_target(box, box_target)
         output[f"loss_cns{suffix}"] = self.loss_cns(
             centerness,
-            centerness_target,
+            cns_target,
             avg_factor=avg_factor,
         )
         yawness = quality[..., YNS].sigmoid()
@@ -87,6 +87,6 @@ class EvaluatorAlignedSparseBox3DLoss(SparseBox3DLoss):
 
 
 __all__ = [
-    "EvaluatorAlignedSparseBox3DLoss",
-    "evaluator_aligned_centerness_target",
+    "ROSABoxLoss",
+    "centerness_target",
 ]

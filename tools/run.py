@@ -100,10 +100,10 @@ def _compile_for_benchmark(model: torch.nn.Module) -> list[str]:
     """
 
     for module in model.modules():
-        if hasattr(module, "streaming_compact_weights"):
+        if hasattr(module, "fused_logit_weights"):
             with torch.no_grad():
-                key, reliability = (t.detach().clone() for t in module.streaming_compact_weights())
-            module.streaming_compact_weights = lambda key=key, reliability=reliability: (key, reliability)
+                key, reliability = (t.detach().clone() for t in module.fused_logit_weights())
+            module.fused_logit_weights = lambda key=key, reliability=reliability: (key, reliability)
 
     def compile_inplace(module: torch.nn.Module) -> None:
         compiled = torch.compile(module.forward, mode="reduce-overhead")
@@ -115,7 +115,7 @@ def _compile_for_benchmark(model: torch.nn.Module) -> list[str]:
         if module is not None:
             compile_inplace(module)
             targets.append(name)
-    decoder = getattr(getattr(model, "head", None), "fisheye_box_decoder", None)
+    decoder = getattr(getattr(model, "head", None), "rosa_decoder", None)
     if decoder is not None:
         for layer in decoder.layers:
             compile_inplace(layer)

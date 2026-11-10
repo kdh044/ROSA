@@ -1,6 +1,6 @@
 """Projection of box keypoints into the native camera images.
 
-``NativeFisheyeProjector`` applies the rig transform and computes the
+``Projector`` applies the rig transform and computes the
 projection cues; a lens backend maps camera rays to pixels: OCam for
 Fisheye3DOD, pinhole + MEI for KITTI-360.
 """
@@ -15,12 +15,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from .kitti360_projection import mixed_camera_project_rays_to_pixels
+from .pinhole_mei import pinhole_mei_project_rays
 from .ray import normalize_direction, spherical_tangent_basis
 
 
 @dataclass(frozen=True)
-class FisheyeObservationGeometry:
+class ObservationGeometry:
     """Calibrated per-query geometry, ``[B,Q,C,...]``.
 
     ``rays`` are camera-frame unit rays, ``tangent`` the observation in the
@@ -47,11 +47,11 @@ class LensProjection:
 
 
 @dataclass(frozen=True)
-class NativeFisheyeProjection:
+class Projection:
     """Normalized pixels plus the projection cues of every camera."""
 
     uv: Tensor
-    geometry: FisheyeObservationGeometry
+    geometry: ObservationGeometry
 
 
 def _expand_fov(raw_fov, reference: Tensor) -> Tensor:
@@ -84,7 +84,7 @@ def _polynomial_and_derivative(
     return output, derivative
 
 
-class OCamFisheyeProjection(nn.Module):
+class OCamProjection(nn.Module):
     """Full-FOV OCam backend with an analytic pixel/radian Jacobian."""
 
     required_metadata = (
@@ -203,7 +203,7 @@ class OCamFisheyeProjection(nn.Module):
         )
 
 
-class MixedPinholeMEIProjection(nn.Module):
+class PinholeMEIProjection(nn.Module):
     """KITTI-360 backend: pinhole cameras and unified (MEI) fisheye cameras."""
 
     required_metadata = (
@@ -230,7 +230,7 @@ class MixedPinholeMEIProjection(nn.Module):
             raise ValueError("image_wh must be [B,C,2]")
 
         ray = normalize_direction(camera_rays)
-        pixels, domain_valid = mixed_camera_project_rays_to_pixels(ray, metadata)
+        pixels, domain_valid = pinhole_mei_project_rays(ray, metadata)
         width = image_wh[:, None, :, 0].to(device=ray.device, dtype=ray.dtype)
         height = image_wh[:, None, :, 1].to(device=ray.device, dtype=ray.dtype)
         uv = torch.stack((pixels[..., 0] / width, pixels[..., 1] / height), dim=-1)
@@ -252,10 +252,10 @@ class MixedPinholeMEIProjection(nn.Module):
         def derivative(tangent: Tensor) -> Tensor:
             positive = normalize_direction(ray * cosine + tangent * sine)
             negative = normalize_direction(ray * cosine - tangent * sine)
-            positive_pixel = mixed_camera_project_rays_to_pixels(
+            positive_pixel = pinhole_mei_project_rays(
                 positive, metadata
             )[0]
-            negative_pixel = mixed_camera_project_rays_to_pixels(
+            negative_pixel = pinhole_mei_project_rays(
                 negative, metadata
             )[0]
             return (positive_pixel - negative_pixel) / (2.0 * epsilon)
@@ -306,7 +306,7 @@ def _spherical_log_coordinates(origin: Tensor, target: Tensor) -> Tensor:
     return torch.where(regular, coordinates, torch.zeros_like(coordinates))
 
 
-class NativeFisheyeProjector(nn.Module):
+class Projector(nn.Module):
     """Transform ego rays/points and apply an interchangeable lens backend."""
 
     def __init__(
@@ -322,7 +322,7 @@ class NativeFisheyeProjector(nn.Module):
         if torch.linalg.vector_norm(forward).le(1e-6):
             raise ValueError("camera_forward must be non-zero")
         self.register_buffer("camera_forward", F.normalize(forward, dim=0), persistent=False)
-        self.lens = lens or OCamFisheyeProjection()
+        self.lens = lens or OCamProjection()
 
     def forward(
         self,
@@ -330,7 +330,7 @@ class NativeFisheyeProjector(nn.Module):
         metadata: dict,
         *,
         points: Tensor | None = None,
-    ) -> NativeFisheyeProjection:
+    ) -> Projection:
         if direction.ndim != 3 or direction.shape[-1] != 3:
             raise ValueError("direction must be [B,Q,3]")
         transform = metadata["lidar2cam"].to(
@@ -389,7 +389,7 @@ class NativeFisheyeProjector(nn.Module):
         )
         overlap = overlap.expand(-1, -1, cameras)[..., None]
         overlap = torch.where(lens.valid[..., None], overlap, torch.zeros_like(overlap))
-        geometry = FisheyeObservationGeometry(
+        geometry = ObservationGeometry(
             rays=camera_rays,
             tangent=tangent,
             jacobian=lens.jacobian,
@@ -397,24 +397,24 @@ class NativeFisheyeProjector(nn.Module):
             overlap=overlap,
             valid=lens.valid,
         )
-        return NativeFisheyeProjection(uv=lens.uv, geometry=geometry)
+        return Projection(uv=lens.uv, geometry=geometry)
 
 
-def make_native_projector(projection_type: str) -> NativeFisheyeProjector:
+def build_projector(projection_type: str) -> Projector:
     """Projector for the dataset's camera model."""
 
-    if projection_type == "ocam_fisheye":
-        return NativeFisheyeProjector()
-    if projection_type == "mixed_kitti360":
-        return NativeFisheyeProjector(MixedPinholeMEIProjection(), camera_forward=(0.0, 0.0, 1.0))
+    if projection_type == "ocam":
+        return Projector()
+    if projection_type == "pinhole_mei":
+        return Projector(PinholeMEIProjection(), camera_forward=(0.0, 0.0, 1.0))
     raise ValueError(f"unsupported projection_type={projection_type!r}")
 
 
 __all__ = [
-    "MixedPinholeMEIProjection",
-    "make_native_projector",
+    "PinholeMEIProjection",
+    "build_projector",
     "LensProjection",
-    "NativeFisheyeProjection",
-    "NativeFisheyeProjector",
-    "OCamFisheyeProjection",
+    "Projection",
+    "Projector",
+    "OCamProjection",
 ]
