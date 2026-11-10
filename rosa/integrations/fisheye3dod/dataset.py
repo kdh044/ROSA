@@ -1,4 +1,4 @@
-"""Released-schema Fisheye3DOD dataset and native image transforms."""
+"""Fisheye3DOD dataset and image-loading transforms."""
 
 from __future__ import annotations
 
@@ -24,11 +24,10 @@ from .constants import (
     CLASSES,
     DEFAULT_OFFICIAL_REPO,
     OFFICIAL_CLASS_RANGES,
-    OFFICIAL_POINT_CLOUD_RANGE,
 )
 
-# Converter pickles may refer to ``utils.fisheye3dod_calib``.  Make the
-# released repository root available before Det3DDataset unpickles an info.
+# Info pickles may reference ``utils.fisheye3dod_calib`` from the official
+# Fisheye3DOD repository, so add it to ``sys.path`` before unpickling.
 _official_root = Path(
     os.environ.get("FISHEYE3DOD_OFFICIAL_ROOT", DEFAULT_OFFICIAL_REPO)
 ).resolve()
@@ -45,7 +44,7 @@ def _stable_instance_id(scene: str, raw_id: object) -> int:
 
 @DATASETS.register_module()
 class Fisheye3DODSparse4DDataset(Det3DDataset):
-    """Read released ``fisheye3dod_infos_*.pkl`` files without rewriting."""
+    """Read the official ``fisheye3dod_infos_*.pkl`` files."""
 
     METAINFO = {
         "classes": (
@@ -148,37 +147,11 @@ class Fisheye3DODSparse4DDataset(Det3DDataset):
         return info
 
 
-@TRANSFORMS.register_module()
-class OfficialFisheye3DODRangeFilter(BaseTransform):
-    """Released BEV range filter with instance IDs kept aligned."""
-
-    def transform(self, results: dict) -> dict:
-        annotation = results.get("ann_info")
-        if not annotation:
-            return results
-        boxes = annotation["gt_bboxes_3d"]
-        labels = np.asarray(annotation["gt_labels_3d"], dtype=np.int64)
-        keep_tensor = boxes.in_range_bev(
-            boxes.tensor.new_tensor(
-                (
-                    OFFICIAL_POINT_CLOUD_RANGE[0],
-                    OFFICIAL_POINT_CLOUD_RANGE[1],
-                    OFFICIAL_POINT_CLOUD_RANGE[3],
-                    OFFICIAL_POINT_CLOUD_RANGE[4],
-                )
-            )
-        )
-        keep = keep_tensor.detach().cpu().numpy().astype(bool)
-        annotation["gt_bboxes_3d"] = boxes[keep_tensor]
-        annotation["gt_labels_3d"] = labels[keep]
-        if "instance_inds" in annotation:
-            annotation["instance_inds"] = np.asarray(annotation["instance_inds"])[keep]
-        return results
 
 
 @TRANSFORMS.register_module()
 class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
-    """Apply the evaluator's exact class-conditional radial GT range."""
+    """Apply the evaluator's class-dependent radial GT range."""
 
     class_ranges = tuple(float(OFFICIAL_CLASS_RANGES[name]) for name in CLASSES)
 
@@ -197,7 +170,7 @@ class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
         label_tensor = boxes.tensor.new_tensor(labels, dtype=torch.long)
         limits = boxes.tensor.new_tensor(self.class_ranges)[label_tensor]
         radius = torch.linalg.vector_norm(boxes.tensor[:, :2], dim=-1)
-        # The released evaluator uses strict `ego_dist < class_range`.
+        # The evaluator uses strict `ego_dist < class_range`.
         keep_tensor = radius < limits
         keep = keep_tensor.detach().cpu().numpy().astype(bool)
         annotation["gt_bboxes_3d"] = boxes[keep_tensor]
@@ -211,7 +184,7 @@ class Fisheye3DODEvaluatorRangeFilter(BaseTransform):
 
 @TRANSFORMS.register_module()
 class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
-    """Load four native 800×800 OCam images in the fixed released order."""
+    """Load the four 800x800 OCam images in a fixed camera order."""
 
     _EMIT_CAM2EGO = True
 
@@ -224,8 +197,6 @@ class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
         self.cam_names = tuple(cam_names)
         self.to_float32 = bool(to_float32)
         self.color_type = color_type
-        if self.cam_names != CAMERAS:
-            raise ValueError(f"paired protocol fixes camera order to {CAMERAS}")
 
     def transform(self, results: dict) -> dict:
         camera_infos = results["cam_info"]["cam_fisheye"]
@@ -235,8 +206,6 @@ class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
             info = camera_infos[camera]
             path = str(info["cam_path"])
             image = mmcv.imread(path, flag=self.color_type)
-            if image is None:
-                raise FileNotFoundError(path)
             if image.shape[:2] != (
                 CAMERA_IMAGE_SIZE[1],
                 CAMERA_IMAGE_SIZE[0],
@@ -285,10 +254,9 @@ class LoadOfficialFisheye3DODForSparse4D(BaseTransform):
 class LoadOfficialFisheye3DODLeanForSparse4D(
     LoadOfficialFisheye3DODForSparse4D
 ):
-    """Exact native loader without the unused camera-pose inverse.
+    """Same loader without the ``cam2ego`` output.
 
-    This variant is only for pipelines that do not consume ``cam2ego``.  Keep
-    the default loader for the optional ego D4/C4 augmentation branches.
+    Use the default loader for pipelines that need ``cam2ego``.
     """
 
     _EMIT_CAM2EGO = False
@@ -299,5 +267,4 @@ __all__ = [
     "Fisheye3DODSparse4DDataset",
     "LoadOfficialFisheye3DODLeanForSparse4D",
     "LoadOfficialFisheye3DODForSparse4D",
-    "OfficialFisheye3DODRangeFilter",
 ]

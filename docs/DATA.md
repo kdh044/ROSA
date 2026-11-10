@@ -1,8 +1,8 @@
 # Data preparation
 
-ROSA reads two benchmarks. Neither is redistributed here — download them from
-their original sources and place them under `data/`, or point the environment
-variables at wherever they already live.
+Both benchmarks are mirrored on Hugging Face in their original layout,
+together with the info files ROSA reads. Nothing has to be converted: download,
+extract, and point ROSA at the folder.
 
 ```
 data/
@@ -10,106 +10,73 @@ data/
 └── KITTI-360/
 ```
 
+Use `data/` inside the repository, or set `ROSA_DATA_ROOT` /
+`ROSA_KITTI360_ROOT` to the folders.
+
 ## Fisheye3DOD
 
-Download from the [official
-repository](https://github.com/weiyangdaren/Fisheye3DOD). The expected layout
-is the one the release ships:
+Source: [Fisheye3DOD](https://github.com/weiyangdaren/Fisheye3DOD), mirrored at
+[`danny042/Fisheye3DOD`](https://huggingface.co/datasets/danny042/Fisheye3DOD)
+(126 scenes, 163 GB).
+
+```bash
+hf download danny042/Fisheye3DOD --repo-type dataset --local-dir data/Fisheye3DOD \
+    --include "scenes/*" --include "ImageSets-main126/*" --include "calib_results.txt"
+cd data/Fisheye3DOD && for f in scenes/*.tar; do tar -xf "$f" && rm "$f"; done && cd -
+```
 
 ```
 data/Fisheye3DOD/
 ├── calib_results.txt
 ├── ImageSets-main126/
-│   ├── fisheye3dod_infos_train.pkl
-│   ├── fisheye3dod_infos_val.pkl
-│   └── fisheye3dod_sensor_transform.pkl
+│   ├── fisheye3dod_infos_train.pkl      8,820 frames
+│   └── fisheye3dod_infos_val.pkl        3,906 frames
 ├── train-Town01_Opt-ClearNight-.../
-├── train-Town01_Opt-ClearNoon-.../
-└── ...
+└── ...                                  126 scene folders
 ```
 
-We evaluate on 3,906 validation frames from 126 scenes, scoring objects
-within 48 m. If your dataset is elsewhere:
-
-```bash
-export ROSA_DATA_ROOT=/path/to/Fisheye3DOD
-```
-
-The anchor file shipped in `assets/` is the 300-cluster k-means anchor set fit
-on the training split with seed 3407. It is what the released config
-uses; regenerating it is unnecessary.
+Evaluation uses the official Fisheye3DOD metric (objects within the class
+ranges, up to 48 m). The anchor file is in `assets/`.
 
 ## KITTI-360
 
-Download from the [KITTI-360 website](https://www.cvlibs.net/datasets/kitti-360/).
-ROSA uses the two perspective cameras and the two 205° MEI fisheyes, so you
-need `data_2d_raw`, `data_3d_bboxes` and `calibration`. `data_3d_raw` is only
-required if you want to render the LiDAR BEV figures.
+Source: [KITTI-360](https://www.cvlibs.net/datasets/kitti-360/) (CC BY-NC-SA
+3.0), mirrored at
+[`danny042/KITTI-360-fisheye`](https://huggingface.co/datasets/danny042/KITTI-360-fisheye).
+ROSA uses the two rectified perspective cameras and the two MEI fisheyes
+(94 GB); the LiDAR folder of the mirror is not needed.
+
+```bash
+hf download danny042/KITTI-360-fisheye --repo-type dataset --local-dir data/KITTI-360 \
+    --include "data_2d_raw/*" --include "calibration/*" --include "ImageSets-rosa-6class/*"
+cd data/KITTI-360 && for f in data_2d_raw/*.tar; do tar -xf "$f" && rm "$f"; done && cd -
+```
 
 ```
 data/KITTI-360/
 ├── calibration/
-├── data_2d_raw/
-├── data_3d_bboxes/
+├── data_2d_raw/2013_05_28_drive_*_sync/image_0{0,1,2,3}/
 └── ImageSets-rosa-6class/
-    ├── kitti360_rosa_infos_train.pkl
-    └── kitti360_rosa_infos_val.pkl
+    ├── kitti360_rosa_infos_train.pkl    10,999 frames
+    └── kitti360_rosa_infos_val.pkl       2,860 frames
 ```
+
+The info files hold six classes (car, truck, trailer, motorcycle, bicycle,
+pedestrian) at 2 Hz from nine drives, in the nuScenes-style format of the
+metric. The anchor file (300 k-means centres of the training boxes) is in
+`assets/`.
+
+## Pretrained weights
+
+All weights are on Hugging Face, next to the datasets:
 
 ```bash
-export ROSA_KITTI360_ROOT=/path/to/KITTI-360
+# ROSA checkpoints
+hf download danny042/Fisheye3DOD checkpoints/rosa_fisheye3dod_r18_20e.pth --repo-type dataset --local-dir .
+hf download danny042/KITTI-360-fisheye checkpoints/rosa_kitti360_vov99_24e.pth --repo-type dataset --local-dir .
+# VoVNet-99 initialization for KITTI-360 training (FCOS3D weights from PETR)
+hf download danny042/KITTI-360-fisheye checkpoints/fcos3d_vovnet_imgbackbone-remapped.pth --repo-type dataset --local-dir .
 ```
 
-### Info files
-
-The `ImageSets-rosa-6class` pickles convert KITTI-360 into the nuScenes-style
-format the metric expects: six classes (car, truck, trailer, motorcycle,
-bicycle, pedestrian), 2 Hz keyframes, 10,999 training and 2,860 validation
-samples drawn from nine drives.
-
-They are released alongside the checkpoints — see
-[MODEL_ZOO.md](MODEL_ZOO.md) — but they can also be rebuilt from the raw
-dataset:
-
-```bash
-export ROSA_KITTI360_ROOT=/path/to/KITTI-360
-
-# parses the 3D bounding-box XML and the perspective/MEI calibration,
-# and writes kitti360_rosa_infos_{train,val}.pkl
-python tools/data_converter/build_kitti360_infos.py
-
-# k-means anchor initialization over the training box centers
-python tools/data_converter/build_kitti360_anchor.py \
-    --train-pkl $ROSA_KITTI360_ROOT/ImageSets-rosa-6class/kitti360_rosa_infos_train.pkl \
-    --num-anchor 300 --seed 3407 \
-    --output assets/kitti360_rosa_train_kmeans300_seed3407.npy
-```
-
-`tools/data_converter/kitti360_mixed_camera.py` holds the standalone
-perspective/MEI camera geometry the converter uses; it is the same projection
-the detector runs at training time, so the info files and the model agree by
-construction.
-
-The Fisheye3DOD info pickles ship with that benchmark and need no conversion;
-its anchor file is already in `assets/`.
-
-### Pretrained backbone
-
-The KITTI-360 arm starts from the FCOS3D-pretrained VoVNet-99 backbone
-released with Fisheye3DOD, remapped so its tensors load under the
-`img_backbone.` prefix. Download it from the release page and place it at:
-
-```
-weights/fcos3d_vovnet_imgbackbone-remapped.pth
-```
-
-or set `ROSA_VOVNET_CKPT`. Training without it is possible but will not
-reproduce the reported numbers.
-
-## Evaluation ranges
-
-| Benchmark | Classes | Range |
-|---|---|---|
-| Fisheye3DOD | Car, Van, Truck, Bus, Pedestrian, Cyclist | 48 m |
-| KITTI-360 | car, truck, trailer | 50 m |
-| KITTI-360 | pedestrian, bicycle, motorcycle | 40 m |
+The ResNet-18 ImageNet weights for Fisheye3DOD training are fetched
+automatically by torchvision. `ROSA_VOVNET_CKPT` overrides the VoVNet path.

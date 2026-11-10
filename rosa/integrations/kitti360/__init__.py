@@ -1,6 +1,6 @@
-"""FishBEVOD/DAPETR-compatible KITTI-360 integration."""
+"""DAPETR-compatible KITTI-360 integration."""
 
-from .backbone import register_fishbevod_vovnet
+from .backbone import ROSAVoVNetCP, register_vovnet
 from .constants import CAMERAS, CLASSES
 from .dataset import (
     DAPETRGlobalRotScale,
@@ -20,5 +20,6 @@ __all__ = [
     "KITTI360DAPETRMetric",
     "KITTI360ObjectRangeFilter",
     "LoadKITTI360MixedCameraImages",
-    "register_fishbevod_vovnet",
+    "ROSAVoVNetCP",
+    "register_vovnet",
 ]

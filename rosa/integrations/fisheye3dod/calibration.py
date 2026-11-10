@@ -1,4 +1,4 @@
-"""Convert released Fisheye3DOD OCam calibration to ROSA coordinates."""
+"""Convert Fisheye3DOD OCam calibration to ROSA coordinates."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ class OcamLike(Protocol):
     _fov: float
 
 
-# Released [right, down, forward] -> ROSA [down, right, back].
+# Fisheye3DOD [right, down, forward] -> ROSA [down, right, back].
 OFFICIAL_TO_ROSA_OCAM = np.asarray(
     (
         (0.0, 1.0, 0.0, 0.0),
@@ -26,8 +26,6 @@ OFFICIAL_TO_ROSA_OCAM = np.asarray(
     ),
     dtype=np.float32,
 )
-# Released name retained for source compatibility with experiment utilities.
-OFFICIAL_TO_SPARSE_OCAM = OFFICIAL_TO_ROSA_OCAM
 
 
 @dataclass(frozen=True)
@@ -37,11 +35,8 @@ class ROSAOcamCalibration:
     lens_fov_deg: float
 
 
-SparseOcamCalibration = ROSAOcamCalibration
-
-
 def convert_ocamcamera(ocam: OcamLike) -> ROSAOcamCalibration:
-    """Convert a released ``OcamCamera`` without changing its polynomial."""
+    """Convert an ``OcamCamera``; the polynomial is copied unchanged."""
 
     affine = np.asarray(ocam._affine, dtype=np.float32)
     if affine.shape != (3,):
@@ -59,11 +54,9 @@ def convert_ocamcamera(ocam: OcamLike) -> ROSAOcamCalibration:
         dtype=np.float32,
     )
     polynomial = np.asarray(ocam._invpol, dtype=np.float32)
-    if polynomial.ndim != 1 or polynomial.size < 2:
-        raise ValueError("released OCam inverse polynomial is missing")
     lens_fov_deg = float(ocam._fov)
     if not np.isfinite(lens_fov_deg) or not 0 < lens_fov_deg <= 360:
-        raise ValueError("released OCam FOV must be finite and in (0,360]")
+        raise ValueError("OCam FOV must be finite and in (0,360]")
     return ROSAOcamCalibration(
         intrinsic=intrinsic,
         polynomial=polynomial,
@@ -78,61 +71,9 @@ def convert_lidar2cam(lidar2cam: np.ndarray) -> np.ndarray:
     return OFFICIAL_TO_ROSA_OCAM @ matrix
 
 
-def project_rosa_compatible_numpy(
-    points_lidar: np.ndarray,
-    lidar2cam_rosa: np.ndarray,
-    calibration: ROSAOcamCalibration,
-    image_wh: tuple[int, int] = (800, 800),
-    *,
-    contract: str = "legacy_front_only",
-) -> np.ndarray:
-    """NumPy projection reference for either explicit OCam contract."""
-
-    if contract not in {"legacy_front_only", "full_fov"}:
-        raise ValueError(f"unknown projection contract: {contract}")
-    points = np.asarray(points_lidar, dtype=np.float64).reshape(-1, 3)
-    homogeneous = np.concatenate(
-        (points, np.ones((len(points), 1), dtype=np.float64)), axis=1
-    )
-    camera = (np.asarray(lidar2cam_rosa, dtype=np.float64) @ homogeneous.T).T
-    down, right, back = camera[:, 0], camera[:, 1], camera[:, 2]
-    planar = np.sqrt(down * down + right * right)
-    theta = np.arctan2(back, planar)
-    rho = np.polynomial.polynomial.polyval(
-        theta, calibration.polynomial.astype(np.float64)
-    )
-    scale = np.divide(rho, planar, out=np.zeros_like(rho), where=planar > 1e-12)
-    image_down = down * scale
-    image_right = right * scale
-    intrinsic = calibration.intrinsic.astype(np.float64)
-    u = intrinsic[1, 0] * image_down + intrinsic[1, 1] * image_right + intrinsic[0, 2]
-    v = intrinsic[0, 0] * image_down + intrinsic[0, 1] * image_right + intrinsic[1, 2]
-    width, height = image_wh
-    incidence = np.arctan2(planar, -back)
-    valid = (
-        (incidence <= np.deg2rad(calibration.lens_fov_deg / 2))
-        & (u >= 0)
-        & (u < width)
-        & (v >= 0)
-        & (v < height)
-    )
-    if contract == "legacy_front_only":
-        valid &= back < 0
-    uv = np.stack((u, v), axis=-1)
-    uv[~valid] = -1
-    return uv
-
-
-project_sparse_compatible_numpy = project_rosa_compatible_numpy
-
-
 __all__ = [
     "OFFICIAL_TO_ROSA_OCAM",
-    "OFFICIAL_TO_SPARSE_OCAM",
     "ROSAOcamCalibration",
-    "SparseOcamCalibration",
     "convert_lidar2cam",
     "convert_ocamcamera",
-    "project_rosa_compatible_numpy",
-    "project_sparse_compatible_numpy",
 ]

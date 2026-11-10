@@ -1,87 +1,27 @@
-"""ROSA: calibrated multiview refinement for native fisheye 3D detection."""
+"""ROSA: Ray-aware Observation Selection and Aggregation for fisheye 3D detection."""
 
-from .refiner import (
-    ObservationEncoding,
-    PointwiseROSA,
-    ROSAConfig,
-    ROSAOutput,
-    ROSARefiner,
-)
-from .rfl import SphericalRayFeatureLifting
-from .fisheye_decoder import (
-    FisheyeRayDecoder,
-    FisheyeRayDecoderConfig,
-    FisheyeRayDecoderOutput,
-    SphericalRayQueryBank,
-)
-from .fisheye_box_decoder import (
-    FisheyeBoxDecoderConfig,
-    FisheyeBoxDecoderOutput,
-    FisheyeBoxKeypointGenerator,
-    FisheyeSparseBoxDecoder,
-    RayGuidedBoxInitializer,
-)
-from .fisheye_evidence import (
-    FisheyeEvidenceConfig,
-    FisheyeObservationGeometry,
-    UnifiedFisheyeEvidenceAttention,
-)
-from .hybrid_box_decoder import (
-    FisheyeBoxDecoderV4Config,
-    FisheyeBoxDecoderV4Output,
-    FisheyeSparseBoxDecoderV4,
+from .projection import NativeFisheyeProjector, OCamFisheyeProjection
+from .decoder import (
+    HybridBoxDecoderConfig,
+    HybridBoxDecoderOutput,
     HybridBoxRefinement,
     HybridBoxState,
+    HybridSparseBoxDecoder,
 )
-from .fisheye_projection import (
-    FisheyeProjectionModel,
-    NativeFisheyeProjector,
-    OCamFisheyeProjection,
-)
-from .ray_losses import (
-    FisheyeHybridRayAuxiliaryLoss,
-    FisheyeRayAuxiliaryLoss,
-    RayAuxiliaryLossConfig,
-)
-from .ray_state import (
-    FisheyeRayStateRefinement,
-    RayRefinementConfig,
-    RayState,
-)
+from .losses import FisheyeHybridRayAuxiliaryLoss, RayAuxiliaryLossConfig
+from .rfl import SphericalRayFeatureLifting
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 __all__ = [
-    "ObservationEncoding",
-    "PointwiseROSA",
-    "FisheyeEvidenceConfig",
-    "FisheyeBoxDecoderConfig",
-    "FisheyeBoxDecoderOutput",
-    "FisheyeBoxKeypointGenerator",
-    "FisheyeBoxDecoderV4Config",
-    "FisheyeBoxDecoderV4Output",
-    "FisheyeObservationGeometry",
-    "FisheyeProjectionModel",
     "FisheyeHybridRayAuxiliaryLoss",
-    "FisheyeRayAuxiliaryLoss",
-    "FisheyeRayDecoder",
-    "FisheyeRayDecoderConfig",
-    "FisheyeRayDecoderOutput",
-    "FisheyeRayStateRefinement",
-    "FisheyeSparseBoxDecoder",
-    "FisheyeSparseBoxDecoderV4",
-    "NativeFisheyeProjector",
-    "OCamFisheyeProjection",
-    "ROSAConfig",
-    "ROSAOutput",
-    "ROSARefiner",
-    "RayAuxiliaryLossConfig",
-    "RayGuidedBoxInitializer",
-    "RayRefinementConfig",
-    "RayState",
+    "HybridBoxDecoderConfig",
+    "HybridBoxDecoderOutput",
     "HybridBoxRefinement",
     "HybridBoxState",
-    "SphericalRayQueryBank",
+    "HybridSparseBoxDecoder",
+    "NativeFisheyeProjector",
+    "OCamFisheyeProjection",
+    "RayAuxiliaryLossConfig",
     "SphericalRayFeatureLifting",
-    "UnifiedFisheyeEvidenceAttention",
 ]

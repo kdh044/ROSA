@@ -1,11 +1,10 @@
-"""KITTI-360 data path matching the ICRA 2026 DAPETR protocol."""
+"""KITTI-360 dataset and transforms following the DAPETR protocol."""
 
 from __future__ import annotations
 
 import hashlib
 from os import path as osp
 from pathlib import Path
-import sys
 from typing import Optional
 
 import mmcv
@@ -17,6 +16,7 @@ from mmdet3d.datasets import Det3DDataset
 from mmdet3d.registry import DATASETS, TRANSFORMS
 from mmdet3d.structures import LiDARInstance3DBoxes
 
+from .calibration import load_cam_to_pose, load_mei, load_perspective
 from .constants import (
     CAMERAS,
     CAMERA_MODEL_IDS,
@@ -35,7 +35,7 @@ def _stable_int64(value: object) -> int:
 
 @DATASETS.register_module()
 class KITTI360MixedCameraDataset(Det3DDataset):
-    """Read the ROSA KITTI-360 info files generated from FishBEVOD tables."""
+    """KITTI-360 mixed-camera dataset (two pinhole and two MEI fisheye views)."""
 
     METAINFO = {
         "classes": CLASSES,
@@ -65,36 +65,6 @@ class KITTI360MixedCameraDataset(Det3DDataset):
         )
 
     def parse_ann_info(self, info: dict) -> dict:
-        if "instances" not in info and "annos" in info:
-            annotations = info["annos"]
-            boxes = np.asarray(
-                annotations.get("gt_boxes", np.zeros((0, 9))), dtype=np.float32
-            ).reshape(-1, 9)
-            names = np.asarray(annotations.get("gt_names", ()))
-            categories = {
-                name: index for index, name in enumerate(self.metainfo["classes"])
-            }
-            aliases = {"trafficSign": "traffic_sign"}
-            labels = np.asarray(
-                [
-                    categories.get(aliases.get(str(name), str(name)), -1)
-                    for name in names
-                ],
-                dtype=np.int64,
-            )
-            valid = labels >= 0
-            raw_ids = np.asarray(
-                annotations.get("gt_ids", np.arange(len(names))), dtype=np.int64
-            )
-            return {
-                "gt_bboxes_3d": LiDARInstance3DBoxes(
-                    boxes[valid],
-                    box_dim=9,
-                    origin=(0.5, 0.5, 0.5),
-                ).convert_to(self.box_mode_3d),
-                "gt_labels_3d": labels[valid],
-                "instance_inds": raw_ids[valid],
-            }
         instances = info.get("instances", ())
         boxes = np.asarray(
             [item["bbox_3d"] for item in instances], dtype=np.float32
@@ -181,20 +151,9 @@ class LoadKITTI360MixedCameraImages(BaseTransform):
         self.cameras = tuple(cameras)
         self.to_float32 = bool(to_float32)
         self.color_type = color_type
-        if self.cameras != CAMERAS:
-            raise ValueError(f"DAPETR protocol fixes camera order to {CAMERAS}")
         self.data_root = Path(data_root).resolve() if data_root is not None else None
-        self._legacy_calibration = None
+        self._calibration = None
         if self.data_root is not None:
-            helper_root = str(self.data_root.parent)
-            if helper_root not in sys.path:
-                sys.path.insert(0, helper_root)
-            from kitti360_mixed_camera import (
-                load_cam_to_pose,
-                load_mei,
-                load_perspective,
-            )
-
             calibration_root = self.data_root / "calibration"
             cam_to_pose = load_cam_to_pose(
                 calibration_root / "calib_cam_to_pose.txt"
@@ -234,36 +193,9 @@ class LoadKITTI360MixedCameraImages(BaseTransform):
                     )
                     folder = "data_rgb"
                 records[key] = (camera, folder, transform, intrinsic, coefficients)
-            self._legacy_calibration = records
+            self._calibration = records
 
     def transform(self, results: dict) -> dict:
-        if "images" not in results:
-            if self._legacy_calibration is None:
-                raise KeyError("legacy KITTI-360 info requires data_root in loader")
-            sequence = str(results["sequence"])
-            frame = int(results["frame_id"])
-            results["images"] = {
-                key: {
-                    "img_path": str(
-                        self.data_root
-                        / "data_2d_raw"
-                        / sequence
-                        / camera
-                        / folder
-                        / f"{frame:010d}.png"
-                    ),
-                    "lidar2cam": transform,
-                    "camera_intrinsic": intrinsic,
-                    "distortion_coefficients": coefficients,
-                }
-                for key, (
-                    camera,
-                    folder,
-                    transform,
-                    intrinsic,
-                    coefficients,
-                ) in self._legacy_calibration.items()
-            }
         images = []
         paths = []
         shapes = []
@@ -276,8 +208,6 @@ class LoadKITTI360MixedCameraImages(BaseTransform):
             record = results["images"][camera]
             path = str(record["img_path"])
             image = mmcv.imread(path, flag=self.color_type)
-            if image is None:
-                raise FileNotFoundError(path)
             expected_w, expected_h = NATIVE_IMAGE_SIZES[index]
             if image.shape[:2] != (expected_h, expected_w):
                 raise ValueError(
@@ -328,21 +258,6 @@ class LoadKITTI360MixedCameraImages(BaseTransform):
         return results
 
 
-@TRANSFORMS.register_module()
-class ConvertLegacyKITTI360MEIOrder(BaseTransform):
-    """Convert the existing camera-only infos to the public MEI convention.
-
-    The earlier local KITTI-360 loader emits ``[xi, k1, k2, p1, p2]`` while
-    the common mixed-camera projector deliberately exposes FishBEVOD's
-    calibration order ``[k1, k2, p1, p2, xi]``.
-    """
-
-    def transform(self, results: dict) -> dict:
-        distortion = np.asarray(results["mei_distortion"], dtype=np.float32)
-        if distortion.shape[-1] != 5:
-            raise ValueError("mei_distortion must end in five coefficients")
-        results["mei_distortion"] = distortion[..., (1, 2, 3, 4, 0)]
-        return results
 
 
 @TRANSFORMS.register_module()
@@ -458,8 +373,6 @@ class DAPETRGlobalRotScale(BaseTransform):
             boxes = annotation["gt_bboxes_3d"]
             boxes.rotate(torch.tensor(angle, dtype=boxes.tensor.dtype))
             boxes.scale(scale)
-            if "gt_bboxes_3d" in results:
-                results["gt_bboxes_3d"] = boxes
         return results
 
 
@@ -490,10 +403,6 @@ class KITTI360ObjectRangeFilter(BaseTransform):
             annotation["instance_inds"] = np.asarray(
                 annotation["instance_inds"]
             )[keep]
-        if "gt_bboxes_3d" in results:
-            results["gt_bboxes_3d"] = annotation["gt_bboxes_3d"]
-        if "gt_labels_3d" in results:
-            results["gt_labels_3d"] = annotation["gt_labels_3d"]
         return results
 
 

@@ -10,10 +10,14 @@ dist/
 data/
 external/
 
-# Checkpoints ship on the Releases page, not in the tree
+# Weights are downloaded from Hugging Face (docs/MODEL_ZOO.md)
 weights/
+checkpoints/
 *.pth
 *.ckpt
+
+# Compiled CUDA extension
+*.so
 
 # Training output
 work_dirs/

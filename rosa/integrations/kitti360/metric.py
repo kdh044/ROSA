@@ -1,4 +1,4 @@
-"""AAE-free KITTI-360 nuScenes-style metric used by the ICRA DAPETR paper."""
+"""nuScenes-style KITTI-360 metric without AAE, following DAPETR."""
 
 from __future__ import annotations
 
@@ -161,13 +161,7 @@ class KITTI360DAPETRMetric(BaseMetric):
                 if hasattr(data_sample, "metainfo")
                 else data_sample.get("token", data_sample.get("sample_idx"))
             )
-            # ``pred_instances_3d`` normally reaches here as an ``InstanceData``
-            # (attribute access), but under some launch paths (observed with
-            # 2-GPU DDP here) it arrives as the plain dict the detector's
-            # ``results["img_bbox"]`` was built from -- same underlying
-            # content, different container.  Accept both rather than assume
-            # one, matching the normalisation already used for the
-            # Fisheye3DOD arms throughout this project.
+            # Predictions may arrive as ``InstanceData`` or as a plain dict.
             if isinstance(prediction, dict):
                 boxes = prediction.get("bboxes_3d", prediction.get("boxes_3d"))
                 labels = prediction.get("labels_3d")
