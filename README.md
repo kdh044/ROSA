@@ -4,10 +4,9 @@
 
 DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</sup> Corresponding author</sub>
 
-**Downloads** (Hugging Face):
+**Datasets & checkpoints:**
 [Fisheye3DOD](https://huggingface.co/datasets/danny042/Fisheye3DOD) ·
-[KITTI-360 fisheye](https://huggingface.co/datasets/danny042/KITTI-360-fisheye) —
-datasets, info files and ROSA checkpoints (in `checkpoints/` of each repository)
+[KITTI-360](https://huggingface.co/datasets/danny042/KITTI-360-fisheye)
 
 ROSA is a camera-only 3D object detector for surround-view **fisheye** cameras.
 It runs on the raw fisheye images, without undistortion, and for every
