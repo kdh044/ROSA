@@ -11,11 +11,11 @@ DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</s
 ROSA is a 3D object detector for surround-view **fisheye** cameras that works
 directly on raw fisheye images, without undistortion.
 
-**Fisheye3DOD**: four fisheye cameras (day, sunset, rain, night)
+**Fisheye3DOD**
 
 https://github.com/user-attachments/assets/95b32f78-1ce0-4324-afab-87e9886f0d78
 
-**KITTI-360**: two front pinhole cameras and two side fisheye cameras
+**KITTI-360**
 
 https://github.com/user-attachments/assets/368c0d84-e00c-42e8-bccd-473feab84650
 
