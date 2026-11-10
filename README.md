@@ -8,8 +8,7 @@ DongHun Kim, Sang Jun Lee, HyungGi Jo<sup>†</sup> &nbsp;&nbsp;<sub><sup>†</s
 [Fisheye3DOD](https://huggingface.co/datasets/danny042/Fisheye3DOD) ·
 [KITTI-360](https://huggingface.co/datasets/danny042/KITTI-360-fisheye)
 
-ROSA is a 3D object detector for surround-view **fisheye** cameras that works
-directly on raw fisheye images, without undistortion.
+ROSA is a 3D object detector for surround-view **fisheye** cameras.
 
 **Fisheye3DOD**
 
